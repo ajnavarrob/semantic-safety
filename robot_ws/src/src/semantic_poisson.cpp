@@ -25,7 +25,7 @@
 #include "mpc_cbf_3d.h"
 #include "cloud_merger.h"
 #include "poisson/human_tracker.h"
-#include "constraint_manager.hpp"
+#include "constraints/constraint_manager.hpp"
 
 #include <opencv2/opencv.hpp>
 
@@ -365,7 +365,7 @@ private:
             IMAX * JMAX * QMAX * sizeof(float)
         );
     
-        find_boundary(hgrid_temp_, occ1, false);
+        find_boundary(hgrid_temp_, occ1, false, false, nullptr);
     }
 
     SemanticStageOutput run_semantic_fusion() {

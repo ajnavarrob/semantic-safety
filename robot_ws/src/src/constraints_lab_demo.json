@@ -8,7 +8,7 @@
         "target": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1.5
+        "buffer_distance_m": 1.0
       }
     }
   ]
