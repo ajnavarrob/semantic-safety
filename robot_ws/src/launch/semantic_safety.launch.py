@@ -217,7 +217,7 @@ def generate_launch_description():
     # Velocity bound parameters
     vel_max_x_fwd_arg = DeclareLaunchArgument(
         'vel_max_x_fwd',
-        default_value='0.75', # '1.1',
+        default_value='1.1', # '1.1',
         description='Maximum forward velocity (m/s)'
     )
     

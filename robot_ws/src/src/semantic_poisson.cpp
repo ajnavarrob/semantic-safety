@@ -125,15 +125,6 @@ public:
                         robot_MOS_human
                     );
                 }
-                
-                if (constraint_runtime_config_.obstacle_buffer_m > 0.0f) {
-                    robot_MOS_obstacle = constraint_runtime_config_.obstacle_buffer_m;
-                    RCLCPP_INFO(
-                        this->get_logger(),
-                        "Applied JSON obstacle buffer override: %.2f m",
-                        robot_MOS_obstacle
-                    );
-                }
             } else {
                 RCLCPP_WARN(
                     this->get_logger(),
@@ -1887,33 +1878,9 @@ private:
         float hqm = trilinear_interpolation(hgrid1, ic, jc, qm);
         dhdq = (hqp - hqm) / (2.0f * q_eps * DQ);
     
-        // Dynamic space-time correction direction.
-        // Start from Laplace spatial guidance.
-        float dhdx_pred = vx;
-        float dhdy_pred = vy;
-        
-        // Use actual local spatial h-gradient to account for moving level set.
-        const float grad_norm_sq = Dh_x * Dh_x + Dh_y * Dh_y;
-        
-        if (grad_norm_sq > 1.0e-6f) {
-            // Boundary normal velocity implied by h_t:
-            // h_t + grad(h) · v_boundary = 0
-            const float v_boundary_x = -dhdt * Dh_x / grad_norm_sq;
-            const float v_boundary_y = -dhdt * Dh_y / grad_norm_sq;
-        
-            // Relative correction direction: push against the moving boundary,
-            // not only the static spatial boundary.
-            dhdx_pred = vx - v_boundary_x;
-            dhdy_pred = vy - v_boundary_y;
-        
-            const float pred_norm = std::sqrt(dhdx_pred * dhdx_pred + dhdy_pred * dhdy_pred);
-            const float original_norm = std::sqrt(vx * vx + vy * vy);
-        
-            if (pred_norm > 1.0e-6f && original_norm > 1.0e-6f) {
-                dhdx_pred = dhdx_pred / pred_norm * original_norm;
-                dhdy_pred = dhdy_pred / pred_norm * original_norm;
-            }
-        }
+        // Forward-predicted guidance-aligned derivatives
+        const float dhdx_pred = vx;
+        const float dhdy_pred = vy;
     
         hqp += trilinear_interpolation(dhdt_grid, ic, jc, qp) * grid_age;
         hqm += trilinear_interpolation(dhdt_grid, ic, jc, qm) * grid_age;
@@ -1946,7 +1913,7 @@ private:
     
         // Activating function
         float a = wn * h_pred;
-        a += dhdx_pred * vd[0] + dhdy_pred * vd[1];
+        a += vx * vd[0] + vy * vd[1];
         a += dhdt_scale * dhdt;
         a += dhdq_pred * vd[2];
         a -= ISSf;

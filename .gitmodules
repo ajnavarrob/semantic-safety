@@ -1,0 +1,22 @@
+[submodule "submodules/osqp-eigen"]
+	path = submodules/osqp-eigen
+	url = https://github.com/robotology/osqp-eigen.git
+[submodule "submodules/unitree_ros2"]
+	path = submodules/unitree_ros2
+	url = git@github.com:unitreerobotics/unitree_ros2.git
+[submodule "submodules/osqp"]
+	path = submodules/osqp
+	url = git@github.com:osqp/osqp.git
+[submodule "submodules/Livox-SDK2"]
+	path = submodules/Livox-SDK2
+	url = git@github.com:Livox-SDK/Livox-SDK2.git
+[submodule "submodules/lidar_ws/src/livox_ros_driver2"]
+	path = submodules/lidar_ws/src/livox_ros_driver2
+	url = git@github.com:Livox-SDK/livox_ros_driver2.git
+[submodule "submodules/realsense_ros2"]
+	path = submodules/realsense_ros2
+	url = git@github.com:Caltech-AMBER/realsense_ros2.git
+[submodule "submodules/odom_ws/src/FAST_LIO"]
+	path = submodules/odom_ws/src/FAST_LIO
+	url = https://github.com/Caltech-AMBER/FAST_LIO.git
+	branch = foxy

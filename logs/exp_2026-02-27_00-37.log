@@ -1,0 +1,267 @@
+[INFO] [launch]: All log files can be found below /home/unitree/.ros/log/2026-02-27-00-40-52-084244-ubuntu-9180
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [rs_d435_node-1]: process started with pid [9183]
+[INFO] [static_transform_publisher-2]: process started with pid [9185]
+[INFO] [static_transform_publisher-3]: process started with pid [9187]
+[INFO] [livox_ros_driver2_node-4]: process started with pid [9189]
+[INFO] [static_transform_publisher-5]: process started with pid [9191]
+[INFO] [static_transform_publisher-6]: process started with pid [9217]
+[INFO] [static_transform_publisher-7]: process started with pid [9219]
+[INFO] [static_transform_publisher-8]: process started with pid [9228]
+[INFO] [fastlio_mapping-9]: process started with pid [9238]
+[INFO] [odom_publisher_fastlio-10]: process started with pid [9254]
+[INFO] [yolo_detector.py-11]: process started with pid [9257]
+[INFO] [human_tracking.py-12]: process started with pid [9260]
+[INFO] [semantic_poisson-13]: process started with pid [9270]
+[livox_ros_driver2_node-4] LdsLidar *GetInstance
+[livox_ros_driver2_node-4] config lidar type: 8
+[livox_ros_driver2_node-4] successfully parse base config, counts: 1
+[static_transform_publisher-2] [INFO] [1772124052.381482847] [camera_depth_optical_frame_publisher]: Spinning until killed publishing transform from 'camera_link' to 'camera_link_d435_pcl'
+[static_transform_publisher-3] [INFO] [1772124052.310171961] [camera_color_optical_frame_publisher]: Spinning until killed publishing transform from 'camera_link' to 'camera_link_d435'
+[livox_ros_driver2_node-4] [INFO] [1772124052.300329410] [livox_lidar_publisher]: Livox Ros Driver2 Version: 1.2.4
+[livox_ros_driver2_node-4] [INFO] [1772124052.304577307] [livox_lidar_publisher]: Data Source is raw lidar.
+[livox_ros_driver2_node-4] [INFO] [1772124052.304674174] [livox_lidar_publisher]: Config file : /home/unitree/semantic-safety-master/robot_ws/install/unitree_ros2_poisson_simple/share/unitree_ros2_poisson_simple/config/MID360_config.json
+[livox_ros_driver2_node-4] [INFO] [1772124052.309529575] [livox_lidar_publisher]: Init lds lidar success!
+[static_transform_publisher-6] [INFO] [1772124052.390585345] [body_to_livox_tf]: Spinning until killed publishing transform from 'body' to 'livox_frame'
+[static_transform_publisher-7] [INFO] [1772124052.458597897] [livox_to_body_tf]: Spinning until killed publishing transform from 'livox_frame' to 'body_link'
+[static_transform_publisher-8] [INFO] [1772124052.490947838] [body_to_utlidar_tf]: Spinning until killed publishing transform from 'body_link' to 'utlidar_lidar'
+[odom_publisher_fastlio-10] [INFO] [1772124052.564676232] [odom_publisher]: FAST_LIO Odom Publisher Node initialized
+[odom_publisher_fastlio-10] [INFO] [1772124052.565053427] [odom_publisher]: Subscribing to: /Odometry (FAST_LIO frame: camera_init -> body)
+[odom_publisher_fastlio-10] [INFO] [1772124052.565113589] [odom_publisher]: Publishing to: /odom (TF handled by FAST_LIO + static TFs)
+[static_transform_publisher-5] [INFO] [1772124052.578928796] [odom_to_camera_init_tf]: Spinning until killed publishing transform from 'odom' to 'camera_init'
+[semantic_poisson-13] [INFO] [1772124052.770434641] [semantic_poisson]: Data logging DISABLED
+[semantic_poisson-13] [INFO] [1772124052.804899266] [semantic_poisson]: dh0_human=1.70, dh0_obstacle=0.50, MOS_human=1.50, MOS_obstacle=1.00, display=false, social_nav=true
+[semantic_poisson-13] [INFO] [1772124052.806593490] [semantic_poisson]: Dynamic CBF: sigma_epsilon=0.100, sigma_kappa=5.00
+[semantic_poisson-13] [INFO] [1772124052.808109629] [semantic_poisson]: Velocity bounds: x_fwd=1.10, x_bwd=0.75, y=0.75, yaw=0.75
+[semantic_poisson-13] [INFO] [1772124052.822116234] [semantic_poisson]: HumanTracker: timeout=5.0s, gate=0.80m, vel_thresh=0.20m/s, decay_fov=0.85, decay_stat=0.99, decay_unconf=0.95, no_retrack=true
+[semantic_poisson-13] [INFO] [1772124052.826295361] [semantic_poisson]: Tight-area params: human_thresh=1.00m, h_thresh=0.20, wall_slack=0.00
+[fastlio_mapping-9] [INFO] [1772124052.862960624] [fastlio_mapping]: p_pre->lidar_type 0
+[fastlio_mapping-9] Multi thread started 
+[fastlio_mapping-9] ~~~~/home/unitree/semantic-safety-master/submodules/odom_ws/src/FAST_LIO/ file opened
+[fastlio_mapping-9] [INFO] [1772124052.975491911] [fastlio_mapping]: Node init finished.
+[semantic_poisson-13] [INFO] [1772124053.106711150] [semantic_poisson]: Logging publish rate: 10.0 Hz
+[rs_d435_node-1] [INFO] [1772124053.246389445] [D435Node]: Device set up
+[rs_d435_node-1] [INFO] [1772124053.248105558] [D435Node]: 
+[rs_d435_node-1] 
+[rs_d435_node-1] Module name: Stereo Module
+[rs_d435_node-1] [INFO] [1772124053.254085983] [D435Node]: 
+[rs_d435_node-1] 
+[rs_d435_node-1] Module name: RGB Camera
+[rs_d435_node-1] [INFO] [1772124053.257608035] [D435Node]: RGB Camera stream is enabled - width: 640, height: 480, fps: 15
+[rs_d435_node-1] [INFO] [1772124053.258643169] [D435Node]: 
+[rs_d435_node-1] 
+[rs_d435_node-1] Module name: Motion Module
+[rs_d435_node-1] [INFO] [1772124053.441499904] [D435Node]: Capture Pipeline started!
+[human_tracking.py-12] [INFO] [1772124053.683467658] [human_tracking]: Human tracking node initialized
+[human_tracking.py-12] [INFO] [1772124053.686377149] [human_tracking]: Control loop rate: 100 Hz
+[human_tracking.py-12] [INFO] [1772124053.688093806] [human_tracking]: Publishing TF body_link -> camera_link at 100 Hz (no gimbal)
+[human_tracking.py-12] [INFO] [1772124053.689818494] [human_tracking]: Camera offset (body frame): x=0.35, y=0.0, z=0.2
+[livox_ros_driver2_node-4] GetFreeIndex key:livox_lidar_343648448.
+[livox_ros_driver2_node-4] Lidar[0] storage queue size: 16
+[livox_ros_driver2_node-4] set pcl data type, handle: 343648448, data type: 1
+[livox_ros_driver2_node-4] set scan pattern, handle: 343648448, scan pattern: 0
+[livox_ros_driver2_node-4] begin to change work mode to 'Normal', handle: 343648448
+[livox_ros_driver2_node-4] successfully set data type, handle: 343648448, set_bit: 2
+[livox_ros_driver2_node-4] successfully set pattern mode, handle: 343648448, set_bit: 0
+[livox_ros_driver2_node-4] successfully set lidar attitude, ip: 192.168.123.20
+[livox_ros_driver2_node-4] successfully change work mode, handle: 343648448
+[livox_ros_driver2_node-4] successfully enable Livox Lidar imu, ip: 192.168.123.20
+[semantic_poisson-13] [INFO] [1772124054.665947825] [semantic_poisson]: Passing min_z=0.10, max_z=0.50 to CloudMergerNode
+[semantic_poisson-13] [WARN] [1772124054.666373053] [rcl.logging_rosout]: Publisher already registered for provided node name. If this is due to multiple nodes with the same name then all logs for that logger name will go out over the existing publisher. As soon as any node with that name is destructed it will unregister the publisher, preventing any further logs for that name from being published on the rosout topic.
+[semantic_poisson-13] [INFO] [1772124054.712775616] [semantic_poisson]: CloudMerger min_z=0.10, max_z=0.50
+[livox_ros_driver2_node-4] [INFO] [1772124055.312604136] [livox_lidar_publisher]: livox/imu publish use imu format
+[livox_ros_driver2_node-4] [INFO] [1772124055.329280896] [livox_lidar_publisher]: livox/lidar publish use PointCloud2 format
+[fastlio_mapping-9] [WARN] [1772124055.392105973] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.394578523] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.395878367] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.416102653] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[semantic_poisson-13] [WARN] [1772124055.435079798] [semantic_poisson]: Waiting for TF odom -> body_link, skipping lidar frame
+[fastlio_mapping-9] [WARN] [1772124055.471276248] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.498196179] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.516857476] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.534584986] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.563637810] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.569995110] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.584549986] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.611197653] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.624365067] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.631687738] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [WARN] [1772124055.639177870] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] IMU Initial Done
+[fastlio_mapping-9] [WARN] [1772124055.654020019] [fastlio_mapping]: No point, skip this scan!
+[fastlio_mapping-9] 
+[fastlio_mapping-9] [INFO] [1772124055.673696224] [fastlio_mapping]: Initialize the map kdtree
+[odom_publisher_fastlio-10] [INFO] [1772124055.688195963] [odom_publisher]: Received first FAST_LIO odometry message!
+[semantic_poisson-13] Occ Map Solve Time: 2.24093 ms
+[semantic_poisson-13] Poisson Solve Time: 55.2785 ms
+[semantic_poisson-13] Grid Loop Time: 62.0059 ms
+[semantic_poisson-13] Control Loop Time: 16.9086 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 2.78331 ms
+[semantic_poisson-13] Poisson Solve Time: 54.8806 ms
+[semantic_poisson-13] Grid Loop Time: 68.1475 ms
+[semantic_poisson-13] Control Loop Time: 68.3801 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.43831 ms
+[semantic_poisson-13] Poisson Solve Time: 43.5686 ms
+[semantic_poisson-13] Grid Loop Time: 65.0158 ms
+[semantic_poisson-13] Control Loop Time: 71.9523 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.3939 ms
+[semantic_poisson-13] Poisson Solve Time: 49.3285 ms
+[semantic_poisson-13] Grid Loop Time: 66.07 ms
+[semantic_poisson-13] Control Loop Time: 118.978 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.54219 ms
+[semantic_poisson-13] Poisson Solve Time: 43.0239 ms
+[semantic_poisson-13] Grid Loop Time: 66.4806 ms
+[semantic_poisson-13] Control Loop Time: 66.5273 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.37422 ms
+[semantic_poisson-13] Poisson Solve Time: 72.8724 ms
+[semantic_poisson-13] Grid Loop Time: 65.2728 ms
+[semantic_poisson-13] Control Loop Time: 21.7199 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.45422 ms
+[semantic_poisson-13] Poisson Solve Time: 48.6683 ms
+[semantic_poisson-13] Grid Loop Time: 64.9363 ms
+[semantic_poisson-13] Control Loop Time: 47.9806 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.99193 ms
+[semantic_poisson-13] Poisson Solve Time: 48.8142 ms
+[semantic_poisson-13] Grid Loop Time: 67.1494 ms
+[semantic_poisson-13] Control Loop Time: 66.342 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124063.270950621] [yolo_detector]: Loading YOLO model: /home/unitree/semantic-safety-master/yolo11n-seg.engine, using TensorRT: True
+[yolo_detector.py-11] [INFO] [1772124063.271845814] [yolo_detector]: TensorRT engine already exists: /home/unitree/semantic-safety-master/yolo11n-seg.engine
+[yolo_detector.py-11] [INFO] [1772124063.275981515] [yolo_detector]: TensorRT engine loaded: /home/unitree/semantic-safety-master/yolo11n-seg.engine
+[yolo_detector.py-11] [INFO] [1772124063.328186289] [yolo_detector]: YOLO Detector Node initialized (logging publish rate: 10.0 Hz)
+[yolo_detector.py-11] Loading /home/unitree/semantic-safety-master/yolo11n-seg.engine for TensorRT inference...
+[semantic_poisson-13] Occ Map Solve Time: 1.25783 ms
+[semantic_poisson-13] Poisson Solve Time: 49.2275 ms
+[semantic_poisson-13] Grid Loop Time: 64.5698 ms
+[semantic_poisson-13] Control Loop Time: 62.3583 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [02/27/2026-00:41:04] [TRT] [I] Loaded engine size: 13 MiB
+[yolo_detector.py-11] [02/27/2026-00:41:04] [TRT] [W] Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+[semantic_poisson-13] Occ Map Solve Time: 1.45354 ms
+[semantic_poisson-13] Poisson Solve Time: 52.6651 ms
+[semantic_poisson-13] Grid Loop Time: 64.0887 ms
+[semantic_poisson-13] Control Loop Time: 61.9067 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.32369 ms
+[semantic_poisson-13] Poisson Solve Time: 51.7033 ms
+[semantic_poisson-13] Grid Loop Time: 65.3922 ms
+[semantic_poisson-13] Control Loop Time: 66.5544 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [02/27/2026-00:41:06] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +620, GPU +586, now: CPU 1025, GPU 6925 (MiB)
+[yolo_detector.py-11] [02/27/2026-00:41:06] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in engine deserialization: CPU +0, GPU +11, now: CPU 0, GPU 11 (MiB)
+[yolo_detector.py-11] [02/27/2026-00:41:06] [TRT] [I] [MemUsageChange] Init cuDNN: CPU +0, GPU +0, now: CPU 1012, GPU 6914 (MiB)
+[yolo_detector.py-11] [02/27/2026-00:41:06] [TRT] [I] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +24, now: CPU 0, GPU 35 (MiB)
+[semantic_poisson-13] Occ Map Solve Time: 1.38346 ms
+[semantic_poisson-13] Poisson Solve Time: 51.1808 ms
+[semantic_poisson-13] Grid Loop Time: 65.2897 ms
+[semantic_poisson-13] Control Loop Time: 64.5108 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.65803 ms
+[semantic_poisson-13] Poisson Solve Time: 66.7764 ms
+[semantic_poisson-13] Grid Loop Time: 70.3531 ms
+[semantic_poisson-13] Control Loop Time: 66.9701 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.55905 ms
+[semantic_poisson-13] Poisson Solve Time: 48.6644 ms
+[semantic_poisson-13] Grid Loop Time: 64.1922 ms
+[semantic_poisson-13] Control Loop Time: 69.855 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.4842 ms
+[semantic_poisson-13] Poisson Solve Time: 81.0242 ms
+[semantic_poisson-13] Grid Loop Time: 67.0129 ms
+[semantic_poisson-13] Control Loop Time: 65.2133 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124069.951075041] [yolo_detector]: Detected: 0 human pixels, 40799 object pixels, 0 grid cells, PC: waiting
+[semantic_poisson-13] Occ Map Solve Time: 1.24295 ms
+[semantic_poisson-13] Poisson Solve Time: 48.7015 ms
+[semantic_poisson-13] Grid Loop Time: 70.7923 ms
+[semantic_poisson-13] Control Loop Time: 19.3903 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.36266 ms
+[semantic_poisson-13] Poisson Solve Time: 67.7648 ms
+[semantic_poisson-13] Grid Loop Time: 72.4872 ms
+[semantic_poisson-13] Control Loop Time: 77.7182 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124072.007514813] [yolo_detector]: Detected: 0 human pixels, 38163 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.55662 ms
+[semantic_poisson-13] Poisson Solve Time: 59.8119 ms
+[semantic_poisson-13] Grid Loop Time: 59.9571 ms
+[semantic_poisson-13] Control Loop Time: 59.8563 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.31092 ms
+[semantic_poisson-13] Poisson Solve Time: 53.7938 ms
+[semantic_poisson-13] Grid Loop Time: 64.2836 ms
+[semantic_poisson-13] Control Loop Time: 135.323 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124074.087754572] [yolo_detector]: Detected: 0 human pixels, 46263 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.46315 ms
+[semantic_poisson-13] Poisson Solve Time: 73.2868 ms
+[semantic_poisson-13] Grid Loop Time: 65.7787 ms
+[semantic_poisson-13] Control Loop Time: 61.6608 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.42567 ms
+[semantic_poisson-13] Poisson Solve Time: 48.0379 ms
+[semantic_poisson-13] Grid Loop Time: 65.279 ms
+[semantic_poisson-13] Control Loop Time: 92.2091 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124076.151287893] [yolo_detector]: Detected: 0 human pixels, 41830 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.46823 ms
+[semantic_poisson-13] Poisson Solve Time: 80.631 ms
+[semantic_poisson-13] Grid Loop Time: 65.7235 ms
+[semantic_poisson-13] Control Loop Time: 60.7213 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.82629 ms
+[semantic_poisson-13] Poisson Solve Time: 41.2402 ms
+[semantic_poisson-13] Grid Loop Time: 64.6592 ms
+[semantic_poisson-13] Control Loop Time: 68.6524 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124078.211804635] [yolo_detector]: Detected: 0 human pixels, 45231 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.56056 ms
+[semantic_poisson-13] Poisson Solve Time: 51.6643 ms
+[semantic_poisson-13] Grid Loop Time: 65.609 ms
+[semantic_poisson-13] Control Loop Time: 63.9898 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.46039 ms
+[semantic_poisson-13] Poisson Solve Time: 71.5199 ms
+[semantic_poisson-13] Grid Loop Time: 64.7169 ms
+[semantic_poisson-13] Control Loop Time: 74.447 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124080.277671658] [yolo_detector]: Detected: 0 human pixels, 40789 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.55627 ms
+[semantic_poisson-13] Poisson Solve Time: 57.1321 ms
+[semantic_poisson-13] Grid Loop Time: 62.8666 ms
+[semantic_poisson-13] Control Loop Time: 63.4549 ms
+[semantic_poisson-13] Command: <0,0,0>
+[semantic_poisson-13] Occ Map Solve Time: 1.66789 ms
+[semantic_poisson-13] Poisson Solve Time: 39.0221 ms
+[semantic_poisson-13] Grid Loop Time: 67.9411 ms
+[semantic_poisson-13] Control Loop Time: 58.3756 ms
+[semantic_poisson-13] Command: <0,0,0>
+[yolo_detector.py-11] [INFO] [1772124082.321714564] [yolo_detector]: Detected: 0 human pixels, 46684 object pixels, 0 grid cells, PC: synced
+[semantic_poisson-13] Occ Map Solve Time: 1.57214 ms
+[semantic_poisson-13] Poisson Solve Time: 54.5109 ms
+[semantic_poisson-13] Grid Loop Time: 65.6898 ms
+[semantic_poisson-13] Control Loop Time: 63.6719 ms
+[semantic_poisson-13] Command: <0,0,0>
