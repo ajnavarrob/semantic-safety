@@ -6,7 +6,8 @@ Subscribes to ZED camera images, runs YOLO detection, and publishes segmentation
 
 # IMPORTANT: Preload libgomp before importing torch/ultralytics to fix TLS error
 import ctypes
-ctypes.CDLL('/home/unitree/miniconda3/envs/semantic-safety/lib/libgomp.so.1.0.0', mode=ctypes.RTLD_GLOBAL)
+#ctypes.CDLL('/home/unitree/miniconda3/envs/semantic-safety/lib/libgomp.so.1.0.0', mode=ctypes.RTLD_GLOBAL)
+# ctypes.CDLL('/home/unitree/.local/lib/python3.8/site-packages/torch.libs/libgomp-804f19d4.so.1.0.0', mode=ctypes.RTLD_GLOBAL)
 import os
 import rclpy
 from rclpy.node import Node
@@ -15,8 +16,8 @@ from sensor_msgs_py import point_cloud2
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Point, TransformStamped
 # Removed: unitree_go.msg.SportModeState - now using TF for robot pose
-from cv_bridge import CvBridge
 import cv2
+from cv_bridge import CvBridge
 import numpy as np
 from ultralytics import YOLO
 import tf2_ros
@@ -50,8 +51,9 @@ class YOLODetectorNode(Node):
                 self.get_logger().info(f'TensorRT engine loaded: {engine_path}')
             else:
                 self.get_logger().info('Exporting to TensorRT engine...')
-                self.model.export(format='engine', device=0)
-                self.model = YOLO(engine_path)
+                self.model = YOLO(model_path)
+                self.model.export(format='engine', device=0)  #export engine
+                self.model = YOLO(engine_path) # reload model as engine
                 self.get_logger().info(f'TensorRT engine loaded: {engine_path}')
         else:
             self.model = YOLO(model_path)
@@ -252,6 +254,7 @@ class YOLODetectorNode(Node):
                 cv_image,
                 conf=self.conf_threshold,
                 verbose=False,
+                show=False, 
                 device=0  # Use GPU
             )
             
@@ -328,8 +331,8 @@ class YOLODetectorNode(Node):
                 self.annotated_image_pub.publish(annotated_msg)
                 
                 # Display annotated RGB image with YOLO bounding boxes
-                cv2.imshow('YOLO Bounding Boxes', annotated_image)
-                cv2.waitKey(1)
+                #cv2.imshow('YOLO Bounding Boxes', annotated_image)
+                #cv2.waitKey(1)
             
             # Calculate and publish human centroid for gimbal tracking
             centroid_msg = Point()
@@ -519,8 +522,8 @@ class YOLODetectorNode(Node):
             # Flip vertically to match display convention
             class_map_vis = cv2.flip(class_map_vis, 0)
             
-            cv2.imshow('YOLO Class Map', class_map_vis)
-            cv2.waitKey(1)
+            # cv2.imshow('YOLO Class Map', class_map_vis)
+            #cv2.waitKey(1)
             
             # Log detection statistics
             pc_status = "synced" if self.latest_pointcloud is not None else "waiting"
