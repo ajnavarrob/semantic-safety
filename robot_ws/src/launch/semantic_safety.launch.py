@@ -40,7 +40,7 @@ def generate_launch_description():
     
     yolo_model_arg = DeclareLaunchArgument(
         'yolo_model',
-        default_value='yolo11n-seg.engine' if IS_JETSON else 'yolo11n-seg.pt',
+        default_value='/home/unitree/semantic-safety-master/yolo11n-seg.engine',
         description='Path to YOLO model file'
     )
     
@@ -318,7 +318,7 @@ def generate_launch_description():
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
             'dh0_obstacle': LaunchConfiguration('dh0_obstacle'),
-            'enable_display': True,  # Show OpenCV visualization
+            'enable_display': False,  # Show OpenCV visualization
             'min_z': LaunchConfiguration('min_z'),  # Forwarded to CloudMergerNode
             'max_z': LaunchConfiguration('max_z'),  # Forwarded to CloudMergerNode
             # Tight-area wall softening
@@ -444,10 +444,16 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='livox_to_body_tf',
         arguments=[
-            '-0.05', '0.0', '0.18',  # x, y, z translation (body relative to livox)
-            '0', '3.14159', '0',     # roll, pitch, yaw (180° pitch for Y-axis flip)
-            'livox_frame', 'body_link'  # parent_frame, child_frame
+             '-0.05', '0.0', '0.18',  # x, y, z translation (body relative to livox)
+             '0', '3.14159', '0',     # roll, pitch, yaw (180° pitch for Y-axis flip)
+             'livox_frame', 'body_link'  # parent_frame, child_frame
         ],
+
+        # arguments=[
+        #     '-0.05', '0.0', '0.18',  # x, y, z translation (body relative to livox)
+        #     '0', '3.14159', '0',     # roll, pitch, yaw (180° pitch for Y-axis flip)
+        #     'livox_frame', 'body_link'  # parent_frame, child_frame
+        # ],
     )
     
     # Static TF: body_link -> utlidar_link (front UTLidar on Go2)
