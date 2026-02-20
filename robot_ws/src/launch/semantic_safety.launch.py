@@ -58,7 +58,7 @@ def generate_launch_description():
     
     dh0_human_arg = DeclareLaunchArgument(
         'dh0_human',
-        default_value='1.7', # '0.5',
+        default_value='1.7', # '1.7',
         description='Safety field gradient magnitude for humans (stronger repulsion)'
     )
     
@@ -89,7 +89,7 @@ def generate_launch_description():
     
     tight_area_h_threshold_arg = DeclareLaunchArgument(
         'tight_area_h_threshold',
-        default_value='0.3',
+        default_value='0.2', #'0.3', 
         description='h-value threshold for tight-area detection (lower = closer to obstacles)'
     )
     
@@ -102,7 +102,7 @@ def generate_launch_description():
     # Human tracker lifecycle parameters
     human_track_timeout_arg = DeclareLaunchArgument(
         'human_track_timeout_sec',
-        default_value='10.0',
+        default_value='5.0', #'10.0',
         description='How long (sec) to keep track after last observation before deletion'
     )
     
@@ -186,7 +186,7 @@ def generate_launch_description():
     
     robot_mos_human_arg = DeclareLaunchArgument(
         'robot_mos_human',
-        default_value='1.0',
+        default_value='1.5', #'1.5',
         description='Margin of Safety multiplier for human boundary inflation. Larger = more buffer around humans'
     )
     
@@ -217,7 +217,7 @@ def generate_launch_description():
     # Velocity bound parameters
     vel_max_x_fwd_arg = DeclareLaunchArgument(
         'vel_max_x_fwd',
-        default_value='1.1', # '0.75',
+        default_value='0.75', # '1.1',
         description='Maximum forward velocity (m/s)'
     )
     

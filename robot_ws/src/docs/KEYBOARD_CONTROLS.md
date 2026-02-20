@@ -35,7 +35,7 @@ These keys control the Poisson safety filter and experiment flow:
 | `Space` (×3) | Start robot | Enables motion commands |
 | `Space` (×6) | Stop robot | Stops motion and shuts down |
 
-### Safety Filter Toggles
+### Safety Filter Togglesr1
 
 | Key | Action | Description |
 |-----|--------|-------------|
