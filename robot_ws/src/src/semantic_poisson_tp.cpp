@@ -859,7 +859,29 @@ private:
     // 8. EXISTING LOW-LEVEL METHODS TO KEEP / MOVE VERBATIM
     // ============================================================
 
-    void build_occ_map(float* occ_map, const float* occ_map_old, const int8_t* conf);
+    void build_occ_map(float* occ_map, const float* occ_map_old, const int8_t* conf) {
+        const int8_t T_hi = 85;
+        const int8_t T_lo = 64;
+    
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int i0 = i + static_cast<int>(std::round(dx[1] / DS));
+                const int j0 = j + static_cast<int>(std::round(dx[0] / DS));
+    
+                const bool in_grid = (i0 >= 0) && (i0 < IMAX) && (j0 >= 0) && (j0 < JMAX);
+                const bool strong = conf[i * JMAX + j] >= T_hi;
+                const bool weak = conf[i * JMAX + j] >= T_lo;
+    
+                if (strong) {
+                    occ_map[i * JMAX + j] = -1.0f;
+                } else if (weak && in_grid) {
+                    occ_map[i * JMAX + j] = occ_map_old[i0 * JMAX + j0];
+                } else {
+                    occ_map[i * JMAX + j] = 1.0f;
+                }
+            }
+        }
+    }
     bool is_tight_area();
     void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area = false, const int8_t* class_map = nullptr);
     int initialize_robot_kernel(float*& kernel, float mos);
