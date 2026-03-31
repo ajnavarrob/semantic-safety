@@ -883,7 +883,51 @@ private:
         }
     }
     bool is_tight_area();
-    void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area = false, const int8_t* class_map = nullptr);
+
+
+
+    void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area, const int8_t* class_map) {
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (i == 0 || i == (IMAX - 1) || j == 0 || j == (JMAX - 1)) {
+                    bound[i * JMAX + j] = 0.0f;
+                }
+            }
+        }
+    
+        float b0[IMAX * JMAX];
+        std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (b0[n] == 1.0f) {
+                if (b0[n + 1] == -1.0f ||
+                    b0[n - 1] == -1.0f ||
+                    b0[n + JMAX] == -1.0f ||
+                    b0[n - JMAX] == -1.0f ||
+                    b0[n + JMAX + 1] == -1.0f ||
+                    b0[n - JMAX + 1] == -1.0f ||
+                    b0[n + JMAX - 1] == -1.0f ||
+                    b0[n - JMAX - 1] == -1.0f) {
+                    bound[n] = 0.0f;
+                }
+            }
+    
+            if (fix_flag && !bound[n]) {
+                bool is_wall = true;
+                if (class_map) {
+                    is_wall = (class_map[n] != 1);
+                }
+    
+                if (tight_area && is_wall) {
+                    grid[n] = h0 + tight_area_wall_slack_;
+                } else {
+                    grid[n] = h0;
+                }
+            }
+        }
+    }
+
+
     int initialize_robot_kernel(float*& kernel, float mos);
     void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float mos);
     void inflate_occupancy_grid(float* bound, int8_t* class_map = nullptr);
