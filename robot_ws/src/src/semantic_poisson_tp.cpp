@@ -58,7 +58,12 @@ struct TimingSample {
     double occupancy_preprocess_ms{0.0};
     double semantic_fusion_ms{0.0};
     double geometry_shaping_ms{0.0};
-    double guidance_field_ms{0.0};
+
+    double guidance_boundary_setup_ms{0.0};
+    double guidance_social_expansion_ms{0.0};
+    double guidance_laplace_ms{0.0};
+    double guidance_copyout_ms{0.0};
+
     double safety_field_solve_ms{0.0};
     double dhdt_update_ms{0.0};
     double predictive_control_ms{0.0};
@@ -68,9 +73,16 @@ struct TimingSample {
     double end_to_end_grid_ms{0.0};
 };
 
+struct ConnectedComponentsData {
+    cv::Mat binary;
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    int num_labels{0};
+};
+
 struct SemanticStageOutput {
     bool tight_area{false};
-    std::vector<ClusterInfo> clusters;
     std::vector<HumanTrack> active_tracks;
 };
 
@@ -273,24 +285,24 @@ private:
 
     void handle_state_update(const nav_msgs::msg::Odometry& data) {
         update_robot_state(data);
-
+    
         std::vector<float> v_input_body = form_nominal_body_command();
-
+    
+        timing_.field_data_age_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - latest_field_timestamp_).count();
+    
         {
             ScopedTimer timer(timing_.realtime_filter_ms);
             if (h_flag) compute_realtime_safe_control(v_input_body);
             else v = v_input_body;
         }
-
+    
         postprocess_command();
-
+    
         {
             ScopedTimer timer(timing_.command_dispatch_ms);
             dispatch_robot_command();
         }
-
-        timing_.field_data_age_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - latest_field_timestamp_).count();
     }
 
     void handle_mpc_update() {
@@ -306,8 +318,16 @@ private:
 
     void preprocess_occupancy() {
         ScopedTimer timer(timing_.occupancy_preprocess_ms);
+    
         build_occ_map(occ1, occ0, conf);
-        std::memcpy(hgrid_temp_, hgrid1, IMAX * JMAX * QMAX * sizeof(float));
+    
+        // Only copy layer q=0 instead of entire grid
+        std::memcpy(
+            hgrid_temp_,
+            hgrid1,
+            IMAX * JMAX * sizeof(float)
+        );
+    
         find_boundary(hgrid_temp_, occ1, false);
     }
 
@@ -344,7 +364,6 @@ private:
     // ============================================================
 
     GuidanceStageOutput build_guidance_field(const std::vector<HumanTrack>& active_tracks) {
-        ScopedTimer timer(timing_.guidance_field_ms);
         GuidanceStageOutput out;
         out.guidance_x = guidance_x_temp_;
         out.guidance_y = guidance_y_temp_;
@@ -361,45 +380,60 @@ private:
         const float s_yaw = std::sin(x[2]);
         const float vn_body_x = c_yaw * vn[0] + s_yaw * vn[1];
         const float vn_body_y = -s_yaw * vn[0] + c_yaw * vn[1];
-
-        compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, class_map_expanded,
-                                   x[0], x[1], vn_body_x, vn_body_y, true);
-
-        #pragma omp parallel for num_threads(4)
-        for (int q = 1; q < QMAX; ++q) {
-            float* bound_slice = bound + q * IMAX * JMAX;
-            float* gx = guidance_x_temp_ + q * IMAX * JMAX;
-            float* gy = guidance_y_temp_ + q * IMAX * JMAX;
-            compute_boundary_gradients(gx, gy, bound_slice, class_map_expanded,
-                                       x[0], x[1], vn_body_x, vn_body_y, false);
-        }
-
-        if (enable_social_navigation_ && social_tangent_layers_ > 0 && !human_boundary_info_.empty()) {
-            out.bound_guidance = bound_guidance_temp_;
-            out.uses_temp_bound = true;
-            const float sign = compute_tangent_direction(active_tracks, 0.0f, 0.0f, vn_body_x, vn_body_y);
-            for (int q = 0; q < QMAX; ++q) {
-                expand_human_obstacles_for_guidance(
-                    bound_guidance_temp_ + q * IMAX * JMAX,
-                    guidance_x_temp_ + q * IMAX * JMAX,
-                    guidance_y_temp_ + q * IMAX * JMAX,
-                    bound + q * IMAX * JMAX,
-                    social_tangent_layers_,
-                    social_layer_thickness_,
-                    social_tangent_bias_,
-                    sign);
+        
+        {
+            ScopedTimer timer(timing_.guidance_boundary_setup_ms);
+        
+            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, class_map_expanded,
+                                       x[0], x[1], vn_body_x, vn_body_y, true);
+        
+            #pragma omp parallel for num_threads(4)
+            for (int q = 1; q < QMAX; ++q) {
+                float* bound_slice = bound + q * IMAX * JMAX;
+                float* gx = guidance_x_temp_ + q * IMAX * JMAX;
+                float* gy = guidance_y_temp_ + q * IMAX * JMAX;
+                compute_boundary_gradients(gx, gy, bound_slice, class_map_expanded,
+                                           x[0], x[1], vn_body_x, vn_body_y, false);
             }
         }
 
-        solve_guidance_laplace(out.bound_guidance);
+        {
+            ScopedTimer timer(timing_.guidance_social_expansion_ms);
+        
+            if (enable_social_navigation_ && social_tangent_layers_ > 0 && !human_boundary_info_.empty()) {
+                out.bound_guidance = bound_guidance_temp_;
+                out.uses_temp_bound = true;
+                const float sign = compute_tangent_direction(active_tracks, 0.0f, 0.0f, vn_body_x, vn_body_y);
+                for (int q = 0; q < QMAX; ++q) {
+                    expand_human_obstacles_for_guidance(
+                        bound_guidance_temp_ + q * IMAX * JMAX,
+                        guidance_x_temp_ + q * IMAX * JMAX,
+                        guidance_y_temp_ + q * IMAX * JMAX,
+                        bound + q * IMAX * JMAX,
+                        social_tangent_layers_,
+                        social_layer_thickness_,
+                        social_tangent_bias_,
+                        sign);
+                }
+            }
+        }
+
+        {
+            ScopedTimer timer(timing_.guidance_laplace_ms);
+            solve_guidance_laplace(out.bound_guidance);
+        }
+        
         compute_guidance_forcing();
 
-        std::memcpy(guidance_x_display, guidance_x_temp_, IMAX * JMAX * sizeof(float));
-        std::memcpy(guidance_y_display, guidance_y_temp_, IMAX * JMAX * sizeof(float));
-        std::memcpy(bound_display, bound, IMAX * JMAX * sizeof(float));
-        std::memcpy(guidance_x_grid, guidance_x_temp_, IMAX * JMAX * QMAX * sizeof(float));
-        std::memcpy(guidance_y_grid, guidance_y_temp_, IMAX * JMAX * QMAX * sizeof(float));
-
+        {
+            ScopedTimer timer(timing_.guidance_copyout_ms);
+        
+            std::memcpy(guidance_x_display, guidance_x_temp_, IMAX * JMAX * sizeof(float));
+            std::memcpy(guidance_y_display, guidance_y_temp_, IMAX * JMAX * sizeof(float));
+            std::memcpy(bound_display, bound, IMAX * JMAX * sizeof(float));
+            std::memcpy(guidance_x_grid, guidance_x_temp_, IMAX * JMAX * QMAX * sizeof(float));
+            std::memcpy(guidance_y_grid, guidance_y_temp_, IMAX * JMAX * QMAX * sizeof(float));
+        }
         return out;
     }
 
@@ -423,22 +457,26 @@ private:
         }
     }
 
-    bool solve_safety_field(const GuidanceStageOutput&) {
+    bool solve_safety_field(const GuidanceStageOutput& guidance){
         ScopedTimer timer(timing_.safety_field_solve_ms);
+    
         const float relTol = 1.0e-4f;
         const int N = IMAX / 5;
         const float w_SOR = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N + 1)));
-        
+    
         const bool success = true;
-        (void)Kernel::poissonSolve(hgrid_temp_, force, bound, relTol, w_SOR);
-
+    
+        (void)Kernel::poissonSolve(hgrid_temp_, force, guidance.bound_guidance, relTol, w_SOR);
+    
         std::memcpy(occ0, occ1, IMAX * JMAX * sizeof(float));
         std::memcpy(hgrid0, hgrid1, IMAX * JMAX * QMAX * sizeof(float));
         std::memcpy(hgrid1, hgrid_temp_, IMAX * JMAX * QMAX * sizeof(float));
-
+    
         if (success) {
             dhdt_flag = true;
         }
+    
+        return success;
     }
 
     void update_temporal_field_derivative() {
@@ -509,12 +547,10 @@ private:
     void dispatch_robot_command() {
         if (stop_flag) {
             sport_req.StopMove(req);
-            sleep(2);
             sport_req.StandDown(req);
             rclcpp::shutdown();
         } else if (sit_flag) {
             sport_req.StopMove(req);
-            sleep(2);
             sport_req.StandDown(req);
         } else if (start_flag) {
             sport_req.Move(req, vb[0], vb[1], vb[2]);
@@ -533,12 +569,27 @@ private:
     void publish_timing_data() {
         if (!logging_data_pub_) return;
     
+        const auto now = std::chrono::steady_clock::now();
+        const double time_since_last =
+            std::chrono::duration<double>(now - last_logging_publish_time_).count();
+    
+        if (time_since_last < logging_publish_period_) {
+            return;
+        }
+    
+        last_logging_publish_time_ = now;
+    
         std_msgs::msg::Float32MultiArray msg;
         msg.data = {
             static_cast<float>(timing_.occupancy_preprocess_ms),
             static_cast<float>(timing_.semantic_fusion_ms),
             static_cast<float>(timing_.geometry_shaping_ms),
-            static_cast<float>(timing_.guidance_field_ms),
+        
+            static_cast<float>(timing_.guidance_boundary_setup_ms),
+            static_cast<float>(timing_.guidance_social_expansion_ms),
+            static_cast<float>(timing_.guidance_laplace_ms),
+            static_cast<float>(timing_.guidance_copyout_ms),
+        
             static_cast<float>(timing_.safety_field_solve_ms),
             static_cast<float>(timing_.dhdt_update_ms),
             static_cast<float>(timing_.predictive_control_ms),
@@ -547,6 +598,7 @@ private:
             static_cast<float>(timing_.field_data_age_ms),
             static_cast<float>(timing_.end_to_end_grid_ms)
         };
+    
         logging_data_pub_->publish(msg);
     }
 
@@ -707,6 +759,7 @@ private:
         t_grid = std::chrono::steady_clock::now();
         t_state = std::chrono::steady_clock::now();
         latest_field_timestamp_ = std::chrono::steady_clock::now();
+        last_logging_publish_time_ = std::chrono::steady_clock::now();
     }
 
     void initialize_logging_outputs() {
@@ -1527,25 +1580,35 @@ private:
         }
     }
 
-    std::vector<ClusterInfo> extract_lidar_clusters(const float* occ_true) {
-        std::vector<ClusterInfo> clusters;
+    ConnectedComponentsData compute_connected_components(const float* occ_true) {
+        ConnectedComponentsData cc;
+        cc.binary = cv::Mat(IMAX, JMAX, CV_8UC1);
     
-        cv::Mat binary(IMAX, JMAX, CV_8UC1);
         for (int n = 0; n < IMAX * JMAX; ++n) {
-            binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
+            cc.binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
         }
     
-        cv::Mat labels, stats, centroids;
-        const int num_labels = cv::connectedComponentsWithStats(binary, labels, stats, centroids);
+        cc.num_labels = cv::connectedComponentsWithStats(
+            cc.binary,
+            cc.labels,
+            cc.stats,
+            cc.centroids
+        );
     
-        for (int l = 1; l < num_labels; ++l) {
-            const int area = stats.at<int>(l, cv::CC_STAT_AREA);
+        return cc;
+    }
+
+    std::vector<ClusterInfo> extract_lidar_clusters(const ConnectedComponentsData& cc) {
+        std::vector<ClusterInfo> clusters;
+
+        for (int l = 1; l < cc.num_labels; ++l) {
+            const int area = cc.stats.at<int>(l, cv::CC_STAT_AREA);
             if (area < 3) continue;
     
             ClusterInfo c;
     
-            const float j_centroid = static_cast<float>(centroids.at<double>(l, 0));
-            const float i_centroid = static_cast<float>(centroids.at<double>(l, 1));
+            const float j_centroid = static_cast<float>(cc.centroids.at<double>(l, 0));
+            const float i_centroid = static_cast<float>(cc.centroids.at<double>(l, 1));
     
             c.centroid_x = (j_centroid - JMAX / 2) * DS;
             c.centroid_y = (i_centroid - IMAX / 2) * DS;
@@ -1558,7 +1621,7 @@ private:
     
             for (int i = 0; i < IMAX; ++i) {
                 for (int j = 0; j < JMAX; ++j) {
-                    if (labels.at<int>(i, j) == l) {
+                    if (cc.labels.at<int>(i, j) == l) {
                         ++cluster_cell_count;
                         const int idx = i * JMAX + j;
                         if (class_map[idx] == 1) ++yolo_cell_count;
@@ -1579,21 +1642,14 @@ private:
     void label_human_clusters(const float* occ_true) {
         std::memset(class_map_expanded, 0, IMAX * JMAX * sizeof(int8_t));
     
-        auto clusters = extract_lidar_clusters(occ_true);
+        ConnectedComponentsData cc = compute_connected_components(occ_true);
+        auto clusters = extract_lidar_clusters(cc);
     
         const float current_time =
             std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count();
     
         human_tracker_->update(clusters, current_time);
         auto active_tracks = human_tracker_->get_active_tracks();
-    
-        cv::Mat binary(IMAX, JMAX, CV_8UC1);
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
-        }
-    
-        cv::Mat labels, stats, centroids;
-        const int num_labels = cv::connectedComponentsWithStats(binary, labels, stats, centroids);
     
         for (const auto& track : active_tracks) {
             const float track_j = track.x / DS + JMAX / 2.0f;
@@ -1602,9 +1658,9 @@ private:
             float best_dist = 999999.0f;
             int best_label = -1;
     
-            for (int l = 1; l < num_labels; ++l) {
-                const float j_cent = static_cast<float>(centroids.at<double>(l, 0));
-                const float i_cent = static_cast<float>(centroids.at<double>(l, 1));
+            for (int l = 1; l < cc.num_labels; ++l) {
+                const float j_cent = static_cast<float>(cc.centroids.at<double>(l, 0));
+                const float i_cent = static_cast<float>(cc.centroids.at<double>(l, 1));
                 const float dist = std::sqrt((j_cent - track_j) * (j_cent - track_j) +
                                              (i_cent - track_i) * (i_cent - track_i));
                 if (dist < best_dist) {
@@ -1621,12 +1677,12 @@ private:
                 track.yolo_ever_confirmed &&
                 track.confidence > 0.5f) {
     
-                const int cluster_size = stats.at<int>(best_label, cv::CC_STAT_AREA);
+                const int cluster_size = cc.stats.at<int>(best_label, cv::CC_STAT_AREA);
     
                 if (cluster_size <= max_human_cells) {
                     for (int i = 0; i < IMAX; ++i) {
                         for (int j = 0; j < JMAX; ++j) {
-                            if (labels.at<int>(i, j) == best_label) {
+                            if (cc.labels.at<int>(i, j) == best_label) {
                                 class_map_expanded[i * JMAX + j] = 1;
                             }
                         }
@@ -1637,7 +1693,7 @@ private:
     
                     for (int i = 0; i < IMAX; ++i) {
                         for (int j = 0; j < JMAX; ++j) {
-                            if (labels.at<int>(i, j) == best_label) {
+                            if (cc.labels.at<int>(i, j) == best_label) {
                                 const float di = static_cast<float>(i) - track_i;
                                 const float dj = static_cast<float>(j) - track_j;
                                 if (di * di + dj * dj <= radius_sq) {
@@ -1688,7 +1744,11 @@ private:
         }
     }
 
-    void safety_filter(const std::vector<float> vd) {
+
+
+
+
+    void safety_filter(const std::vector<float>& vd) {
         // In body_link frame, robot is always at origin (0, 0)
         const float ic = y_to_i(0.0f, xc[1]);
         const float jc = x_to_j(0.0f, xc[0]);
