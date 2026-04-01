@@ -14,6 +14,7 @@
 #include <array>
 #include <unistd.h>
 #include <cstring>
+#include <cfloat>
 
 #include <cuda_runtime.h>
 #include "kernel.hpp"
@@ -882,10 +883,6 @@ private:
             }
         }
     }
-    bool is_tight_area();
-
-
-
     void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area, const int8_t* class_map) {
         for (int i = 0; i < IMAX; ++i) {
             for (int j = 0; j < JMAX; ++j) {
@@ -926,11 +923,146 @@ private:
             }
         }
     }
+    int initialize_robot_kernel(float*& kernel, float mos) {
+        robot_length = 0.7f;
+        robot_width = 0.3f;
+    
+        const float ar = mos * robot_length / 2.0f;
+        const float br = mos * robot_width / 2.0f;
+        const float D = 2.0f * std::sqrt(ar * ar + br * br);
+    
+        int dim = 2 * static_cast<int>(std::ceil(std::ceil(D / DS) / 2.0f));
+        if (dim < 2) dim = 2;
+    
+        kernel = static_cast<float*>(std::malloc(dim * dim * QMAX * sizeof(float)));
+        if (!kernel) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to allocate robot kernel");
+            throw std::runtime_error("Robot kernel allocation failed");
+        }
+    
+        for (int q = 0; q < QMAX; ++q) {
+            float* kernel_slice = kernel + q * dim * dim;
+            const float yawq = q_to_yaw(q, xc[2]);
+            fill_elliptical_robot_kernel(kernel_slice, yawq, dim, 2.0f, mos);
+        }
+    
+        return dim;
+    }
+    void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float mos) {
+        const float ar = mos * robot_length / 2.0f;
+        const float br = mos * robot_width / 2.0f;
+    
+        if (ar < 0.001f || br < 0.001f) {
+            for (int i = 0; i < dim * dim; ++i) kernel[i] = 0.0f;
+            return;
+        }
+    
+        for (int i = 0; i < dim; ++i) {
+            const float yi = static_cast<float>(i - dim / 2) * DS;
+            for (int j = 0; j < dim; ++j) {
+                kernel[i * dim + j] = 0.0f;
+                const float xi = static_cast<float>(j - dim / 2) * DS;
+    
+                const float xb = std::cos(yawq) * xi + std::sin(yawq) * yi;
+                const float yb = -std::sin(yawq) * xi + std::cos(yawq) * yi;
+    
+                const float dist =
+                    std::pow(std::abs(xb / ar), expo) +
+                    std::pow(std::abs(yb / br), expo);
+    
+                if (dist <= 1.0f) kernel[i * dim + j] = -1.0f;
+            }
+        }
+    }
+    void inflate_occupancy_grid(float* bound, int8_t* class_map) {
+        float b0[IMAX * JMAX];
+        std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
+    
+        int8_t c0[IMAX * JMAX];
+        if (class_map) {
+            std::memcpy(c0, class_map, IMAX * JMAX * sizeof(int8_t));
+        }
+    
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                if (!b0[i * JMAX + j]) {
+                    int8_t source_class = 0;
+    
+                    if (class_map) {
+                        for (int di = -1; di <= 1 && source_class == 0; ++di) {
+                            for (int dj = -1; dj <= 1 && source_class == 0; ++dj) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+                                if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                                    if (b0[ni * JMAX + nj] < 0.0f && c0[ni * JMAX + nj] == 1) {
+                                        source_class = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+    
+                    const float* kernel = (source_class == 1) ? robot_kernel_human : robot_kernel_obstacle;
+                    const int kernel_dim = (source_class == 1) ? robot_kernel_dim_human : robot_kernel_dim_obstacle;
+                    const int lim = (kernel_dim - 1) / 2;
+    
+                    const int ilow = std::max(i - lim, 0);
+                    const int itop = std::min(i + lim, IMAX);
+                    const int jlow = std::max(j - lim, 0);
+                    const int jtop = std::min(j + lim, JMAX);
+    
+                    for (int p = ilow; p < itop; ++p) {
+                        for (int q = jlow; q < jtop; ++q) {
+                            const float kernel_val = kernel[(p - i + lim) * kernel_dim + (q - j + lim)];
+                            bound[p * JMAX + q] += kernel_val;
+    
+                            if (class_map && kernel_val < 0.0f && source_class == 1) {
+                                class_map[p * JMAX + q] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (bound[n] < -1.0f) bound[n] = -1.0f;
+        }
+    }
 
 
-    int initialize_robot_kernel(float*& kernel, float mos);
-    void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float mos);
-    void inflate_occupancy_grid(float* bound, int8_t* class_map = nullptr);
+
+
+
+
+
+    bool is_tight_area() {
+        auto tracks = human_tracker_->get_active_tracks();
+        if (tracks.empty()) return false;
+    
+        float min_human_dist = FLT_MAX;
+        for (const auto& track : tracks) {
+            const float d = std::sqrt(std::pow(track.x - x[0], 2) + std::pow(track.y - x[1], 2));
+            min_human_dist = std::min(min_human_dist, d);
+        }
+    
+        const float ic = y_to_i(0.0f, xc[1]);
+        const float jc = x_to_j(0.0f, xc[0]);
+        const float qc = yaw_to_q(x[2], xc[2]);
+    
+        const float ic_clamped = std::clamp(ic, 0.0f, static_cast<float>(IMAX - 1));
+        const float jc_clamped = std::clamp(jc, 0.0f, static_cast<float>(JMAX - 1));
+    
+        const float h_at_robot = trilinear_interpolation(hgrid1, ic_clamped, jc_clamped, qc);
+    
+        const bool tight =
+            (min_human_dist < tight_area_human_threshold_) &&
+            (h_at_robot < tight_area_h_threshold_);
+    
+        return tight;
+    }
+
+
     void compute_boundary_gradients(float* guidance_x, float* guidance_y, float* bound,
                                     const int8_t* class_map = nullptr,
                                     float rx = 0.0f, float ry = 0.0f,
@@ -942,8 +1074,171 @@ private:
                                              float bias_strength, float sign);
     void compute_optimal_forcing_function(float* force, const float* guidance_x, const float* guidance_y, const float* bound);
     void safety_filter(const std::vector<float> vd);
-    std::vector<ClusterInfo> extract_lidar_clusters(const float* occ_true);
-    void label_human_clusters(const float* occ_true);
+
+
+
+
+
+    std::vector<ClusterInfo> extract_lidar_clusters(const float* occ_true) {
+        std::vector<ClusterInfo> clusters;
+    
+        cv::Mat binary(IMAX, JMAX, CV_8UC1);
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
+        }
+    
+        cv::Mat labels, stats, centroids;
+        const int num_labels = cv::connectedComponentsWithStats(binary, labels, stats, centroids);
+    
+        for (int l = 1; l < num_labels; ++l) {
+            const int area = stats.at<int>(l, cv::CC_STAT_AREA);
+            if (area < 3) continue;
+    
+            ClusterInfo c;
+    
+            const float j_centroid = static_cast<float>(centroids.at<double>(l, 0));
+            const float i_centroid = static_cast<float>(centroids.at<double>(l, 1));
+    
+            c.centroid_x = (j_centroid - JMAX / 2) * DS;
+            c.centroid_y = (i_centroid - IMAX / 2) * DS;
+            c.cell_count = area;
+            c.label_id = l;
+    
+            int yolo_cell_count = 0;
+            int visible_cell_count = 0;
+            int cluster_cell_count = 0;
+    
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    if (labels.at<int>(i, j) == l) {
+                        ++cluster_cell_count;
+                        const int idx = i * JMAX + j;
+                        if (class_map[idx] == 1) ++yolo_cell_count;
+                        if (visibility_map[idx] == 1) ++visible_cell_count;
+                    }
+                }
+            }
+    
+            c.has_yolo_seed = (yolo_cell_count >= min_yolo_cells_);
+            c.in_camera_fov = (cluster_cell_count > 0 && visible_cell_count * 2 >= cluster_cell_count);
+    
+            clusters.push_back(c);
+        }
+    
+        return clusters;
+    }
+    void label_human_clusters(const float* occ_true) {
+        std::memset(class_map_expanded, 0, IMAX * JMAX * sizeof(int8_t));
+    
+        auto clusters = extract_lidar_clusters(occ_true);
+    
+        const float current_time =
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count();
+    
+        human_tracker_->update(clusters, current_time);
+        auto active_tracks = human_tracker_->get_active_tracks();
+    
+        cv::Mat binary(IMAX, JMAX, CV_8UC1);
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            binary.data[n] = (occ_true[n] < 0.0f) ? 255 : 0;
+        }
+    
+        cv::Mat labels, stats, centroids;
+        const int num_labels = cv::connectedComponentsWithStats(binary, labels, stats, centroids);
+    
+        for (const auto& track : active_tracks) {
+            const float track_j = track.x / DS + JMAX / 2.0f;
+            const float track_i = track.y / DS + IMAX / 2.0f;
+    
+            float best_dist = 999999.0f;
+            int best_label = -1;
+    
+            for (int l = 1; l < num_labels; ++l) {
+                const float j_cent = static_cast<float>(centroids.at<double>(l, 0));
+                const float i_cent = static_cast<float>(centroids.at<double>(l, 1));
+                const float dist = std::sqrt((j_cent - track_j) * (j_cent - track_j) +
+                                             (i_cent - track_i) * (i_cent - track_i));
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_label = l;
+                }
+            }
+    
+            const float gate_cells = 1.0f / DS;
+            const int max_human_cells = static_cast<int>(0.4f / (DS * DS));
+    
+            if (best_label > 0 &&
+                best_dist < gate_cells &&
+                track.yolo_ever_confirmed &&
+                track.confidence > 0.5f) {
+    
+                const int cluster_size = stats.at<int>(best_label, cv::CC_STAT_AREA);
+    
+                if (cluster_size <= max_human_cells) {
+                    for (int i = 0; i < IMAX; ++i) {
+                        for (int j = 0; j < JMAX; ++j) {
+                            if (labels.at<int>(i, j) == best_label) {
+                                class_map_expanded[i * JMAX + j] = 1;
+                            }
+                        }
+                    }
+                } else {
+                    const float label_radius = 0.1f / DS;
+                    const float radius_sq = label_radius * label_radius;
+    
+                    for (int i = 0; i < IMAX; ++i) {
+                        for (int j = 0; j < JMAX; ++j) {
+                            if (labels.at<int>(i, j) == best_label) {
+                                const float di = static_cast<float>(i) - track_i;
+                                const float dj = static_cast<float>(j) - track_j;
+                                if (di * di + dj * dj <= radius_sq) {
+                                    class_map_expanded[i * JMAX + j] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        int labeled_cells = 0;
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (class_map_expanded[n] == 1) ++labeled_cells;
+        }
+    
+        if (enable_human_tracker_dilation_ && labeled_cells > 0) {
+            int8_t temp_expanded[IMAX * JMAX];
+            std::memcpy(temp_expanded, class_map_expanded, IMAX * JMAX * sizeof(int8_t));
+    
+            const float* kernel = robot_kernel_human;
+            const int lim = (robot_kernel_dim_human - 1) / 2;
+    
+            for (int i = 1; i < IMAX - 1; ++i) {
+                const int ilow = std::max(i - lim, 0);
+                const int itop = std::min(i + lim, IMAX);
+    
+                for (int j = 1; j < JMAX - 1; ++j) {
+                    if (class_map_expanded[i * JMAX + j] != 1) continue;
+    
+                    const int jlow = std::max(j - lim, 0);
+                    const int jtop = std::min(j + lim, JMAX);
+    
+                    for (int p = ilow; p < itop; ++p) {
+                        for (int q = jlow; q < jtop; ++q) {
+                            const float kernel_val =
+                                kernel[(p - i + lim) * robot_kernel_dim_human + (q - j + lim)];
+                            if (kernel_val < 0.0f) {
+                                temp_expanded[p * JMAX + q] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+    
+            std::memcpy(class_map_expanded, temp_expanded, IMAX * JMAX * sizeof(int8_t));
+        }
+    }
+
 
     // ============================================================
     // 9. STATE
