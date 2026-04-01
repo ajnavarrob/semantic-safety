@@ -428,13 +428,17 @@ private:
         const float relTol = 1.0e-4f;
         const int N = IMAX / 5;
         const float w_SOR = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N + 1)));
+        
+        const bool success = true;
         (void)Kernel::poissonSolve(hgrid_temp_, force, bound, relTol, w_SOR);
 
         std::memcpy(occ0, occ1, IMAX * JMAX * sizeof(float));
         std::memcpy(hgrid0, hgrid1, IMAX * JMAX * QMAX * sizeof(float));
         std::memcpy(hgrid1, hgrid_temp_, IMAX * JMAX * QMAX * sizeof(float));
-        if (h_flag) dhdt_flag = true;
-        return true;
+
+        if (success) {
+            dhdt_flag = true;
+        }
     }
 
     void update_temporal_field_derivative() {
@@ -546,6 +550,25 @@ private:
         logging_data_pub_->publish(msg);
     }
 
+    void refresh_grid_temp_for_logging() {
+        const float qr = yaw_to_q(x[2], xc[2]);
+        const float q1f = std::floor(qr);
+        const float q2f = std::ceil(qr);
+        const int q1 = static_cast<int>(q_wrap(q1f));
+        const int q2 = static_cast<int>(q_wrap(q2f));
+    
+        #pragma omp parallel for
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (q1f != q2f) {
+                grid_temp[n] =
+                    (q2f - qr) * hgrid1[q1 * IMAX * JMAX + n] +
+                    (qr - q1f) * hgrid1[q2 * IMAX * JMAX + n];
+            } else {
+                grid_temp[n] = hgrid1[q1 * IMAX * JMAX + n];
+            }
+        }
+    }
+
     void maybe_write_experiment_data() {
         if (!(save_flag && enable_data_logging_to_file_)) return;
         const std::vector<float> save_data = {
@@ -559,7 +582,10 @@ private:
         }
         outFileCSV << std::endl;
         const int factor = 7;
-        if (!(poisson_save_counter % factor)) outFileBIN.write(reinterpret_cast<char*>(grid_temp), sizeof(grid_temp));
+        if (!(poisson_save_counter % factor)) {
+            refresh_grid_temp_for_logging();
+            outFileBIN.write(reinterpret_cast<char*>(grid_temp), sizeof(grid_temp));
+        }
         poisson_save_counter++;
     }
 
