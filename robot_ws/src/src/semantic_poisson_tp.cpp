@@ -110,6 +110,29 @@ public:
         startup_robot();
     }
 
+    ~PoissonControllerNode() override {
+        if (hgrid1) cudaFreeHost(hgrid1);
+        if (hgrid0) cudaFreeHost(hgrid0);
+        if (bound) cudaFreeHost(bound);
+        if (force) cudaFreeHost(force);
+
+        if (dhdt_grid) std::free(dhdt_grid);
+        if (guidance_x_grid) std::free(guidance_x_grid);
+        if (guidance_y_grid) std::free(guidance_y_grid);
+
+        if (hgrid_temp_) std::free(hgrid_temp_);
+        if (guidance_x_temp_) std::free(guidance_x_temp_);
+        if (guidance_y_temp_) std::free(guidance_y_temp_);
+        if (forcing_zero_temp_) std::free(forcing_zero_temp_);
+        if (bound_guidance_temp_) std::free(bound_guidance_temp_);
+
+        if (robot_kernel_human) std::free(robot_kernel_human);
+        if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
+
+        if (outFileCSV.is_open()) outFileCSV.close();
+        if (outFileBIN.is_open()) outFileBIN.close();
+    }
+
 private:
     // ============================================================
     // 1. ROS ORCHESTRATION
@@ -128,11 +151,35 @@ private:
     }
 
     void class_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
-        for (int n = 0; n < IMAX * JMAX; ++n) class_map[n] = msg->data[n];
+        if (msg->data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "class_map size mismatch: got %zu expected %d",
+                msg->data.size(),
+                IMAX * JMAX
+            );
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            class_map[n] = msg->data[n];
+        }
     }
 
     void visibility_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
-        for (int n = 0; n < IMAX * JMAX; ++n) visibility_map[n] = msg->data[n];
+        if (msg->data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "visibility_map size mismatch: got %zu expected %d",
+                msg->data.size(),
+                IMAX * JMAX
+            );
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            visibility_map[n] = msg->data[n];
+        }
     }
 
     void state_update_callback(const nav_msgs::msg::Odometry::SharedPtr data) {
@@ -197,26 +244,32 @@ private:
 
     void handle_occupancy_update(const nav_msgs::msg::OccupancyGrid& msg) {
         const auto grid_start = std::chrono::steady_clock::now();
-        update_grid_metadata_from_message(msg);
-
+    
+        if (!update_grid_metadata_from_message(msg)) {
+            return;
+        }
+    
         preprocess_occupancy();
         auto semantic_output = run_semantic_fusion();
         build_inflated_boundaries(semantic_output.tight_area);
         auto guidance_output = build_guidance_field(semantic_output.active_tracks);
         h_flag = solve_safety_field(guidance_output);
-
+    
         if (start_flag && dhdt_flag) {
             ScopedTimer timer(timing_.dhdt_update_ms);
             update_temporal_field_derivative();
         }
-
+    
         latest_field_timestamp_ = std::chrono::steady_clock::now();
         timing_.end_to_end_grid_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - grid_start).count();
-
+    
         if (enable_display) render_visualization();
         publish_timing_data();
     }
+
+
+
 
     void handle_state_update(const nav_msgs::msg::Odometry& data) {
         update_robot_state(data);
@@ -474,7 +527,23 @@ private:
     }
 
     void publish_timing_data() {
-        // Publish timing_.<...> here in the next step.
+        if (!logging_data_pub_) return;
+    
+        std_msgs::msg::Float32MultiArray msg;
+        msg.data = {
+            static_cast<float>(timing_.occupancy_preprocess_ms),
+            static_cast<float>(timing_.semantic_fusion_ms),
+            static_cast<float>(timing_.geometry_shaping_ms),
+            static_cast<float>(timing_.guidance_field_ms),
+            static_cast<float>(timing_.safety_field_solve_ms),
+            static_cast<float>(timing_.dhdt_update_ms),
+            static_cast<float>(timing_.predictive_control_ms),
+            static_cast<float>(timing_.realtime_filter_ms),
+            static_cast<float>(timing_.command_dispatch_ms),
+            static_cast<float>(timing_.field_data_age_ms),
+            static_cast<float>(timing_.end_to_end_grid_ms)
+        };
+        logging_data_pub_->publish(msg);
     }
 
     void maybe_write_experiment_data() {
@@ -519,6 +588,100 @@ private:
     // ============================================================
     // 7. HELPERS / INITIALIZATION
     // ============================================================
+
+    void initialize_mpc() {
+        mpc3d_controller.set_velocity_bounds(
+            vel_max_x_fwd_,
+            vel_max_x_bwd_,
+            vel_max_y_,
+            vel_max_yaw_
+        );
+        mpc3d_controller.setup_QP();
+        mpc3d_controller.solve();
+    }
+
+    void update_robot_state(const nav_msgs::msg::Odometry& data) {
+        dt_state = std::chrono::duration<float>(std::chrono::steady_clock::now() - t_state).count();
+        t_state = std::chrono::steady_clock::now();
+        grid_age += dt_state;
+    
+        x[0] = data.pose.pose.position.x;
+        x[1] = data.pose.pose.position.y;
+    
+        const auto& q = data.pose.pose.orientation;
+        const float sin_yaw = 2.0f * (q.w * q.z + q.x * q.y);
+        const float cos_yaw = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
+        x[2] = std::atan2(sin_yaw, cos_yaw);
+    }
+
+    bool update_grid_metadata_from_message(const nav_msgs::msg::OccupancyGrid& msg) {
+        if (msg.data.size() != IMAX * JMAX) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "occupancy_grid size mismatch: got %zu expected %d",
+                msg.data.size(),
+                IMAX * JMAX
+            );
+            return false;
+        }
+    
+        dt_grid = std::chrono::duration<float>(std::chrono::steady_clock::now() - t_grid).count();
+        t_grid = std::chrono::steady_clock::now();
+        grid_age = dt_grid;
+    
+        dx[0] = msg.info.origin.position.x - xc[0];
+        dx[1] = msg.info.origin.position.y - xc[1];
+        xc[0] = msg.info.origin.position.x;
+        xc[1] = msg.info.origin.position.y;
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            conf[n] = msg.data[n];
+        }
+    
+        return true;
+    }
+
+    void startup_robot() {
+        sport_req.RecoveryStand(req);
+        sleep(1);
+        sport_req.SpeedLevel(req, 1);
+        sleep(1);
+    }
+
+    void initialize_robot_kernels() {
+        robot_kernel_obstacle = nullptr;
+        robot_kernel_human = nullptr;
+    
+        robot_kernel_dim_obstacle = initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
+        robot_kernel_dim_human = initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
+    }
+
+    void initialize_static_grids() {
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            occ1[n] = 1.0f;
+            occ0[n] = 1.0f;
+            conf[n] = 0;
+            grid_temp[n] = 0.0f;
+            class_map[n] = 0;
+            visibility_map[n] = 0;
+            class_map_expanded[n] = 0;
+            guidance_x_display[n] = 0.0f;
+            guidance_y_display[n] = 0.0f;
+            bound_display[n] = 0.0f;
+            tangent_layer_display[n] = 0;
+        }
+    }
+
+    void initialize_clocks_and_flags() {
+        gen.seed(rd());
+        current_parameter_deck = sorted_parameter_deck;
+        std::shuffle(current_parameter_deck.begin(), current_parameter_deck.end(), gen);
+    
+        t_start = std::chrono::steady_clock::now();
+        t_grid = std::chrono::steady_clock::now();
+        t_state = std::chrono::steady_clock::now();
+        latest_field_timestamp_ = std::chrono::steady_clock::now();
+    }
 
     void initialize_logging_outputs() {
         if (!enable_data_logging_to_file_) {
@@ -770,6 +933,7 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent temporary buffers");
             throw std::runtime_error("Temporary buffer allocation failed");
         }
+        std::memset(bound_guidance_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
     
         // ------------------------------------------------------------
         // Initialize values
@@ -883,10 +1047,11 @@ private:
             }
         }
     }
+
     void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area, const int8_t* class_map) {
         for (int i = 0; i < IMAX; ++i) {
             for (int j = 0; j < JMAX; ++j) {
-                if (i == 0 || i == (IMAX - 1) || j == 0 || j == (JMAX - 1)) {
+                if (i == 0 || i == IMAX - 1 || j == 0 || j == JMAX - 1) {
                     bound[i * JMAX + j] = 0.0f;
                 }
             }
@@ -895,34 +1060,39 @@ private:
         float b0[IMAX * JMAX];
         std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
     
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            if (b0[n] == 1.0f) {
-                if (b0[n + 1] == -1.0f ||
-                    b0[n - 1] == -1.0f ||
-                    b0[n + JMAX] == -1.0f ||
-                    b0[n - JMAX] == -1.0f ||
-                    b0[n + JMAX + 1] == -1.0f ||
-                    b0[n - JMAX + 1] == -1.0f ||
-                    b0[n + JMAX - 1] == -1.0f ||
-                    b0[n - JMAX - 1] == -1.0f) {
-                    bound[n] = 0.0f;
-                }
-            }
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                const int n = i * JMAX + j;
     
-            if (fix_flag && !bound[n]) {
-                bool is_wall = true;
-                if (class_map) {
-                    is_wall = (class_map[n] != 1);
+                if (b0[n] == 1.0f) {
+                    if (b0[(i + 1) * JMAX + j] == -1.0f ||
+                        b0[(i - 1) * JMAX + j] == -1.0f ||
+                        b0[i * JMAX + (j + 1)] == -1.0f ||
+                        b0[i * JMAX + (j - 1)] == -1.0f ||
+                        b0[(i + 1) * JMAX + (j + 1)] == -1.0f ||
+                        b0[(i - 1) * JMAX + (j + 1)] == -1.0f ||
+                        b0[(i + 1) * JMAX + (j - 1)] == -1.0f ||
+                        b0[(i - 1) * JMAX + (j - 1)] == -1.0f) {
+                        bound[n] = 0.0f;
+                    }
                 }
     
-                if (tight_area && is_wall) {
-                    grid[n] = h0 + tight_area_wall_slack_;
-                } else {
-                    grid[n] = h0;
+                if (fix_flag && !bound[n]) {
+                    bool is_wall = true;
+                    if (class_map) {
+                        is_wall = (class_map[n] != 1);
+                    }
+    
+                    if (tight_area && is_wall) {
+                        grid[n] = h0 + tight_area_wall_slack_;
+                    } else {
+                        grid[n] = h0;
+                    }
                 }
             }
         }
     }
+
     int initialize_robot_kernel(float*& kernel, float mos) {
         robot_length = 0.7f;
         robot_width = 0.3f;
@@ -948,6 +1118,8 @@ private:
     
         return dim;
     }
+
+
     void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float mos) {
         const float ar = mos * robot_length / 2.0f;
         const float br = mos * robot_width / 2.0f;
@@ -974,6 +1146,8 @@ private:
             }
         }
     }
+
+
     void inflate_occupancy_grid(float* bound, int8_t* class_map) {
         float b0[IMAX * JMAX];
         std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
@@ -1030,12 +1204,6 @@ private:
         }
     }
 
-
-
-
-
-
-
     bool is_tight_area() {
         auto tracks = human_tracker_->get_active_tracks();
         if (tracks.empty()) return false;
@@ -1062,22 +1230,276 @@ private:
         return tight;
     }
 
-
     void compute_boundary_gradients(float* guidance_x, float* guidance_y, float* bound,
-                                    const int8_t* class_map = nullptr,
-                                    float rx = 0.0f, float ry = 0.0f,
-                                    float vn_x = 0.0f, float vn_y = 0.0f,
-                                    bool populate_human_info = false);
-    float compute_tangent_direction(const std::vector<HumanTrack>& active_tracks, float rx, float ry, float vn_x, float vn_y);
-    void expand_human_obstacles_for_guidance(float* bound_guidance, float* guidance_x, float* guidance_y,
-                                             const float* bound_original, int num_layers, int layer_thickness,
-                                             float bias_strength, float sign);
-    void compute_optimal_forcing_function(float* force, const float* guidance_x, const float* guidance_y, const float* bound);
-    void safety_filter(const std::vector<float> vd);
+                                    const int8_t* class_map,
+                                    float /*rx*/, float /*ry*/,
+                                    float /*vn_x*/, float /*vn_y*/,
+                                    bool populate_human_info) {
+        // Set border gradients
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (i == 0) guidance_x[i * JMAX + j] = dh0;
+                if (j == 0) guidance_y[i * JMAX + j] = dh0;
+                if (i == (IMAX - 1)) guidance_x[i * JMAX + j] = -dh0;
+                if (j == (JMAX - 1)) guidance_y[i * JMAX + j] = -dh0;
+            }
+        }
+    
+        if (populate_human_info) {
+            human_boundary_info_.clear();
+        }
+    
+        // Compute raw boundary normals on Layer 0
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                if (!bound[i * JMAX + j]) {
+                    guidance_x[i * JMAX + j] = 0.0f;
+                    guidance_y[i * JMAX + j] = 0.0f;
+    
+                    for (int p = -1; p <= 1; ++p) {
+                        for (int q = -1; q <= 1; ++q) {
+                            if (q > 0) {
+                                guidance_x[i * JMAX + j] += bound[(i + q) * JMAX + (j + p)];
+                                guidance_y[i * JMAX + j] += bound[(i + p) * JMAX + (j + q)];
+                            } else if (q < 0) {
+                                guidance_x[i * JMAX + j] -= bound[(i + q) * JMAX + (j + p)];
+                                guidance_y[i * JMAX + j] -= bound[(i + p) * JMAX + (j + q)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
+        // Normalize and assign class-dependent strength
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (!bound[i * JMAX + j]) {
+                    const float V = std::sqrt(
+                        guidance_x[i * JMAX + j] * guidance_x[i * JMAX + j] +
+                        guidance_y[i * JMAX + j] * guidance_y[i * JMAX + j]);
+    
+                    if (V != 0.0f) {
+                        guidance_x[i * JMAX + j] /= V;
+                        guidance_y[i * JMAX + j] /= V;
+                    }
+    
+                    float local_dh0 = dh0_obstacle;
+                    bool is_human = false;
+    
+                    if (class_map) {
+                        for (int di = -1; di <= 1 && !is_human; ++di) {
+                            for (int dj = -1; dj <= 1 && !is_human; ++dj) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+                                if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                                    if (bound[ni * JMAX + nj] < 0.0f && class_map[ni * JMAX + nj] == 1) {
+                                        is_human = true;
+                                    }
+                                }
+                            }
+                        }
+    
+                        if (is_human) {
+                            local_dh0 = dh0_human;
+                            if (populate_human_info) {
+                                human_boundary_info_.emplace_back(
+                                    i, j,
+                                    guidance_x[i * JMAX + j],
+                                    guidance_y[i * JMAX + j],
+                                    local_dh0
+                                );
+                            }
+                        }
+                    }
+    
+                    guidance_x[i * JMAX + j] *= local_dh0;
+                    guidance_y[i * JMAX + j] *= local_dh0;
+                }
+            }
+        }
+    }
 
+    float compute_tangent_direction(const std::vector<HumanTrack>& active_tracks,
+                                    float /*rx*/, float /*ry*/,
+                                    float /*vn_x*/, float /*vn_y*/) {
+        float target_sign = -1.0f;  // Default visual CW / pass left
+    
+        for (const auto& track : active_tracks) {
+            const float current_distance = std::sqrt(track.x * track.x + track.y * track.y);
+    
+            const float current_time =
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - t_start).count();
+    
+            float closing_rate = 0.0f;
+    
+            auto it = prev_human_distances_.find(track.id);
+            if (it != prev_human_distances_.end()) {
+                const float prev_distance = it->second.first;
+                const float prev_time = it->second.second;
+                const float dt = current_time - prev_time;
+    
+                if (dt > 0.01f && dt < 1.0f) {
+                    closing_rate = (prev_distance - current_distance) / dt;
+                }
+            }
+    
+            prev_human_distances_[track.id] = {current_distance, current_time};
+    
+            if (closing_rate > human_direction_threshold_) {
+                target_sign = 1.0f;  // visual CCW / pass right
+            }
+        }
+    
+        current_tangent_direction_ = target_sign;
+        return target_sign;
+    }
 
+    void expand_human_obstacles_for_guidance(float* bound_guidance,
+                                             float* guidance_x,
+                                             float* guidance_y,
+                                             const float* bound_original,
+                                             int num_layers,
+                                             int layer_thickness,
+                                             float bias_strength,
+                                             float sign) {
+        std::memcpy(bound_guidance, bound_original, IMAX * JMAX * sizeof(float));
+    
+        std::vector<bool> current_occupied(IMAX * JMAX, false);
+        std::vector<bool> is_human_region(IMAX * JMAX, false);
+    
+        // Seed from human boundary info
+        for (const auto& info : human_boundary_info_) {
+            const int i = std::get<0>(info);
+            const int j = std::get<1>(info);
+    
+            current_occupied[i * JMAX + j] = true;
+            is_human_region[i * JMAX + j] = true;
+    
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    const int ni = i + di;
+                    const int nj = j + dj;
+                    if (ni >= 0 && ni < IMAX && nj >= 0 && nj < JMAX) {
+                        if (bound_original[ni * JMAX + nj] < 0.0f) {
+                            current_occupied[ni * JMAX + nj] = true;
+                            is_human_region[ni * JMAX + nj] = true;
+                        }
+                    }
+                }
+            }
+        }
+    
+        for (int layer = 1; layer <= num_layers; ++layer) {
+            std::vector<bool> next_occupied = current_occupied;
+            std::vector<std::tuple<int, int, float, float>> new_layer_cells;
+    
+            const int r = layer_thickness;
+    
+            for (int i = r; i < IMAX - r; ++i) {
+                for (int j = r; j < JMAX - r; ++j) {
+                    if (current_occupied[i * JMAX + j]) continue;
+    
+                    bool in_human_range = false;
+                    float avg_gx = 0.0f;
+                    float avg_gy = 0.0f;
+                    int count = 0;
+    
+                    for (int di = -r; di <= r && !in_human_range; ++di) {
+                        for (int dj = -r; dj <= r && !in_human_range; ++dj) {
+                            if (di * di + dj * dj <= r * r) {
+                                const int ni = i + di;
+                                const int nj = j + dj;
+    
+                                if (is_human_region[ni * JMAX + nj] && current_occupied[ni * JMAX + nj]) {
+                                    in_human_range = true;
+    
+                                    for (const auto& info : human_boundary_info_) {
+                                        const int bi = std::get<0>(info);
+                                        const int bj = std::get<1>(info);
+                                        const int dist_sq = (bi - i) * (bi - i) + (bj - j) * (bj - j);
+    
+                                        if (dist_sq <= (layer * r + r) * (layer * r + r)) {
+                                            avg_gx += std::get<2>(info);
+                                            avg_gy += std::get<3>(info);
+                                            ++count;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+    
+                    if (in_human_range && bound_original[i * JMAX + j] > 0.0f) {
+                        if (count > 0) {
+                            avg_gx /= static_cast<float>(count);
+                            avg_gy /= static_cast<float>(count);
+                        } else {
+                            avg_gx = guidance_x[i * JMAX + j];
+                            avg_gy = guidance_y[i * JMAX + j];
+                        }
+    
+                        const float mag = std::sqrt(avg_gx * avg_gx + avg_gy * avg_gy);
+                        if (mag > 0.01f) {
+                            avg_gx /= mag;
+                            avg_gy /= mag;
+                            new_layer_cells.emplace_back(i, j, avg_gx, avg_gy);
+                        }
+    
+                        next_occupied[i * JMAX + j] = true;
+                        is_human_region[i * JMAX + j] = true;
+                    }
+                }
+            }
+    
+            const float ramp = static_cast<float>(layer) / static_cast<float>(num_layers);
+    
+            for (const auto& cell : new_layer_cells) {
+                const int i = std::get<0>(cell);
+                const int j = std::get<1>(cell);
+                const float gx = std::get<2>(cell);
+                const float gy = std::get<3>(cell);
+    
+                const float biased_gx = gx + sign * bias_strength * ramp * gy;
+                const float biased_gy = gy + sign * bias_strength * ramp * (-gx);
+    
+                const float V = std::sqrt(biased_gx * biased_gx + biased_gy * biased_gy);
+                if (V > 0.0f) {
+                    guidance_x[i * JMAX + j] = biased_gx / V * dh0_human;
+                    guidance_y[i * JMAX + j] = biased_gy / V * dh0_human;
+                }
+    
+                bound_guidance[i * JMAX + j] = 0.0f;
+                tangent_layer_display[i * JMAX + j] = static_cast<int8_t>(layer);
+            }
+    
+            current_occupied = next_occupied;
+        }
+    }
 
-
+    void compute_optimal_forcing_function(float* force,
+                                          const float* guidance_x,
+                                          const float* guidance_y,
+                                          const float* bound) {
+        const float max_div = 10.0f;
+    
+        for (int i = 1; i < IMAX - 1; ++i) {
+            for (int j = 1; j < JMAX - 1; ++j) {
+                force[i * JMAX + j] =
+                    (guidance_x[(i + 1) * JMAX + j] - guidance_x[(i - 1) * JMAX + j]) / (2.0f * DS) +
+                    (guidance_y[i * JMAX + (j + 1)] - guidance_y[i * JMAX + (j - 1)]) / (2.0f * DS);
+    
+                if (bound[i * JMAX + j] > 0.0f) {
+                    // free space: no clamp
+                } else if (bound[i * JMAX + j] < 0.0f) {
+                    force[i * JMAX + j] = std::max(force[i * JMAX + j], max_div);
+                    force[i * JMAX + j] = std::min(force[i * JMAX + j], 0.0f);
+                } else {
+                    force[i * JMAX + j] = 0.0f;
+                }
+            }
+        }
+    }
 
     std::vector<ClusterInfo> extract_lidar_clusters(const float* occ_true) {
         std::vector<ClusterInfo> clusters;
@@ -1127,6 +1549,7 @@ private:
     
         return clusters;
     }
+
     void label_human_clusters(const float* occ_true) {
         std::memset(class_map_expanded, 0, IMAX * JMAX * sizeof(int8_t));
     
@@ -1238,6 +1661,112 @@ private:
             std::memcpy(class_map_expanded, temp_expanded, IMAX * JMAX * sizeof(int8_t));
         }
     }
+
+    void safety_filter(const std::vector<float> vd) {
+        // In body_link frame, robot is always at origin (0, 0)
+        const float ic = y_to_i(0.0f, xc[1]);
+        const float jc = x_to_j(0.0f, xc[0]);
+        const float qc = yaw_to_q(0.0f, xc[2]);
+    
+        // Conservative local estimate of dh/dt around the robot footprint
+        const int range = static_cast<int>(std::round(0.2f / DS));
+        dhdt = 0.0f;
+        for (int di = -range; di <= range; ++di) {
+            for (int dj = -range; dj <= range; ++dj) {
+                const float dhdt_ij = trilinear_interpolation(dhdt_grid, ic + static_cast<float>(di), jc + static_cast<float>(dj), qc);
+                if (dhdt_ij < dhdt) dhdt = dhdt_ij;
+            }
+        }
+    
+        // Safety function value and forward prediction to compensate field age
+        h = trilinear_interpolation(hgrid1, ic, jc, qc);
+        const float h_pred = h + dhdt * grid_age;
+    
+        // Guidance field (control direction) from Laplace solve
+        // guidance_y corresponds to x-direction, guidance_x to y-direction
+        const float vx = trilinear_interpolation(guidance_y_grid, ic, jc, qc);
+        const float vy = trilinear_interpolation(guidance_x_grid, ic, jc, qc);
+        const float v_norm = std::sqrt(vx * vx + vy * vy);
+    
+        // Numerical gradient of h-field in x/y
+        const float h_eps = 1.0f;
+        const float hip = trilinear_interpolation(hgrid1, ic + h_eps, jc, qc);
+        const float him = trilinear_interpolation(hgrid1, ic - h_eps, jc, qc);
+        const float hjp = trilinear_interpolation(hgrid1, ic, jc + h_eps, qc);
+        const float hjm = trilinear_interpolation(hgrid1, ic, jc - h_eps, qc);
+    
+        const float Dh_x = (hjp - hjm) / (2.0f * h_eps * DS);
+        const float Dh_y = (hip - him) / (2.0f * h_eps * DS);
+    
+        // Store guidance direction for logging/visualization
+        dhdx = vx;
+        dhdy = vy;
+    
+        // Numerical derivative in yaw
+        const float q_eps = 1.0f;
+        const float qp = q_wrap(qc + q_eps);
+        const float qm = q_wrap(qc - q_eps);
+    
+        float hqp = trilinear_interpolation(hgrid1, ic, jc, qp);
+        float hqm = trilinear_interpolation(hgrid1, ic, jc, qm);
+        dhdq = (hqp - hqm) / (2.0f * q_eps * DQ);
+    
+        // Forward-predicted guidance-aligned derivatives
+        const float dhdx_pred = vx;
+        const float dhdy_pred = vy;
+    
+        hqp += trilinear_interpolation(dhdt_grid, ic, jc, qp) * grid_age;
+        hqm += trilinear_interpolation(dhdt_grid, ic, jc, qm) * grid_age;
+        const float dhdq_pred = (hqp - hqm) / (2.0f * q_eps * DQ);
+    
+        const float Dh_norm = std::sqrt(Dh_x * Dh_x + Dh_y * Dh_y + dhdq_pred * dhdq_pred);
+    
+        // sigma(h) = epsilon * (1 - exp(-kappa * max(0,h)))
+        const float sigma_h =
+            cbf_sigma_epsilon_ *
+            (1.0f - std::exp(-cbf_sigma_kappa_ * std::max(0.0f, h_pred)));
+    
+        // Dynamic dh/dt scaling from eq. 31, clamped to avoid instability
+        const float dhdt_scale =
+            std::min(v_norm / (Dh_norm + sigma_h + 1.0e-6f), 1.0f);
+    
+        // Input-to-State Safety robustness term
+        const float Pu[3] = {2.0f, 2.0f, 1.0f};
+        const float ISSf1 = issf;
+        const float ISSf2 = issf;
+    
+        const float b =
+            dhdx_pred * dhdx_pred / Pu[0] +
+            dhdy_pred * dhdy_pred / Pu[1] +
+            dhdq_pred * dhdq_pred / Pu[2];
+    
+        float ISSf = std::sqrt(b) / ISSf1 + b / ISSf2;
+        const float sigma = std::clamp(-10.0f * dhdt, 0.0f, 1.0f);
+        ISSf *= sigma;
+    
+        // Activating function
+        float a = wn * h_pred;
+        a += vx * vd[0] + vy * vd[1];
+        a += dhdt_scale * dhdt;
+        a += dhdq_pred * vd[2];
+        a -= ISSf;
+    
+        // Half-Sontag correction
+        const float sigma_sontag = 1.0f;
+        float lambda = 0.0f;
+        if (b > 1.0e-4f) {
+            lambda = (-a + std::sqrt(a * a + sigma_sontag * b * b)) / (2.0f * b);
+        }
+    
+        v = vd;
+        if (realtime_sf_flag) {
+            v[0] += lambda * dhdx_pred / Pu[0];
+            v[1] += lambda * dhdy_pred / Pu[1];
+            v[2] += lambda * dhdq_pred / Pu[2];
+        }
+    }
+
+
 
 
     // ============================================================
@@ -1372,3 +1901,36 @@ private:
 };
 
 } // namespace ss
+
+int main(int argc, char* argv[]) {
+    rclcpp::init(argc, argv);
+
+    rclcpp::executors::MultiThreadedExecutor executor;
+
+    auto poissonNode = std::make_shared<ss::PoissonControllerNode>();
+
+    // Read CloudMerger parameters from the Poisson node so behavior matches the original setup
+    const float min_z = poissonNode->get_parameter("min_z").as_double();
+    const float max_z = poissonNode->get_parameter("max_z").as_double();
+
+    RCLCPP_INFO(
+        poissonNode->get_logger(),
+        "Passing min_z=%.2f, max_z=%.2f to CloudMergerNode",
+        min_z, max_z
+    );
+
+    auto mappingNode = std::make_shared<CloudMergerNode>(min_z, max_z);
+
+    executor.add_node(mappingNode);
+    executor.add_node(poissonNode);
+
+    try {
+        executor.spin();
+        throw("Terminated");
+    } catch (const char* msg) {
+        rclcpp::shutdown();
+        std::cout << msg << std::endl;
+    }
+
+    return 0;
+}
