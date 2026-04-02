@@ -87,11 +87,7 @@ struct SemanticStageOutput {
 };
 
 struct GuidanceStageOutput {
-    float* guidance_x{nullptr};
-    float* guidance_y{nullptr};
-    float* forcing_zero{nullptr};
     float* bound_guidance{nullptr};
-    bool uses_temp_bound{false};
 };
 
 class ScopedTimer {
@@ -137,6 +133,8 @@ public:
         if (guidance_y_temp_) std::free(guidance_y_temp_);
         if (forcing_zero_temp_) std::free(forcing_zero_temp_);
         if (bound_guidance_temp_) std::free(bound_guidance_temp_);
+        if (class_map_temp_expanded_) std::free(class_map_temp_expanded_);
+        if (boundary_temp_) std::free(boundary_temp_);
 
         if (robot_kernel_human) std::free(robot_kernel_human);
         if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
@@ -365,11 +363,7 @@ private:
 
     GuidanceStageOutput build_guidance_field(const std::vector<HumanTrack>& active_tracks) {
         GuidanceStageOutput out;
-        out.guidance_x = guidance_x_temp_;
-        out.guidance_y = guidance_y_temp_;
-        out.forcing_zero = forcing_zero_temp_;
         out.bound_guidance = bound;
-        out.uses_temp_bound = false;
 
         std::memset(guidance_x_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
         std::memset(guidance_y_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
@@ -402,7 +396,6 @@ private:
         
             if (enable_social_navigation_ && social_tangent_layers_ > 0 && !human_boundary_info_.empty()) {
                 out.bound_guidance = bound_guidance_temp_;
-                out.uses_temp_bound = true;
                 const float sign = compute_tangent_direction(active_tracks, 0.0f, 0.0f, vn_body_x, vn_body_y);
                 for (int q = 0; q < QMAX; ++q) {
                     expand_human_obstacles_for_guidance(
@@ -1007,11 +1000,16 @@ private:
         guidance_y_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
         forcing_zero_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
         bound_guidance_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        class_map_temp_expanded_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
+        boundary_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
     
-        if (!hgrid_temp_ || !guidance_x_temp_ || !guidance_y_temp_ || !forcing_zero_temp_ || !bound_guidance_temp_) {
+        if (!hgrid_temp_ || !guidance_x_temp_ || !guidance_y_temp_ ||
+            !forcing_zero_temp_ || !bound_guidance_temp_ ||
+            !class_map_temp_expanded_ || !boundary_temp_) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent temporary buffers");
             throw std::runtime_error("Temporary buffer allocation failed");
         }
+        
         std::memset(bound_guidance_temp_, 0, IMAX * JMAX * QMAX * sizeof(float));
     
         // ------------------------------------------------------------
@@ -1136,8 +1134,8 @@ private:
             }
         }
     
-        float b0[IMAX * JMAX];
-        std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
+        std::memcpy(boundary_temp_, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = boundary_temp_;
     
         for (int i = 1; i < IMAX - 1; ++i) {
             for (int j = 1; j < JMAX - 1; ++j) {
@@ -1710,37 +1708,36 @@ private:
         for (int n = 0; n < IMAX * JMAX; ++n) {
             if (class_map_expanded[n] == 1) ++labeled_cells;
         }
-    
+        
         if (enable_human_tracker_dilation_ && labeled_cells > 0) {
-            int8_t temp_expanded[IMAX * JMAX];
-            std::memcpy(temp_expanded, class_map_expanded, IMAX * JMAX * sizeof(int8_t));
-    
+            std::memcpy(class_map_temp_expanded_, class_map_expanded, IMAX * JMAX * sizeof(int8_t));
+        
             const float* kernel = robot_kernel_human;
             const int lim = (robot_kernel_dim_human - 1) / 2;
-    
+        
             for (int i = 1; i < IMAX - 1; ++i) {
                 const int ilow = std::max(i - lim, 0);
                 const int itop = std::min(i + lim, IMAX);
-    
+        
                 for (int j = 1; j < JMAX - 1; ++j) {
                     if (class_map_expanded[i * JMAX + j] != 1) continue;
-    
+        
                     const int jlow = std::max(j - lim, 0);
                     const int jtop = std::min(j + lim, JMAX);
-    
+        
                     for (int p = ilow; p < itop; ++p) {
                         for (int q = jlow; q < jtop; ++q) {
                             const float kernel_val =
                                 kernel[(p - i + lim) * robot_kernel_dim_human + (q - j + lim)];
                             if (kernel_val < 0.0f) {
-                                temp_expanded[p * JMAX + q] = 1;
+                                class_map_temp_expanded_[p * JMAX + q] = 1;
                             }
                         }
                     }
                 }
             }
-    
-            std::memcpy(class_map_expanded, temp_expanded, IMAX * JMAX * sizeof(int8_t));
+        
+            std::memcpy(class_map_expanded, class_map_temp_expanded_, IMAX * JMAX * sizeof(int8_t));
         }
     }
 
@@ -1924,6 +1921,9 @@ private:
     float* guidance_y_temp_{};
     float* forcing_zero_temp_{};
     float* bound_guidance_temp_{};
+    int8_t* class_map_temp_expanded_{};
+    float* boundary_temp_{};
+
 
     float guidance_x_display[IMAX * JMAX];
     float guidance_y_display[IMAX * JMAX];
