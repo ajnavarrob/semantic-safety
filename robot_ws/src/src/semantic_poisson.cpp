@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <cfloat>
+#include <set>
+#include <shared_mutex>
 
 #include <cuda_runtime.h>
 #include "kernel.hpp"
@@ -135,6 +137,8 @@ public:
         if (bound_guidance_temp_) std::free(bound_guidance_temp_);
         if (class_map_temp_expanded_) std::free(class_map_temp_expanded_);
         if (boundary_temp_) std::free(boundary_temp_);
+        if (inflate_bound_temp_) std::free(inflate_bound_temp_);
+        if (inflate_class_temp_) std::free(inflate_class_temp_);
 
         if (robot_kernel_human) std::free(robot_kernel_human);
         if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
@@ -1002,10 +1006,13 @@ private:
         bound_guidance_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         class_map_temp_expanded_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
         boundary_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
+        inflate_bound_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
+        inflate_class_temp_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
     
         if (!hgrid_temp_ || !guidance_x_temp_ || !guidance_y_temp_ ||
             !forcing_zero_temp_ || !bound_guidance_temp_ ||
-            !class_map_temp_expanded_ || !boundary_temp_) {
+            !class_map_temp_expanded_ || !boundary_temp_ ||
+            !inflate_bound_temp_ || !inflate_class_temp_) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent temporary buffers");
             throw std::runtime_error("Temporary buffer allocation failed");
         }
@@ -1226,10 +1233,10 @@ private:
 
 
     void inflate_occupancy_grid(float* bound, int8_t* class_map) {
-        float b0[IMAX * JMAX];
-        std::memcpy(b0, bound, IMAX * JMAX * sizeof(float));
-    
-        int8_t c0[IMAX * JMAX];
+        std::memcpy(inflate_bound_temp_, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = inflate_bound_temp_;
+        
+        int8_t* c0 = inflate_class_temp_;
         if (class_map) {
             std::memcpy(c0, class_map, IMAX * JMAX * sizeof(int8_t));
         }
@@ -1427,7 +1434,19 @@ private:
                 target_sign = 1.0f;  // visual CCW / pass right
             }
         }
-    
+        std::set<int> active_ids;
+        for (const auto& track : active_tracks) {
+            active_ids.insert(track.id);
+        }
+        
+        for (auto it = prev_human_distances_.begin(); it != prev_human_distances_.end(); ) {
+            if (active_ids.find(it->first) == active_ids.end()) {
+                it = prev_human_distances_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        
         current_tangent_direction_ = target_sign;
         return target_sign;
     }
@@ -1861,6 +1880,8 @@ private:
 
     std::mutex mpc_mutex;
     MPC3D mpc3d_controller;
+    mutable std::shared_mutex field_mutex_;
+
     const float h0 = 0.0f;
     const float dh0 = 1.0f;
     float wn = 1.0f;
@@ -1923,6 +1944,8 @@ private:
     float* bound_guidance_temp_{};
     int8_t* class_map_temp_expanded_{};
     float* boundary_temp_{};
+    float* inflate_bound_temp_{};
+    int8_t* inflate_class_temp_{};
 
 
     float guidance_x_display[IMAX * JMAX];
