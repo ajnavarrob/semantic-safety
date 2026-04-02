@@ -263,18 +263,23 @@ private:
             return;
         }
     
-        preprocess_occupancy();
-        auto semantic_output = run_semantic_fusion();
-        build_inflated_boundaries(semantic_output.tight_area);
-        auto guidance_output = build_guidance_field(semantic_output.active_tracks);
-        h_flag = solve_safety_field(guidance_output);
+        {
+            std::unique_lock<std::shared_mutex> lock(field_mutex_);
     
-        if (start_flag && dhdt_flag) {
-            ScopedTimer timer(timing_.dhdt_update_ms);
-            update_temporal_field_derivative();
+            preprocess_occupancy();
+            auto semantic_output = run_semantic_fusion();
+            build_inflated_boundaries(semantic_output.tight_area);
+            auto guidance_output = build_guidance_field(semantic_output.active_tracks);
+            h_flag = solve_safety_field(guidance_output);
+    
+            if (start_flag && dhdt_flag) {
+                ScopedTimer timer(timing_.dhdt_update_ms);
+                update_temporal_field_derivative();
+            }
+    
+            latest_field_timestamp_ = std::chrono::steady_clock::now();
         }
     
-        latest_field_timestamp_ = std::chrono::steady_clock::now();
         timing_.end_to_end_grid_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - grid_start).count();
     
