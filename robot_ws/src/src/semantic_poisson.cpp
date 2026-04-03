@@ -303,6 +303,7 @@ private:
             std::chrono::steady_clock::now() - latest_field_timestamp_).count();
     
         {
+            std::shared_lock<std::shared_mutex> lock(field_mutex_);
             ScopedTimer timer(timing_.realtime_filter_ms);
             if (h_flag) compute_realtime_safe_control(v_input_body);
             else v = v_input_body;
@@ -319,6 +320,8 @@ private:
     void handle_mpc_update() {
         if (!(predictive_sf_flag && h_flag && mpc_mutex.try_lock())) return;
         std::lock_guard<std::mutex> lock(mpc_mutex, std::adopt_lock);
+    
+        std::shared_lock<std::shared_mutex> field_lock(field_mutex_);
         ScopedTimer timer(timing_.predictive_control_ms);
         compute_predictive_control();
     }
@@ -429,7 +432,7 @@ private:
             solve_guidance_laplace(out.bound_guidance);
         }
         
-        compute_guidance_forcing();
+        compute_guidance_forcing(out.bound_guidance);
 
         {
             ScopedTimer timer(timing_.guidance_copyout_ms);
@@ -451,11 +454,11 @@ private:
         (void)Kernel::poissonSolve(guidance_y_temp_, forcing_zero_temp_, bound_guidance, v_RelTol, w_SOR_guidance);
     }
 
-    void compute_guidance_forcing() {
+    void compute_guidance_forcing(const float* bound_guidance) {
         #pragma omp parallel for num_threads(4)
         for (int q = 0; q < QMAX; ++q) {
             float* force_slice = force + q * IMAX * JMAX;
-            float* bound_slice = bound + q * IMAX * JMAX;
+            const float* bound_slice = bound_guidance + q * IMAX * JMAX;
             float* gx = guidance_x_temp_ + q * IMAX * JMAX;
             float* gy = guidance_y_temp_ + q * IMAX * JMAX;
             compute_optimal_forcing_function(force_slice, gx, gy, bound_slice);
