@@ -284,7 +284,11 @@ private:
             std::chrono::steady_clock::now() - grid_start).count();
     
         if (enable_display) render_visualization();
-        publish_timing_data();
+        
+        if (should_publish_logging_now()) {
+            publish_logging_data();
+            publish_profiling_data();
+        }
     }
 
 
@@ -332,7 +336,7 @@ private:
         std::memcpy(
             hgrid_temp_,
             hgrid1,
-            IMAX * JMAX * sizeof(float)
+            IMAX * JMAX * QMAX * sizeof(float)
         );
     
         find_boundary(hgrid_temp_, occ1, false);
@@ -466,10 +470,13 @@ private:
         const int N = IMAX / 5;
         const float w_SOR = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N + 1)));
     
-        const bool success = true;
-    
-        (void)Kernel::poissonSolve(hgrid_temp_, force, guidance.bound_guidance, relTol, w_SOR);
-    
+        bool success = true;
+        if (!hgrid_temp_ || !force || !guidance.bound_guidance) {
+            success = false;
+        } else {
+            (void)Kernel::poissonSolve(hgrid_temp_, force, guidance.bound_guidance, relTol, w_SOR);
+            // optional: add finite-value checks here
+}
         std::memcpy(occ0, occ1, IMAX * JMAX * sizeof(float));
         std::memcpy(hgrid0, hgrid1, IMAX * JMAX * QMAX * sizeof(float));
         std::memcpy(hgrid1, hgrid_temp_, IMAX * JMAX * QMAX * sizeof(float));
@@ -568,30 +575,34 @@ private:
         // This has been separated conceptually from the hot-path field construction.
     }
 
-    void publish_timing_data() {
-        if (!logging_data_pub_) return;
-    
+
+    bool should_publish_logging_now() {
         const auto now = std::chrono::steady_clock::now();
         const double time_since_last =
             std::chrono::duration<double>(now - last_logging_publish_time_).count();
     
         if (time_since_last < logging_publish_period_) {
-            return;
+            return false;
         }
     
         last_logging_publish_time_ = now;
+        return true;
+    }
+
+    void publish_profiling_data() {
+        if (!profiling_data_pub_) return;
     
         std_msgs::msg::Float32MultiArray msg;
         msg.data = {
             static_cast<float>(timing_.occupancy_preprocess_ms),
             static_cast<float>(timing_.semantic_fusion_ms),
             static_cast<float>(timing_.geometry_shaping_ms),
-        
+    
             static_cast<float>(timing_.guidance_boundary_setup_ms),
             static_cast<float>(timing_.guidance_social_expansion_ms),
             static_cast<float>(timing_.guidance_laplace_ms),
             static_cast<float>(timing_.guidance_copyout_ms),
-        
+    
             static_cast<float>(timing_.safety_field_solve_ms),
             static_cast<float>(timing_.dhdt_update_ms),
             static_cast<float>(timing_.predictive_control_ms),
@@ -601,7 +612,7 @@ private:
             static_cast<float>(timing_.end_to_end_grid_ms)
         };
     
-        logging_data_pub_->publish(msg);
+        profiling_data_pub_->publish(msg);
     }
 
     void refresh_grid_temp_for_logging() {
@@ -1098,6 +1109,7 @@ private:
     
         poisson_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/poisson/visualization", 10);
         logging_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/logging_data", 10);
+        profiling_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/profiling_data", 10);
     
         mpc_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
         mpc_timer_ = this->create_wall_timer(
@@ -1106,6 +1118,26 @@ private:
             mpc_callback_group_
         );
     }
+
+    void publish_logging_data() {
+        if (!logging_data_pub_) return;
+    
+        std_msgs::msg::Float32MultiArray msg;
+        msg.data = {
+            t_ms,
+            static_cast<float>(space_counter),
+            x[0], x[1], x[2],
+            v[0], v[1], v[2],
+            vt[0], vt[1], vt[2],
+            h, dhdx, dhdy, dhdq, dhdt,
+            wn,
+            static_cast<float>(realtime_sf_flag | predictive_sf_flag)
+        };
+    
+        logging_data_pub_->publish(msg);
+    }
+
+
 
 
 
@@ -2008,6 +2040,7 @@ private:
     std::ofstream outFileBIN;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr poisson_image_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_data_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr profiling_data_pub_;
     double logging_publish_hz_ = 10.0;
     double logging_publish_period_ = 0.1;
     std::chrono::steady_clock::time_point last_logging_publish_time_;
