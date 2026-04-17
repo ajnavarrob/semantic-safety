@@ -145,7 +145,15 @@ add_executable(odom_publisher_fastlio src/odom_publisher_fastlio.cpp)
 
 # target_link_libraries(poissonLocal Eigen3::Eigen OsqpEigen::OsqpEigen cuda_kernel ${OpenCV_LIBS} ${PCL_LIBRARIES})
 target_link_libraries(teleOp ${CURSES_LIBRARIES})
-target_link_libraries(semantic_poisson Eigen3::Eigen OsqpEigen::OsqpEigen cuda_kernel ${OpenCV_LIBS} ${PCL_LIBRARIES})
+target_link_libraries(
+  semantic_poisson
+  Eigen3::Eigen
+  OsqpEigen::OsqpEigen
+  cuda_kernel
+  nlohmann_json::nlohmann_json
+  ${OpenCV_LIBS}
+  ${PCL_LIBRARIES}
+)
 
 # ament_target_dependencies(poissonLocal ${DEPENDENCY_LIST})
 ament_target_dependencies(teleOp ${DEPENDENCY_LIST})
