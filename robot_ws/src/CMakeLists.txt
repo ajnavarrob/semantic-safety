@@ -84,6 +84,7 @@ find_package(Eigen3 REQUIRED)
 find_package(OsqpEigen REQUIRED)
 find_package(osqp REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 # Detect Jetson platform
 if(EXISTS "/etc/nv_tegra_release")
