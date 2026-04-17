@@ -1,51 +1,70 @@
-#include "semantic_constraints/constraint_manager.hpp"
+#include "constraints/constraint_manager.hpp"
+
 #include <fstream>
+#include <iostream>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
 
 bool ConstraintManager::load_from_json(const std::string& path) {
+    config_ = ConstraintRuntimeConfig{};  // reset each load
+
+    if (path.empty()) {
+        std::cout << "[ConstraintManager] Empty JSON path. Using defaults.\n";
+        return false;
+    }
+
     std::ifstream f(path);
-    if (!f.is_open()) return false;
+    if (!f.is_open()) {
+        std::cout << "[ConstraintManager] Could not open file: " << path << "\n";
+        return false;
+    }
 
     json j;
-    f >> j;
+    try {
+        f >> j;
+    } catch (const std::exception& e) {
+        std::cout << "[ConstraintManager] Failed to parse JSON: " << e.what() << "\n";
+        return false;
+    }
 
-    constraints_.clear();
+    if (!j.contains("constraints") || !j["constraints"].is_array()) {
+        std::cout << "[ConstraintManager] JSON missing 'constraints' array.\n";
+        return false;
+    }
 
-    for (const auto& jc : j["constraints"]) {
-        SemanticConstraint c;
-        c.id = jc.value("id", "");
-        c.enabled = jc.value("enabled", true);
-        c.type = jc.value("type", "");
+    for (const auto& c : j["constraints"]) {
+        const bool enabled = c.value("enabled", true);
+        if (!enabled) continue;
 
-        if (jc.contains("objects")) {
-            const auto& objs = jc["objects"];
-            if (objs.contains("target")) {
-                c.target_objects = objs["target"].get<std::vector<std::string>>();
-            }
-            if (objs.contains("object_a")) {
-                c.object_a = objs["object_a"].get<std::vector<std::string>>();
-            }
-            if (objs.contains("object_b")) {
-                c.object_b = objs["object_b"].get<std::vector<std::string>>();
+        const std::string type = c.value("type", "");
+        if (type != "exclusion") continue;
+
+        if (!c.contains("objects")) continue;
+        if (!c["objects"].contains("target")) continue;
+        if (!c.contains("spatial_parameters")) continue;
+
+        const auto& targets = c["objects"]["target"];
+        const float buffer =
+            c["spatial_parameters"].value("buffer_distance_m", -1.0f);
+
+        if (buffer <= 0.0f) continue;
+
+        for (const auto& t : targets) {
+            const std::string target = t.get<std::string>();
+
+            // FIRST IMPLEMENTATION: only support person exclusion
+            if (target == "person") {
+                config_.human_buffer_m = buffer;
+                std::cout << "[ConstraintManager] Loaded human buffer override: "
+                          << buffer << " m\n";
             }
         }
-
-        if (jc.contains("spatial_parameters")) {
-            const auto& sp = jc["spatial_parameters"];
-            c.buffer_distance_m = sp.value("buffer_distance_m", 0.0f);
-            c.relation = sp.value("relation", "");
-            c.reference_frame = sp.value("reference_frame", "");
-        }
-
-        if (jc.contains("behavior")) {
-            const auto& bh = jc["behavior"];
-            c.behavior_mode = bh.value("mode", "");
-        }
-
-        constraints_.push_back(c);
     }
 
     return true;
+}
+
+const ConstraintRuntimeConfig& ConstraintManager::get_config() const {
+    return config_;
 }
