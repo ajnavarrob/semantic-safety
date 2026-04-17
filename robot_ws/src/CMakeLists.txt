@@ -132,7 +132,12 @@ endif()
 # poissonLocal disabled - uses old MPC interface incompatible with guidance field changes
 # add_executable(poissonLocal src/poisson.cpp src/utils.cpp src/common/ros2_sport_client.cpp)
 add_executable(teleOp src/teleop.cpp)
-add_executable(semantic_poisson src/semantic_poisson.cpp src/utils.cpp src/common/ros2_sport_client.cpp)
+add_executable(semantic_poisson
+  src/semantic_poisson.cpp
+  src/constraint_manager.cpp
+  src/utils.cpp
+  src/common/ros2_sport_client.cpp
+)
 add_executable(odom_publisher src/odom_publisher.cpp)
 add_executable(odom_publisher_t265 src/odom_publisher_t265.cpp)
 add_executable(odom_publisher_fastlio src/odom_publisher_fastlio.cpp)
