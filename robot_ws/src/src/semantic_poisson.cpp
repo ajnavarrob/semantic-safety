@@ -26,6 +26,7 @@
 #include "mpc_cbf_3d.h"
 #include "cloud_merger.h"
 #include "poisson/human_tracker.h"
+#include "constraint_manager.hpp"
 
 #include <opencv2/opencv.hpp>
 
@@ -112,7 +113,28 @@ class PoissonControllerNode : public rclcpp::Node {
 public:
     PoissonControllerNode() : Node("poisson_control"), sport_req(this) {
         declare_and_load_parameters();
-        load_constraints_from_json();
+    
+        if (!constraints_path_.empty()) {
+            if (constraint_manager_.load_from_json(constraints_path_)) {
+                constraint_runtime_config_ = constraint_manager_.get_config();
+    
+                if (constraint_runtime_config_.human_buffer_m > 0.0f) {
+                    robot_MOS_human = constraint_runtime_config_.human_buffer_m;
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "Applied JSON human buffer override: %.2f m",
+                        robot_MOS_human
+                    );
+                }
+            } else {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Failed to load constraints JSON from: %s",
+                    constraints_path_.c_str()
+                );
+            }
+        }
+    
         initialize_clocks_and_flags();
         initialize_static_grids();
         allocate_persistent_buffers();
@@ -2062,6 +2084,10 @@ private:
     int robot_kernel_dim_human{}, robot_kernel_dim_obstacle{};
     std::string constraints_path_;
     float json_human_buffer_ = -1.0f;
+
+    ConstraintManager constraint_manager_;
+    ConstraintRuntimeConfig constraint_runtime_config_;
+    std::string constraints_path_;
 
     rclcpp::CallbackGroup::SharedPtr mpc_callback_group_;
     rclcpp::TimerBase::SharedPtr mpc_timer_;
