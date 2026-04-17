@@ -1,0 +1,66 @@
+{
+  "scenario_name": "lab_demo_static_constraints",
+  "constraints": [
+    {
+      "id": "c1_human_buffer",
+      "enabled": true,
+      "type": "exclusion",
+      "objects": {
+        "target": ["person"]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 1.5,
+        "reference_frame": "object"
+      },
+      "behavior": {
+        "mode": "strict"
+      }
+    },
+    {
+      "id": "c2_emergency_tape",
+      "enabled": true,
+      "type": "exclusion",
+      "objects": {
+        "target": ["emergency tape"]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 2.0,
+        "reference_frame": "object"
+      },
+      "behavior": {
+        "mode": "strict"
+      }
+    },
+    {
+      "id": "c3_pass_left_human",
+      "enabled": true,
+      "type": "relational",
+      "objects": {
+        "target": ["person"]
+      },
+      "spatial_parameters": {
+        "relation": "pass_left_of",
+        "reference_frame": "object"
+      },
+      "behavior": {
+        "mode": "preference"
+      }
+    },
+    {
+      "id": "c4_forbidden_between_person_shelf",
+      "enabled": true,
+      "type": "relational",
+      "objects": {
+        "object_a": ["person"],
+        "object_b": ["shelf"]
+      },
+      "spatial_parameters": {
+        "relation": "avoid_between",
+        "reference_frame": "global"
+      },
+      "behavior": {
+        "mode": "strict"
+      }
+    }
+  ]
+}
