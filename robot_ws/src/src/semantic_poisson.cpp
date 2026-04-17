@@ -17,7 +17,6 @@
 #include <cfloat>
 #include <set>
 #include <shared_mutex>
-#include <nlohmann/json.hpp>
 
 #include <cuda_runtime.h>
 #include "kernel.hpp"
@@ -706,66 +705,6 @@ private:
     // ============================================================
     // 7. HELPERS / INITIALIZATION
     // ============================================================
-
-    void load_constraints_from_json() {
-        if (constraints_path_.empty()) {
-            RCLCPP_INFO(this->get_logger(), "No constraints JSON path provided. Using default parameters.");
-            return;
-        }
-    
-        std::ifstream f(constraints_path_);
-        if (!f.is_open()) {
-            RCLCPP_WARN(this->get_logger(), "Could not open constraints file: %s", constraints_path_.c_str());
-            return;
-        }
-    
-        nlohmann::json j;
-        try {
-            f >> j;
-        } catch (const std::exception& e) {
-            RCLCPP_WARN(this->get_logger(), "Failed to parse constraints JSON: %s", e.what());
-            return;
-        }
-    
-        if (!j.contains("constraints") || !j["constraints"].is_array()) {
-            RCLCPP_WARN(this->get_logger(), "Constraints JSON missing 'constraints' array.");
-            return;
-        }
-    
-        for (const auto& c : j["constraints"]) {
-            const bool enabled = c.value("enabled", true);
-            if (!enabled) continue;
-    
-            const std::string type = c.value("type", "");
-            if (type != "exclusion") continue;
-    
-            if (!c.contains("objects") || !c["objects"].contains("target")) continue;
-            if (!c.contains("spatial_parameters")) continue;
-    
-            const auto& targets = c["objects"]["target"];
-            const float buffer =
-                c["spatial_parameters"].value("buffer_distance_m", -1.0f);
-    
-            if (buffer <= 0.0f) continue;
-    
-            for (const auto& t : targets) {
-                const std::string target = t.get<std::string>();
-    
-                if (target == "person") {
-                    json_human_buffer_ = buffer;
-                    robot_MOS_human = buffer;
-    
-                    RCLCPP_INFO(
-                        this->get_logger(),
-                        "Loaded human exclusion buffer from JSON: %.2f m",
-                        json_human_buffer_
-                    );
-                }
-            }
-        }
-    }
-
-
 
     void initialize_mpc() {
         mpc3d_controller.set_velocity_bounds(
@@ -2082,8 +2021,6 @@ private:
     float robot_length{}, robot_width{};
     float robot_MOS_human{}, robot_MOS_obstacle{};
     int robot_kernel_dim_human{}, robot_kernel_dim_obstacle{};
-    std::string constraints_path_;
-    float json_human_buffer_ = -1.0f;
 
     ConstraintManager constraint_manager_;
     ConstraintRuntimeConfig constraint_runtime_config_;
