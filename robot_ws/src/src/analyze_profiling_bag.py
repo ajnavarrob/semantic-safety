@@ -1,5 +1,5 @@
 """
-STEP-BY-STEP WORKFLOW FOR GENERATING THESIS PROFILING RESULTS
+STEP-BY-STEP WORKFLOW FOR GENERATING PROFILING RESULTS
 ============================================================
 
 1. SOURCE ROS 2
@@ -26,8 +26,8 @@ In a NEW terminal, source ROS 2 again, then record the profiling topic:
 
     ros2 bag record /poisson/profiling_data
 
-Optional: give the bag a cleaner name:
-    ros2 bag record /poisson/profiling_data -o thesis_profiling_run1
+Give the bag a cleaner name:
+    ros2 bag record /poisson/profiling_data -o profiling_run1
 
 Let it record while the robot/system is running your experiment.
 
@@ -38,7 +38,7 @@ When the experiment is finished, stop the bag recording with:
     Ctrl + C
 
 This will create a rosbag folder, for example:
-    thesis_profiling_run1/
+    profiling_run1/
 
 Inside it there will be metadata and recorded message data.
 
@@ -46,7 +46,7 @@ Inside it there will be metadata and recorded message data.
 ----------------
 Before analyzing, make sure the bag actually contains the profiling topic:
 
-    ros2 bag info thesis_profiling_run1
+    ros2 bag info profiling_run1
 
 You should see:
     /poisson/profiling_data
@@ -83,7 +83,7 @@ The output folder will contain files like:
     unattributed_latency.png
     report.txt
 
-The most important ones for the thesis are usually:
+The most important ones for the thesis are:
     - profiling_summary.csv
     - stage_breakdown_bar.png
     - total_latency_timeseries.png
