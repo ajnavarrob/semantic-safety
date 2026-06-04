@@ -112,27 +112,8 @@ class PoissonControllerNode : public rclcpp::Node {
 public:
     PoissonControllerNode() : Node("poisson_control"), sport_req(this) {
         declare_and_load_parameters();
-    
-        if (!constraints_path_.empty()) {
-            if (constraint_manager_.load_from_json(constraints_path_)) {
-                constraint_runtime_config_ = constraint_manager_.get_config();
-    
-                if (constraint_runtime_config_.human_buffer_m > 0.0f) {
-                    robot_MOS_human = constraint_runtime_config_.human_buffer_m;
-                    RCLCPP_INFO(
-                        this->get_logger(),
-                        "Applied JSON human buffer override: %.2f m",
-                        robot_MOS_human
-                    );
-                }
-            } else {
-                RCLCPP_WARN(
-                    this->get_logger(),
-                    "Failed to load constraints JSON from: %s",
-                    constraints_path_.c_str()
-                );
-            }
-        }
+
+        load_constraints_once_at_startup();
     
         initialize_clocks_and_flags();
         initialize_static_grids();
@@ -140,6 +121,7 @@ public:
         initialize_robot_kernels();
         initialize_mpc();
         initialize_ros_interfaces();
+        initialize_constraint_reload_timer();
         startup_robot();
     }
 
@@ -797,6 +779,117 @@ private:
     // 7. HELPERS / INITIALIZATION
     // ============================================================
 
+    void initialize_constraint_reload_timer() {
+        if (constraints_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Runtime constraints reload disabled because constraints_path is empty."
+            );
+            return;
+        }
+
+        const double hz = std::max(0.1, constraints_reload_hz_);
+        const int period_ms = static_cast<int>(1000.0 / hz);
+
+        constraints_reload_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(period_ms),
+            std::bind(&PoissonControllerNode::reload_constraints_callback, this)
+        );
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Runtime constraints reload enabled: %.2f Hz, path=%s",
+            hz,
+            constraints_path_.c_str()
+        );
+    }
+    
+
+    void reload_constraints_callback() {
+        ConstraintManager fresh_manager;
+
+        if (!fresh_manager.load_from_json(constraints_path_)) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "Failed to reload constraints JSON: %s",
+                constraints_path_.c_str()
+            );
+            return;
+        }
+
+        const ConstraintRuntimeConfig& fresh_config = fresh_manager.get_config();
+
+        apply_runtime_constraint_config(fresh_config, true);
+
+        constraint_runtime_config_ = fresh_config;
+    }
+
+    void apply_runtime_constraint_config(
+        const ConstraintRuntimeConfig& cfg,
+        bool allow_kernel_rebuild
+    ) {
+        bool need_rebuild_kernels = false;
+
+        if (cfg.human_buffer_m > 0.0f &&
+            std::abs(cfg.human_buffer_m - robot_MOS_human) > 1.0e-4f) {
+
+            robot_MOS_human = cfg.human_buffer_m;
+            need_rebuild_kernels = true;
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Applied runtime human buffer: %.2f m",
+                robot_MOS_human
+            );
+        }
+
+        // if (cfg.obstacle_buffer_m > 0.0f &&
+        //     std::abs(cfg.obstacle_buffer_m - robot_MOS_obstacle) > 1.0e-4f) {
+
+        //     robot_MOS_obstacle = cfg.obstacle_buffer_m;
+        //     need_rebuild_kernels = true;
+
+        //     RCLCPP_INFO(
+        //         this->get_logger(),
+        //         "Applied runtime obstacle buffer: %.2f m",
+        //         robot_MOS_obstacle
+        //     );
+        // }
+
+        if (allow_kernel_rebuild && need_rebuild_kernels) {
+            rebuild_robot_kernels();
+        }
+    }
+
+    void load_constraints_once_at_startup() {
+        if (constraints_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "No constraints_path provided. Using launch/default parameters."
+            );
+            return;
+        }
+
+        if (constraint_manager_.load_from_json(constraints_path_)) {
+            constraint_runtime_config_ = constraint_manager_.get_config();
+
+            apply_runtime_constraint_config(
+                constraint_runtime_config_,
+                false
+            );
+        } else {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Failed to load constraints JSON from: %s",
+                constraints_path_.c_str()
+            );
+        }
+    }
+
+
+
     void initialize_mpc() {
         mpc3d_controller.set_velocity_bounds(
             vel_max_x_fwd_,
@@ -863,6 +956,33 @@ private:
         robot_kernel_dim_obstacle = initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
         robot_kernel_dim_human = initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
     }
+
+    void rebuild_robot_kernels() {
+            std::unique_lock<std::shared_mutex> lock(field_mutex_);
+    
+            if (robot_kernel_human) {
+                std::free(robot_kernel_human);
+                robot_kernel_human = nullptr;
+            }
+    
+            if (robot_kernel_obstacle) {
+                std::free(robot_kernel_obstacle);
+                robot_kernel_obstacle = nullptr;
+            }
+    
+            robot_kernel_dim_human =
+                initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
+    
+            robot_kernel_dim_obstacle =
+                initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
+    
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Rebuilt robot kernels from JSON constraints: human=%.2f, obstacle=%.2f",
+                robot_MOS_human,
+                robot_MOS_obstacle
+            );
+        }
 
     void initialize_static_grids() {
         for (int n = 0; n < IMAX * JMAX; ++n) {
@@ -942,12 +1062,14 @@ private:
         this->declare_parameter("human_persistence_decay", 0.96);
         this->declare_parameter("human_persistence_threshold", 0.25);
         this->declare_parameter("human_persistence_observation_value", 1.0);
+        this->declare_parameter("constraints_reload_hz", 1.0);
     
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
         logging_publish_hz_ = this->get_parameter("logging_publish_hz").as_double();
         logging_publish_period_ = (logging_publish_hz_ > 0.0) ? (1.0 / logging_publish_hz_) : 0.0;
         constraints_path_ = this->get_parameter("constraints_path").as_string();
+        constraints_reload_hz_ = this->get_parameter("constraints_reload_hz").as_double();
         enable_human_persistence_ = this->get_parameter("enable_human_persistence").as_bool();
         human_persistence_decay_ = static_cast<float>(this->get_parameter("human_persistence_decay").as_double());
         human_persistence_threshold_ = static_cast<float>(this->get_parameter("human_persistence_threshold").as_double());
@@ -2186,6 +2308,9 @@ private:
     ConstraintManager constraint_manager_;
     ConstraintRuntimeConfig constraint_runtime_config_;
     std::string constraints_path_;
+
+    rclcpp::TimerBase::SharedPtr constraints_reload_timer_;
+    double constraints_reload_hz_{1.0};
 
     rclcpp::CallbackGroup::SharedPtr mpc_callback_group_;
     rclcpp::TimerBase::SharedPtr mpc_timer_;
