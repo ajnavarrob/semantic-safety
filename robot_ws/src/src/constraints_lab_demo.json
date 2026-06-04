@@ -1,14 +1,16 @@
 {
+  "schema_version": "0.1",
   "constraints": [
     {
-      "id": "human_buffer",
+      "id": "avoid_people",
       "enabled": true,
       "type": "exclusion",
-      "objects": {
-        "target": ["person"]
+      "target": {
+        "semantic_class": "person",
+        "scope": "all"
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1.5
+        "buffer_distance_m": 0.8
       }
     }
   ]
