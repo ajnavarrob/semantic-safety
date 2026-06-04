@@ -1,14 +1,59 @@
 {
+  "schema_version": "0.2",
   "constraints": [
     {
-      "id": "human_buffer",
-      "enabled": true,
+      "id": "avoid_people",
       "type": "exclusion",
-      "objects": {
-        "target": ["person"]
+      "enabled": true,
+      "enforce": true,
+      "target": {
+        "semantic_class": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1.0
+        "buffer_distance_m": 1.2
+      }
+    },
+    {
+      "id": "slow_near_people",
+      "type": "velocity_limit",
+      "enabled": true,
+      "enforce": false,
+      "target": {
+        "semantic_class": ["person"]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 2.0
+      },
+      "control_parameters": {
+        "max_linear_velocity_mps": 0.3,
+        "max_angular_velocity_radps": 0.5
+      }
+    },
+    {
+      "id": "stay_near_chair",
+      "type": "proximity",
+      "enabled": true,
+      "enforce": false,
+      "target": {
+        "semantic_class": ["robot"]
+      },
+      "reference": {
+        "semantic_class": ["chair"]
+      },
+      "spatial_parameters": {
+        "max_distance_m": 1.5
+      }
+    },
+    {
+      "id": "face_person",
+      "type": "heading",
+      "enabled": true,
+      "enforce": false,
+      "target": {
+        "semantic_class": ["robot"]
+      },
+      "reference": {
+        "semantic_class": ["person"]
       }
     }
   ]
