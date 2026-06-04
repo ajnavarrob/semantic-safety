@@ -574,9 +574,100 @@ private:
         const std::vector<float> vb_new = v;
         low_pass(vb, vb_new, 5.0f, dt_state);
         if (std::abs(vb[0]) > 10.0f || std::abs(vb[1]) > 10.0f || std::abs(vb[2]) > 10.0f) sit_flag = true;
-        vb[0] = std::clamp(vb[0], -vel_max_x_bwd_, vel_max_x_fwd_);
-        vb[1] = std::clamp(vb[1], -vel_max_y_, vel_max_y_);
-        vb[2] = std::clamp(vb[2], -vel_max_yaw_, vel_max_yaw_);
+        float runtime_vx_fwd = vel_max_x_fwd_;
+        float runtime_vx_bwd = vel_max_x_bwd_;
+        float runtime_vy = vel_max_y_;
+        float runtime_wz = vel_max_yaw_;
+
+        apply_velocity_limit_constraints(
+            runtime_vx_fwd,
+            runtime_vx_bwd,
+            runtime_vy,
+            runtime_wz
+        );
+    
+        vb[0] = std::clamp(vb[0], -runtime_vx_bwd, runtime_vx_fwd);
+        vb[1] = std::clamp(vb[1], -runtime_vy, runtime_vy);
+        vb[2] = std::clamp(vb[2], -runtime_wz, runtime_wz);
+        
+    }
+
+    void apply_velocity_limit_constraints(
+        float& vx_fwd,
+        float& vx_bwd,
+        float& vy,
+        float& wz
+    ) {
+        if (!human_tracker_) {
+            return;
+        }
+    
+        const auto tracks = human_tracker_->get_active_tracks();
+    
+        if (tracks.empty()) {
+            return;
+        }
+    
+        for (const auto& rc : constraint_runtime_config_.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+    
+            if (rc.type != ConstraintType::VelocityLimit) {
+                continue;
+            }
+    
+            bool targets_person = false;
+            for (const auto& target : rc.target_classes) {
+                if (target == "person" || target == "human") {
+                    targets_person = true;
+                    break;
+                }
+            }
+    
+            if (!targets_person) {
+                continue;
+            }
+    
+            if (rc.buffer_distance_m <= 0.0f) {
+                continue;
+            }
+    
+            bool near_person = false;
+    
+            for (const auto& track : tracks) {
+                const float d = std::sqrt(track.x * track.x + track.y * track.y);
+    
+                if (d <= rc.buffer_distance_m) {
+                    near_person = true;
+                    break;
+                }
+            }
+    
+            if (!near_person) {
+                continue;
+            }
+    
+            if (rc.max_linear_velocity_mps > 0.0f) {
+                vx_fwd = std::min(vx_fwd, rc.max_linear_velocity_mps);
+                vx_bwd = std::min(vx_bwd, rc.max_linear_velocity_mps);
+                vy = std::min(vy, rc.max_linear_velocity_mps);
+            }
+    
+            if (rc.max_angular_velocity_radps > 0.0f) {
+                wz = std::min(wz, rc.max_angular_velocity_radps);
+            }
+    
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Velocity limit active from constraint '%s': linear<=%.2f, yaw<=%.2f",
+                rc.id.c_str(),
+                vx_fwd,
+                wz
+            );
+        }
     }
 
     void dispatch_robot_command() {
