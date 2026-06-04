@@ -938,12 +938,20 @@ private:
         this->declare_parameter("enable_display", true);
         this->declare_parameter("logging_publish_hz", 10.0);
         this->declare_parameter("constraints_path", "");
+        this->declare_parameter("enable_human_persistence", true);
+        this->declare_parameter("human_persistence_decay", 0.96);
+        this->declare_parameter("human_persistence_threshold", 0.25);
+        this->declare_parameter("human_persistence_observation_value", 1.0);
     
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
         logging_publish_hz_ = this->get_parameter("logging_publish_hz").as_double();
         logging_publish_period_ = (logging_publish_hz_ > 0.0) ? (1.0 / logging_publish_hz_) : 0.0;
         constraints_path_ = this->get_parameter("constraints_path").as_string();
+        enable_human_persistence_ = this->get_parameter("enable_human_persistence").as_bool();
+        human_persistence_decay_ = static_cast<float>(this->get_parameter("human_persistence_decay").as_double());
+        human_persistence_threshold_ = static_cast<float>(this->get_parameter("human_persistence_threshold").as_double());
+        human_persistence_observation_value_ = static_cast<float>(this->get_parameter("human_persistence_observation_value").as_double());
     
         initialize_logging_outputs();
     
@@ -1125,6 +1133,8 @@ private:
         dhdt_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         guidance_x_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         guidance_y_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        persistent_human_confidence_.assign(IMAX * JMAX, 0.0f);
+        persistent_human_mask_.assign(IMAX * JMAX, 0);
     
         if (!dhdt_grid || !guidance_x_grid || !guidance_y_grid) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent guidance/dhdt grids");
@@ -1254,6 +1264,50 @@ private:
         };
     
         logging_data_pub_->publish(msg);
+    }
+
+    void update_persistent_human_memory_from_expanded_map() {
+        if (!enable_human_persistence_) {
+            std::fill(
+                persistent_human_confidence_.begin(),
+                persistent_human_confidence_.end(),
+                0.0f
+            );
+    
+            std::fill(
+                persistent_human_mask_.begin(),
+                persistent_human_mask_.end(),
+                0
+            );
+    
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (class_map_expanded[n] == 1) {
+                persistent_human_confidence_[n] =
+                    human_persistence_observation_value_;
+            } else {
+                persistent_human_confidence_[n] *= human_persistence_decay_;
+            }
+    
+            persistent_human_mask_[n] =
+                persistent_human_confidence_[n] >= human_persistence_threshold_
+                    ? 1
+                    : 0;
+        }
+    }
+    
+    void inject_persistent_humans_into_expanded_map() {
+        if (!enable_human_persistence_) {
+            return;
+        }
+    
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (persistent_human_mask_[n]) {
+                class_map_expanded[n] = 1;
+            }
+        }
     }
 
 
@@ -1914,6 +1968,22 @@ private:
         
             std::memcpy(class_map_expanded, class_map_temp_expanded_, IMAX * JMAX * sizeof(int8_t));
         }
+
+        // Add persistence AFTER normal labeling and dilation.
+        update_persistent_human_memory_from_expanded_map();
+        inject_persistent_humans_into_expanded_map();
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "Human persistence: retained_cells=%zu",
+            std::count(
+                persistent_human_mask_.begin(),
+                persistent_human_mask_.end(),
+                static_cast<uint8_t>(1)
+            )
+        );
     }
 
 
@@ -2132,6 +2202,15 @@ private:
     int8_t class_map[IMAX * JMAX];
     int8_t visibility_map[IMAX * JMAX];
     int8_t class_map_expanded[IMAX * JMAX];
+
+    std::vector<float> persistent_human_confidence_;
+    std::vector<uint8_t> persistent_human_mask_;
+    
+    float human_persistence_decay_{0.96f};
+    float human_persistence_threshold_{0.25f};
+    float human_persistence_observation_value_{1.0f};
+    bool enable_human_persistence_{true};
+    
     std::unique_ptr<HumanTracker> human_tracker_;
     int min_yolo_cells_ = 5;
     bool enable_human_tracker_dilation_ = true;
