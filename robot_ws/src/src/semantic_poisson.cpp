@@ -125,6 +125,15 @@ public:
                         robot_MOS_human
                     );
                 }
+                
+                if (constraint_runtime_config_.obstacle_buffer_m > 0.0f) {
+                    robot_MOS_obstacle = constraint_runtime_config_.obstacle_buffer_m;
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "Applied JSON obstacle buffer override: %.2f m",
+                        robot_MOS_obstacle
+                    );
+                }
             } else {
                 RCLCPP_WARN(
                     this->get_logger(),
