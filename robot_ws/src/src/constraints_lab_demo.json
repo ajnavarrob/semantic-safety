@@ -10,7 +10,7 @@
         "semantic_class": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1
+        "buffer_distance_m": 2
       }
     },
     {
@@ -22,11 +22,11 @@
         "semantic_class": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 2.0
+        "buffer_distance_m": 0.5
       },
       "control_parameters": {
         "max_linear_velocity_mps": 0.1,
-        "max_angular_velocity_radps": 0.5
+        "max_angular_velocity_radps": 1
       }
     },
     {

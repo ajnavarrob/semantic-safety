@@ -93,6 +93,18 @@ struct GuidanceStageOutput {
     float* bound_guidance{nullptr};
 };
 
+struct FieldInsertionState {
+    bool active{false};
+
+    float lambda{1.0f};
+    float lambda_dot{0.0f};
+
+    float lambda_dot_max{0.5f};   // start conservative
+    float terminal_window{0.10f};
+
+    std::chrono::steady_clock::time_point last_update_time;
+};
+
 class ScopedTimer {
 public:
     explicit ScopedTimer(double& target_ms)
@@ -148,6 +160,9 @@ public:
 
         if (robot_kernel_human) std::free(robot_kernel_human);
         if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
+        if (hgrid_insertion_old_) std::free(hgrid_insertion_old_);
+        if (hgrid_active_) std::free(hgrid_active_);
+        if (dhdt_active_) std::free(dhdt_active_);
 
         if (outFileCSV.is_open()) outFileCSV.close();
         if (outFileBIN.is_open()) outFileBIN.close();
@@ -282,7 +297,8 @@ private:
                 ScopedTimer timer(timing_.dhdt_update_ms);
                 update_temporal_field_derivative();
             }
-    
+
+            update_active_safety_field();
             latest_field_timestamp_ = std::chrono::steady_clock::now();
         }
     
@@ -531,7 +547,7 @@ private:
             const float s = std::sin(x[2]);
             std::vector<float> vn_body = {c * vn[0] + s * vn[1], -s * vn[0] + c * vn[1], vn[2]};
             mpc3d_controller.update_cost(vn_body);
-            mpc3d_controller.update_constraints(hgrid1, dhdt_grid, guidance_x_grid, guidance_y_grid,
+            mpc3d_controller.update_constraints(hgrid_active_, dhdt_active_, guidance_x_grid, guidance_y_grid,
                                                 x_body_link, xc, grid_age, wn, issf,
                                                 cbf_sigma_epsilon_, cbf_sigma_kappa_);
             mpc3d_controller.solve();
@@ -726,10 +742,10 @@ private:
         for (int n = 0; n < IMAX * JMAX; ++n) {
             if (q1f != q2f) {
                 grid_temp[n] =
-                    (q2f - qr) * hgrid1[q1 * IMAX * JMAX + n] +
-                    (qr - q1f) * hgrid1[q2 * IMAX * JMAX + n];
+                    (q2f - qr) * hgrid_active_[q1 * IMAX * JMAX + n] +
+                    (qr - q1f) * hgrid_active_[q2 * IMAX * JMAX + n];
             } else {
-                grid_temp[n] = hgrid1[q1 * IMAX * JMAX + n];
+                grid_temp[n] = hgrid_active_[q1 * IMAX * JMAX + n];
             }
         }
     }
@@ -780,6 +796,28 @@ private:
     // 7. HELPERS / INITIALIZATION
     // ============================================================
 
+    void start_field_insertion() {
+        if (!hgrid1 || !hgrid_insertion_old_) {
+            return;
+        }
+
+        std::memcpy(
+            hgrid_insertion_old_,
+            hgrid1,
+            IMAX * JMAX * QMAX * sizeof(float)
+        );
+
+        field_insertion_.active = true;
+        field_insertion_.lambda = 0.0f;
+        field_insertion_.lambda_dot = 0.0f;
+        field_insertion_.last_update_time = std::chrono::steady_clock::now();
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Started smooth Poisson field insertion"
+        );
+    }
+
     void initialize_constraint_reload_timer() {
         // if (constraints_path_.empty()) {
         //     RCLCPP_WARN(
@@ -798,10 +836,10 @@ private:
         constraints_reload_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(period_ms),
             [this]() {
-                RCLCPP_ERROR(
-                    this->get_logger(),
-                    "========== SIMPLE TIMER FIRED =========="
-                );
+                // RCLCPP_ERROR(
+                //     this->get_logger(),
+                //     "========== SIMPLE TIMER FIRED =========="
+                // );
 
                 this->reload_constraints_callback();
             },
@@ -867,6 +905,75 @@ private:
         constraint_runtime_config_ = fresh_config;
     }
 
+    void update_active_safety_field() {
+        const int N = IMAX * JMAX * QMAX;
+
+        if (!field_insertion_.active) {
+            std::memcpy(hgrid_active_, hgrid1, N * sizeof(float));
+            std::memcpy(dhdt_active_, dhdt_grid, N * sizeof(float));
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        float dt =
+            std::chrono::duration<float>(
+                now - field_insertion_.last_update_time
+            ).count();
+
+        field_insertion_.last_update_time = now;
+
+        dt = std::clamp(dt, 0.0f, 0.2f);
+
+        const float remaining =
+            std::max(0.0f, 1.0f - field_insertion_.lambda);
+
+        const float terminal_scale =
+            std::clamp(
+                remaining / std::max(field_insertion_.terminal_window, 1.0e-6f),
+                0.0f,
+                1.0f
+            );
+
+        field_insertion_.lambda_dot =
+            field_insertion_.lambda_dot_max * terminal_scale;
+
+        field_insertion_.lambda += dt * field_insertion_.lambda_dot;
+        field_insertion_.lambda =
+            std::clamp(field_insertion_.lambda, 0.0f, 1.0f);
+
+        const float lam = field_insertion_.lambda;
+
+        #pragma omp parallel for num_threads(4)
+        for (int n = 0; n < N; ++n) {
+            const float h_old = hgrid_insertion_old_[n];
+            const float h_new = hgrid1[n];
+
+            hgrid_active_[n] =
+                (1.0f - lam) * h_old + lam * h_new;
+
+            const float beta_lamdot =
+                (h_new - h_old) * field_insertion_.lambda_dot;
+
+            dhdt_active_[n] =
+                lam * dhdt_grid[n]
+                + (h_new - h_old) * field_insertion_.lambda_dot;
+        }
+
+        if (field_insertion_.lambda >= 0.999f) {
+            field_insertion_.active = false;
+            field_insertion_.lambda = 1.0f;
+            field_insertion_.lambda_dot = 0.0f;
+
+            std::memcpy(hgrid_active_, hgrid1, N * sizeof(float));
+            std::memcpy(dhdt_active_, dhdt_grid, N * sizeof(float));
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Completed smooth Poisson field insertion"
+            );
+        }
+    }
+
     void apply_runtime_constraint_config(
         const ConstraintRuntimeConfig& cfg,
         bool allow_kernel_rebuild
@@ -875,6 +982,8 @@ private:
 
         if (cfg.human_buffer_m > 0.0f &&
             std::abs(cfg.human_buffer_m - robot_MOS_human) > 1.0e-4f) {
+
+            start_field_insertion();
 
             robot_MOS_human = cfg.human_buffer_m;
             need_rebuild_kernels = true;
@@ -1226,39 +1335,39 @@ private:
         // ------------------------------------------------------------
         // Informational prints
         // ------------------------------------------------------------
-        RCLCPP_INFO(
-            this->get_logger(),
-            "dh0_human=%.2f, dh0_obstacle=%.2f, MOS_human=%.2f, MOS_obstacle=%.2f, display=%s, social_nav=%s",
-            dh0_human, dh0_obstacle, robot_MOS_human, robot_MOS_obstacle,
-            enable_display ? "true" : "false",
-            enable_social_navigation_ ? "true" : "false"
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "dh0_human=%.2f, dh0_obstacle=%.2f, MOS_human=%.2f, MOS_obstacle=%.2f, display=%s, social_nav=%s",
+        //     dh0_human, dh0_obstacle, robot_MOS_human, robot_MOS_obstacle,
+        //     enable_display ? "true" : "false",
+        //     enable_social_navigation_ ? "true" : "false"
+        // );
     
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Dynamic CBF: sigma_epsilon=%.3f, sigma_kappa=%.2f",
-            cbf_sigma_epsilon_, cbf_sigma_kappa_
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Dynamic CBF: sigma_epsilon=%.3f, sigma_kappa=%.2f",
+        //     cbf_sigma_epsilon_, cbf_sigma_kappa_
+        // );
     
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Velocity bounds: x_fwd=%.2f, x_bwd=%.2f, y=%.2f, yaw=%.2f",
-            vel_max_x_fwd_, vel_max_x_bwd_, vel_max_y_, vel_max_yaw_
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Velocity bounds: x_fwd=%.2f, x_bwd=%.2f, y=%.2f, yaw=%.2f",
+        //     vel_max_x_fwd_, vel_max_x_bwd_, vel_max_y_, vel_max_yaw_
+        // );
     
-        RCLCPP_INFO(
-            this->get_logger(),
-            "HumanTracker: timeout=%.1fs, gate=%.2fm, vel_thresh=%.2fm/s, decay_fov=%.2f, decay_stat=%.2f, decay_unconf=%.2f, no_retrack=%s",
-            track_timeout, track_gate, track_velocity_threshold,
-            decay_in_fov, decay_stationary, decay_unconfirmed,
-            no_retrack_on_move ? "true" : "false"
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "HumanTracker: timeout=%.1fs, gate=%.2fm, vel_thresh=%.2fm/s, decay_fov=%.2f, decay_stat=%.2f, decay_unconf=%.2f, no_retrack=%s",
+        //     track_timeout, track_gate, track_velocity_threshold,
+        //     decay_in_fov, decay_stationary, decay_unconfirmed,
+        //     no_retrack_on_move ? "true" : "false"
+        // );
     
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Tight-area params: human_thresh=%.2fm, h_thresh=%.2f, wall_slack=%.2f",
-            tight_area_human_threshold_, tight_area_h_threshold_, tight_area_wall_slack_
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Tight-area params: human_thresh=%.2fm, h_thresh=%.2f, wall_slack=%.2f",
+        //     tight_area_human_threshold_, tight_area_h_threshold_, tight_area_wall_slack_
+        // );
     
         RCLCPP_INFO(this->get_logger(), "Logging publish rate: %.1f Hz", logging_publish_hz_);
     }
@@ -1298,6 +1407,14 @@ private:
         guidance_y_grid = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         persistent_human_confidence_.assign(IMAX * JMAX, 0.0f);
         persistent_human_mask_.assign(IMAX * JMAX, 0);
+        hgrid_insertion_old_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        hgrid_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        dhdt_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+
+        if (!hgrid_insertion_old_ || !hgrid_active_ || !dhdt_active_) {
+            RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for field insertion buffers");
+            throw std::runtime_error("Field insertion buffer allocation failed");
+        }
     
         if (!dhdt_grid || !guidance_x_grid || !guidance_y_grid) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent guidance/dhdt grids");
@@ -1339,6 +1456,9 @@ private:
             dhdt_grid[n] = 0.0f;
             guidance_x_grid[n] = 0.0f;
             guidance_y_grid[n] = 0.0f;
+            hgrid_insertion_old_[n] = h0;
+            hgrid_active_[n] = h0;
+            dhdt_active_[n] = 0.0f;
         }
     
         Kernel::poissonInit();
@@ -2136,17 +2256,17 @@ private:
         update_persistent_human_memory_from_expanded_map();
         inject_persistent_humans_into_expanded_map();
 
-        RCLCPP_INFO_THROTTLE(
-            this->get_logger(),
-            *this->get_clock(),
-            2000,
-            "Human persistence: retained_cells=%zu",
-            std::count(
-                persistent_human_mask_.begin(),
-                persistent_human_mask_.end(),
-                static_cast<uint8_t>(1)
-            )
-        );
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     2000,
+        //     "Human persistence: retained_cells=%zu",
+        //     std::count(
+        //         persistent_human_mask_.begin(),
+        //         persistent_human_mask_.end(),
+        //         static_cast<uint8_t>(1)
+        //     )
+        // );
     }
 
 
@@ -2170,7 +2290,7 @@ private:
         }
     
         // Safety function value and forward prediction to compensate field age
-        h = trilinear_interpolation(hgrid1, ic, jc, qc);
+        h = trilinear_interpolation(hgrid_active_, ic, jc, qc);
         const float h_pred = h + dhdt * grid_age;
     
         // Guidance field (control direction) from Laplace solve
@@ -2181,10 +2301,10 @@ private:
     
         // Numerical gradient of h-field in x/y
         const float h_eps = 1.0f;
-        const float hip = trilinear_interpolation(hgrid1, ic + h_eps, jc, qc);
-        const float him = trilinear_interpolation(hgrid1, ic - h_eps, jc, qc);
-        const float hjp = trilinear_interpolation(hgrid1, ic, jc + h_eps, qc);
-        const float hjm = trilinear_interpolation(hgrid1, ic, jc - h_eps, qc);
+        const float hip = trilinear_interpolation(hgrid_active_, ic + h_eps, jc, qc);
+        const float him = trilinear_interpolation(hgrid_active_, ic - h_eps, jc, qc);
+        const float hjp = trilinear_interpolation(hgrid_active_, ic, jc + h_eps, qc);
+        const float hjm = trilinear_interpolation(hgrid_active_, ic, jc - h_eps, qc);
     
         const float Dh_x = (hjp - hjm) / (2.0f * h_eps * DS);
         const float Dh_y = (hip - him) / (2.0f * h_eps * DS);
@@ -2198,8 +2318,8 @@ private:
         const float qp = q_wrap(qc + q_eps);
         const float qm = q_wrap(qc - q_eps);
     
-        float hqp = trilinear_interpolation(hgrid1, ic, jc, qp);
-        float hqm = trilinear_interpolation(hgrid1, ic, jc, qm);
+        float hqp = trilinear_interpolation(hgrid_active_, ic, jc, qp);
+        float hqm = trilinear_interpolation(hgrid_active_, ic, jc, qm);
         dhdq = (hqp - hqm) / (2.0f * q_eps * DQ);
     
         // Forward-predicted guidance-aligned derivatives
@@ -2346,6 +2466,11 @@ private:
     float robot_MOS_human{}, robot_MOS_obstacle{};
     int robot_kernel_dim_human{}, robot_kernel_dim_obstacle{};
 
+    float* hgrid_insertion_old_{nullptr};
+    float* hgrid_active_{nullptr};
+    float* dhdt_active_{nullptr};
+
+    FieldInsertionState field_insertion_;
     ConstraintManager constraint_manager_;
     ConstraintRuntimeConfig constraint_runtime_config_;
     std::string constraints_path_;
