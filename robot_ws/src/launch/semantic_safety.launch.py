@@ -247,7 +247,7 @@ def generate_launch_description():
     
     enable_data_logging_to_file_arg = DeclareLaunchArgument(
         'enable_data_logging_to_file',
-        default_value='false',
+        default_value='true',
         description='Enable CSV and BIN data logging for experiments'
     )
     
@@ -352,8 +352,8 @@ def generate_launch_description():
             'vel_max_yaw': LaunchConfiguration('vel_max_yaw'),
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
             'enable_data_logging_to_file': LaunchConfiguration('enable_data_logging_to_file'),
-            "constraints_path": "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json"
-            "constraints_reload_hz": 1.0
+            "constraints_path": "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json",
+            "constraints_reload_hz": 0.1
         }],
     )
     

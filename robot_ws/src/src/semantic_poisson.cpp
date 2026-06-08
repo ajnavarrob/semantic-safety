@@ -121,8 +121,9 @@ public:
         initialize_robot_kernels();
         initialize_mpc();
         initialize_ros_interfaces();
-        initialize_constraint_reload_timer();
         startup_robot();
+
+        initialize_constraint_reload_timer();
     }
 
     ~PoissonControllerNode() override {
@@ -780,32 +781,56 @@ private:
     // ============================================================
 
     void initialize_constraint_reload_timer() {
-        if (constraints_path_.empty()) {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "Runtime constraints reload disabled because constraints_path is empty."
-            );
-            return;
-        }
+        // if (constraints_path_.empty()) {
+        //     RCLCPP_WARN(
+        //         this->get_logger(),
+        //         "Runtime constraints reload disabled because constraints_path is empty."
+        //     );
+        //     return;
+        // }
 
         const double hz = std::max(0.1, constraints_reload_hz_);
         const int period_ms = static_cast<int>(1000.0 / hz);
 
+        constraints_reload_callback_group_ =
+            this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
         constraints_reload_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(period_ms),
-            std::bind(&PoissonControllerNode::reload_constraints_callback, this)
+            [this]() {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "========== SIMPLE TIMER FIRED =========="
+                );
+
+                this->reload_constraints_callback();
+            },
+            constraints_reload_callback_group_
         );
 
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Runtime constraints reload enabled: %.2f Hz, path=%s",
-            hz,
-            constraints_path_.c_str()
-        );
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "Runtime constraints reload enabled: %.2f Hz, path=%s, period=%d ms",
+        //     hz,
+        //     constraints_path_.c_str(),
+        //     period_ms
+        // );
     }
     
 
     void reload_constraints_callback() {
+        // RCLCPP_ERROR(
+        //     this->get_logger(),
+        //     "========== RELOAD CALLBACK FIRED =========="
+        // );
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "reload_constraints_callback is alive. path=%s",
+            constraints_path_.c_str()
+        );
         ConstraintManager fresh_manager;
 
         if (!fresh_manager.load_from_json(constraints_path_)) {
@@ -819,7 +844,23 @@ private:
             return;
         }
 
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "[RELOAD] JSON loaded successfully"
+        // );
+
         const ConstraintRuntimeConfig& fresh_config = fresh_manager.get_config();
+
+        // for (const auto& rc : fresh_config.constraints) {
+        //     RCLCPP_INFO(
+        //         this->get_logger(),
+        //         "[RELOAD] constraint id=%s type=%d enforce=%s buffer=%.3f",
+        //         rc.id.c_str(),
+        //         static_cast<int>(rc.type),
+        //         rc.enforce ? "true" : "false",
+        //         rc.buffer_distance_m
+        //     );
+        // }
 
         apply_runtime_constraint_config(fresh_config, true);
 
@@ -1054,7 +1095,7 @@ private:
         // ------------------------------------------------------------
         // Logging / visualization
         // ------------------------------------------------------------
-        this->declare_parameter("enable_data_logging_to_file", false);
+        this->declare_parameter("enable_data_logging_to_file", true);
         this->declare_parameter("enable_display", true);
         this->declare_parameter("logging_publish_hz", 10.0);
         this->declare_parameter("constraints_path", "");
@@ -1062,7 +1103,7 @@ private:
         this->declare_parameter("human_persistence_decay", 0.96);
         this->declare_parameter("human_persistence_threshold", 0.25);
         this->declare_parameter("human_persistence_observation_value", 1.0);
-        this->declare_parameter("constraints_reload_hz", 1.0);
+        this->declare_parameter("constraints_reload_hz", 0.1);
     
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
@@ -2310,6 +2351,7 @@ private:
     std::string constraints_path_;
 
     rclcpp::TimerBase::SharedPtr constraints_reload_timer_;
+    rclcpp::CallbackGroup::SharedPtr constraints_reload_callback_group_;
     double constraints_reload_hz_{1.0};
 
     rclcpp::CallbackGroup::SharedPtr mpc_callback_group_;
@@ -2397,6 +2439,11 @@ int main(int argc, char* argv[]) {
 
     executor.add_node(mappingNode);
     executor.add_node(poissonNode);
+
+    RCLCPP_INFO(
+        poissonNode->get_logger(),
+        "Poisson node added to executor"
+    );
 
     try {
         executor.spin();
