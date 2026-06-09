@@ -318,7 +318,7 @@ def generate_launch_description():
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
             'dh0_obstacle': LaunchConfiguration('dh0_obstacle'),
-            'enable_display': False,  # Show OpenCV visualization
+            'enable_display': True,  # Show OpenCV visualization
             'min_z': LaunchConfiguration('min_z'),  # Forwarded to CloudMergerNode
             'max_z': LaunchConfiguration('max_z'),  # Forwarded to CloudMergerNode
             # Tight-area wall softening

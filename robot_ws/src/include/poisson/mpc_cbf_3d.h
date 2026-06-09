@@ -19,7 +19,8 @@ class MPC3D{
             N_HORIZON = TMAX - 1;
             nX = (N_HORIZON+1) * STATES;
             nU = N_HORIZON * INPUTS;
-            nZ = nX + nU; // Optimization Variables
+            nLambdaDot = N_HORIZON;
+            nZ = nX + nU + nLambdaDot;
             nC = nZ + N_HORIZON;
 
             cost_P = Eigen::MatrixXd::Zero(nZ, nZ);
@@ -36,7 +37,12 @@ class MPC3D{
             Pu.row(2) << 0.0, 0.0, 1.0;
             for(int k=0; k<N_HORIZON; k++) cost_P.block<INPUTS, INPUTS>(nX + k*INPUTS, nX + k*INPUTS) = Pu;
             cost_P.block<INPUTS, INPUTS>(nX + (N_HORIZON-1)*INPUTS, nX + (N_HORIZON-1)*INPUTS) *= 2.0f;
-            
+            const float lambda_dot_weight = 0.1f;
+            for (int k = 0; k < N_HORIZON; ++k) {
+                const int idlambda = nX + nU + k;
+                cost_P(idlambda, idlambda) = lambda_dot_weight;
+            }
+
             // Build Constraints
             constraint_A.block<STATES,STATES>(0,0).setIdentity(); // Initial Condition Constraint
             for (int k=0; k<N_HORIZON; k++){
@@ -54,6 +60,11 @@ class MPC3D{
                 constraint_A.block<INPUTS, INPUTS>(idu, idu) = Eigen::MatrixXd::Identity(INPUTS, INPUTS); 
                 constraint_upper.segment(idu, INPUTS) << 0.8f, 0.8f, 0.8f;
                 constraint_lower.segment(idu, INPUTS) << -0.8f, -0.8f, -0.8f;
+
+                const int idlambda = nX + nU + k;
+                constraint_A(idlambda, idlambda) = 1.0;
+                constraint_upper(idlambda) = lambda_dot_max_;
+                constraint_lower(idlambda) = lambda_dot_min_;
                 
                 // Set Up Safety Constraints
                 const int idsf = k + nZ;
@@ -65,7 +76,7 @@ class MPC3D{
         }
 
         int N_HORIZON;
-        int nX, nU, nZ, nC;
+        int nX, nU, nLambdaDot, nZ, nC;
         Eigen::MatrixXd Pu;
         Eigen::MatrixXd cost_P;
         Eigen::VectorXd cost_q;
@@ -77,6 +88,9 @@ class MPC3D{
         float cost0 = 1.0e23f;
         float cost1 = 1.0e23f;
         float resid = 1.0e23f;
+        float lambda_dot_min_ = 0.05f;
+        float lambda_dot_max_ = 0.5f;
+        float lambda_dot_solution_ = 0.05f;
 
         int setup_QP(void){
             
@@ -125,6 +139,21 @@ class MPC3D{
             }
         }
 
+        void set_lambda_dot_bounds(float lambda_dot_min, float lambda_dot_max) {
+            lambda_dot_min_ = lambda_dot_min;
+            lambda_dot_max_ = lambda_dot_max;
+
+            for (int k = 0; k < N_HORIZON; ++k) {
+                const int idlambda = nX + nU + k;
+                constraint_lower(idlambda) = lambda_dot_min_;
+                constraint_upper(idlambda) = lambda_dot_max_;
+            }
+        }
+
+        float get_lambda_dot() const {
+            return lambda_dot_solution_;
+        }
+
         float line_search(const float *h_grid, const float *dhdt_grid, const std::vector<float> xc, const float grid_age, const float wn){
 
             float best_violation = -1.0e10f;
@@ -160,7 +189,7 @@ class MPC3D{
 
         }
 
-        int update_constraints(const float *h_grid, const float *dhdt_grid, 
+        int update_constraints(const float *h_grid, const float *dhdt_grid, const float *beta_grid_,
                                const float *guidance_x, const float *guidance_y,
                                const std::vector<float> x, const std::vector<float> xc, 
                                const float grid_age, const float wn, const float issf,
@@ -200,6 +229,7 @@ class MPC3D{
                 // Get Current Safety Function Value & Rate
                 const float h1 = trilinear_interpolation(h_grid, ic, jc, qc);
                 const float dhdt = trilinear_interpolation(dhdt_grid, ic, jc, qc);
+                const float beta = trilinear_interpolation(beta_grid_, ic, jc, qc);
 
                 // Guidance field v from Laplace solve
                 const float vx = trilinear_interpolation(guidance_y, ic, jc, qc);  // j = x
@@ -260,8 +290,14 @@ class MPC3D{
                 const int idsf = k + nZ;
                 const int idsfm1 = idsf - 1;
                 if(k!=N_HORIZON){
-                    constraint_A.block<1,STATES>(idsf, idx) << -alpha*dhdx, -alpha*dhdy, -alpha*dhdyaw;
-                    constraint_lower(idsf) = -alpha * (dhdx*rxk + dhdy*ryk + dhdyaw*yawk - h);
+                    const int idlambda = nX + nU + k;
+                    constraint_A.block<1,STATES>(idsf, idx)
+                        << -alpha*dhdx, -alpha*dhdy, -alpha*dhdyaw;
+
+                    constraint_A(idsf, idlambda) = beta * DT;
+
+                    constraint_lower(idsf) =
+                        -alpha * (dhdx*rxk + dhdy*ryk + dhdyaw*yawk - h);
                     // ISSf Term
                     const float ISSf1 = issf * (0.5f*(float)k + 1.0f);
                     const float ISSf2 = issf * (0.5f*(float)k + 1.0f);
@@ -331,6 +367,10 @@ class MPC3D{
         void set_input(std::vector<float>& u){
             
             u = {(float)sol(nX+0), (float)sol(nX+1), (float)sol(nX+2)};
+
+            if (nLambdaDot > 0) {
+                lambda_dot_solution_ = static_cast<float>(sol(nX + nU));
+            }
                     
         }
 

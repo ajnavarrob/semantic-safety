@@ -99,9 +99,14 @@ struct FieldInsertionState {
     float lambda{1.0f};
     float lambda_dot{0.0f};
 
-    float lambda_dot_max{0.5f};   // start conservative
-    float terminal_window{0.10f};
+    float lambda_dot_min{0.05f};
+    float lambda_dot_max{0.5f};
+    float max_insertion_time_sec{20.0f};
 
+    // Temporary until MPC outputs lambda_dot.
+    float commanded_lambda_dot{0.5f};
+
+    std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_update_time;
 };
 
@@ -163,6 +168,7 @@ public:
         if (hgrid_insertion_old_) std::free(hgrid_insertion_old_);
         if (hgrid_active_) std::free(hgrid_active_);
         if (dhdt_active_) std::free(dhdt_active_);
+        if (beta_grid_) std::free(beta_grid_);
 
         if (outFileCSV.is_open()) outFileCSV.close();
         if (outFileBIN.is_open()) outFileBIN.close();
@@ -304,6 +310,16 @@ private:
     
         timing_.end_to_end_grid_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - grid_start).count();
+
+        // RCLCPP_ERROR_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     1000,
+        //     "Before render: enable_display=%d h_flag=%d hgrid_active=%p",
+        //     enable_display,
+        //     h_flag,
+        //     static_cast<void*>(hgrid_active_)
+        // );
     
         if (enable_display) render_visualization();
         
@@ -547,10 +563,15 @@ private:
             const float s = std::sin(x[2]);
             std::vector<float> vn_body = {c * vn[0] + s * vn[1], -s * vn[0] + c * vn[1], vn[2]};
             mpc3d_controller.update_cost(vn_body);
-            mpc3d_controller.update_constraints(hgrid_active_, dhdt_active_, guidance_x_grid, guidance_y_grid,
+            mpc3d_controller.update_constraints(hgrid_active_, dhdt_grid, beta_grid_, guidance_x_grid, guidance_y_grid,
                                                 x_body_link, xc, grid_age, wn, issf,
                                                 cbf_sigma_epsilon_, cbf_sigma_kappa_);
             mpc3d_controller.solve();
+            if (field_insertion_.active) {
+                field_insertion_.commanded_lambda_dot =
+                    mpc3d_controller.get_lambda_dot();
+            }
+
             if (mpc3d_controller.update_residual() < 1.0f) break;
         }
         mpc3d_controller.set_input(vd);
@@ -687,20 +708,141 @@ private:
     // ============================================================
 
     void render_visualization() {
-        // Intentionally keep existing display_poisson_safety_function body here in the next refactor step.
-        // This has been separated conceptually from the hot-path field construction.
-    }
+        if (!poisson_image_pub_ || !hgrid_active_ || !bound) {
+            return;
+        }
 
+        const int q_vis = QMAX / 2;
+        const int scale = 6;
+
+        cv::Mat h_u8(IMAX, JMAX, CV_8UC1);
+        cv::Mat boundary_u8(IMAX, JMAX, CV_8UC1, cv::Scalar(0));
+
+        float h_min = 1.0e9f;
+        float h_max = -1.0e9f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n3 = q_vis * IMAX * JMAX + i * JMAX + j;
+                const float hv = hgrid_active_[n3];
+
+                h_min = std::min(h_min, hv);
+                h_max = std::max(h_max, hv);
+            }
+        }
+
+        const float display_min = 0.0f;
+        const float display_max = std::max(0.40f, h_max);
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n2 = i * JMAX + j;
+                const int n3 = q_vis * IMAX * JMAX + n2;
+
+                float hv = hgrid_active_[n3];
+                hv = std::clamp(hv, display_min, display_max);
+
+                const float normalized =
+                    (hv - display_min) /
+                    (display_max - display_min + 1.0e-6f);
+
+                h_u8.at<uint8_t>(i, j) =
+                    static_cast<uint8_t>(255.0f * normalized);
+
+                if (bound[n3] <= 0.0f) {
+                    boundary_u8.at<uint8_t>(i, j) = 255;
+                }
+            }
+        }
+
+        cv::Mat h_color;
+        cv::applyColorMap(h_u8, h_color, cv::COLORMAP_TURBO);
+
+        cv::Mat boundary_color(IMAX, JMAX, CV_8UC3, cv::Scalar(0, 0, 0));
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (boundary_u8.at<uint8_t>(i, j) > 0) {
+                    boundary_color.at<cv::Vec3b>(i, j) =
+                        cv::Vec3b(255, 255, 255);
+                }
+            }
+        }
+
+        cv::Mat overlay = h_color.clone();
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                if (boundary_u8.at<uint8_t>(i, j) > 0) {
+                    overlay.at<cv::Vec3b>(i, j) =
+                        cv::Vec3b(255, 255, 255);
+                }
+            }
+        }
+
+        cv::Mat combined;
+        cv::hconcat(
+            std::vector<cv::Mat>{h_color, boundary_color, overlay},
+            combined
+        );
+
+        cv::Mat display_img;
+        cv::resize(
+            combined,
+            display_img,
+            cv::Size(),
+            scale,
+            scale,
+            cv::INTER_NEAREST
+        );
+
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     1000,
+        //     "Poisson viz publish: q=%d h_min=%.4f h_max=%.4f display=[%.2f, %.2f] lambda=%.3f active=%d size=%dx%d",
+        //     q_vis,
+        //     h_min,
+        //     h_max,
+        //     display_min,
+        //     display_max,
+        //     field_insertion_.lambda,
+        //     field_insertion_.active,
+        //     display_img.cols,
+        //     display_img.rows
+        // );
+
+        sensor_msgs::msg::Image msg;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "map";
+        msg.height = display_img.rows;
+        msg.width = display_img.cols;
+        msg.encoding = "bgr8";
+        msg.is_bigendian = false;
+        msg.step = static_cast<sensor_msgs::msg::Image::_step_type>(
+            display_img.cols * display_img.elemSize()
+        );
+
+        msg.data.assign(
+            display_img.data,
+            display_img.data + display_img.total() * display_img.elemSize()
+        );
+
+        poisson_image_pub_->publish(msg);
+    }
 
     bool should_publish_logging_now() {
         const auto now = std::chrono::steady_clock::now();
+
         const double time_since_last =
-            std::chrono::duration<double>(now - last_logging_publish_time_).count();
-    
+            std::chrono::duration<double>(
+                now - last_logging_publish_time_
+            ).count();
+
         if (time_since_last < logging_publish_period_) {
             return false;
         }
-    
+
         last_logging_publish_time_ = now;
         return true;
     }
@@ -753,9 +895,23 @@ private:
     void maybe_write_experiment_data() {
         if (!(save_flag && enable_data_logging_to_file_)) return;
         const std::vector<float> save_data = {
-            t_ms, static_cast<float>(space_counter), x[0], x[1], x[2],
-            v[0], v[1], v[2], vt[0], vt[1], vt[2],
-            h, dhdx, dhdy, dhdq, dhdt, wn, static_cast<float>(realtime_sf_flag | predictive_sf_flag)
+            t_ms,
+            static_cast<float>(space_counter),
+
+            x[0], x[1], x[2],
+
+            v[0], v[1], v[2],
+            vt[0], vt[1], vt[2],
+
+            h, dhdx, dhdy, dhdq, dhdt,
+            wn,
+            static_cast<float>(realtime_sf_flag | predictive_sf_flag),
+
+            field_insertion_.lambda,
+            field_insertion_.lambda_dot,
+            static_cast<float>(field_insertion_.active),
+            new_constraint_event_flag_ ? 1.0f : 0.0f,
+            static_cast<float>(constraint_event_counter_)
         };
         for (size_t n = 0; n < save_data.size(); ++n) {
             outFileCSV << save_data[n];
@@ -801,6 +957,9 @@ private:
             return;
         }
 
+        new_constraint_event_flag_ = true;
+        constraint_event_counter_++;
+
         std::memcpy(
             hgrid_insertion_old_,
             hgrid1,
@@ -809,8 +968,17 @@ private:
 
         field_insertion_.active = true;
         field_insertion_.lambda = 0.0f;
-        field_insertion_.lambda_dot = 0.0f;
-        field_insertion_.last_update_time = std::chrono::steady_clock::now();
+
+        field_insertion_.lambda_dot_min =
+            1.0f / std::max(field_insertion_.max_insertion_time_sec, 1.0e-3f);
+
+        field_insertion_.commanded_lambda_dot = field_insertion_.lambda_dot_max; // temporary fallback
+
+        field_insertion_.lambda_dot =
+            field_insertion_.lambda_dot_min;
+
+        field_insertion_.start_time = std::chrono::steady_clock::now();
+        field_insertion_.last_update_time = field_insertion_.start_time;
 
         RCLCPP_INFO(
             this->get_logger(),
@@ -819,13 +987,14 @@ private:
     }
 
     void initialize_constraint_reload_timer() {
-        // if (constraints_path_.empty()) {
-        //     RCLCPP_WARN(
-        //         this->get_logger(),
-        //         "Runtime constraints reload disabled because constraints_path is empty."
-        //     );
-        //     return;
-        // }
+
+        if (constraints_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Runtime constraints reload disabled because constraints_path is empty."
+            );
+            return;
+        }
 
         const double hz = std::max(0.1, constraints_reload_hz_);
         const int period_ms = static_cast<int>(1000.0 / hz);
@@ -911,6 +1080,7 @@ private:
         if (!field_insertion_.active) {
             std::memcpy(hgrid_active_, hgrid1, N * sizeof(float));
             std::memcpy(dhdt_active_, dhdt_grid, N * sizeof(float));
+            std::memset(beta_grid_, 0, N * sizeof(float));
             return;
         }
 
@@ -924,18 +1094,12 @@ private:
 
         dt = std::clamp(dt, 0.0f, 0.2f);
 
-        const float remaining =
-            std::max(0.0f, 1.0f - field_insertion_.lambda);
-
-        const float terminal_scale =
-            std::clamp(
-                remaining / std::max(field_insertion_.terminal_window, 1.0e-6f),
-                0.0f,
-                1.0f
-            );
-
         field_insertion_.lambda_dot =
-            field_insertion_.lambda_dot_max * terminal_scale;
+            std::clamp(
+                field_insertion_.commanded_lambda_dot,
+                field_insertion_.lambda_dot_min,
+                field_insertion_.lambda_dot_max
+            );
 
         field_insertion_.lambda += dt * field_insertion_.lambda_dot;
         field_insertion_.lambda =
@@ -948,15 +1112,15 @@ private:
             const float h_old = hgrid_insertion_old_[n];
             const float h_new = hgrid1[n];
 
+            beta_grid_[n] = h_new - h_old;
+
             hgrid_active_[n] =
                 (1.0f - lam) * h_old + lam * h_new;
 
-            const float beta_lamdot =
-                (h_new - h_old) * field_insertion_.lambda_dot;
-
             dhdt_active_[n] =
                 lam * dhdt_grid[n]
-                + (h_new - h_old) * field_insertion_.lambda_dot;
+                + beta_grid_[n] * field_insertion_.lambda_dot;
+
         }
 
         if (field_insertion_.lambda >= 0.999f) {
@@ -1047,6 +1211,12 @@ private:
             vel_max_y_,
             vel_max_yaw_
         );
+
+        mpc3d_controller.set_lambda_dot_bounds(
+            field_insertion_.lambda_dot_min,
+            field_insertion_.lambda_dot_max
+        );
+
         mpc3d_controller.setup_QP();
         mpc3d_controller.solve();
     }
@@ -1179,9 +1349,14 @@ private:
         }
     
         const std::vector<std::string> header = {
-            "t_ms", "space_counter", "rx", "ry", "yaw",
-            "vx", "vy", "vyaw", "vxd", "vyd", "vyawd",
-            "h", "dhdx", "dhdy", "dhdq", "dhdt", "alpha", "on_off"
+            "t_ms", "space_counter",
+            "rx", "ry", "yaw",
+            "vx", "vy", "vyaw",
+            "vxd", "vyd", "vyawd",
+            "h", "dhdx", "dhdy", "dhdq", "dhdt",
+            "alpha", "on_off",
+            "lambda", "lambda_dot", "insertion_active",
+            "new_constraint_event", "constraint_event_counter"
         };
     
         for (size_t n = 0; n < header.size(); ++n) {
@@ -1410,8 +1585,9 @@ private:
         hgrid_insertion_old_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         hgrid_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         dhdt_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        beta_grid_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
 
-        if (!hgrid_insertion_old_ || !hgrid_active_ || !dhdt_active_) {
+        if (!hgrid_insertion_old_ || !hgrid_active_ || !dhdt_active_ || !beta_grid_) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for field insertion buffers");
             throw std::runtime_error("Field insertion buffer allocation failed");
         }
@@ -1459,6 +1635,7 @@ private:
             hgrid_insertion_old_[n] = h0;
             hgrid_active_[n] = h0;
             dhdt_active_[n] = 0.0f;
+            beta_grid_[n] = 0.0f;
         }
     
         Kernel::poissonInit();
@@ -1533,20 +1710,31 @@ private:
 
     void publish_logging_data() {
         if (!logging_data_pub_) return;
-    
+
         std_msgs::msg::Float32MultiArray msg;
         msg.data = {
             t_ms,
             static_cast<float>(space_counter),
+
             x[0], x[1], x[2],
+
             v[0], v[1], v[2],
             vt[0], vt[1], vt[2],
+
             h, dhdx, dhdy, dhdq, dhdt,
             wn,
-            static_cast<float>(realtime_sf_flag | predictive_sf_flag)
+            static_cast<float>(realtime_sf_flag | predictive_sf_flag),
+
+            field_insertion_.lambda,
+            field_insertion_.lambda_dot,
+            static_cast<float>(field_insertion_.active),
+            new_constraint_event_flag_ ? 1.0f : 0.0f,
+            static_cast<float>(constraint_event_counter_)
         };
-    
+
         logging_data_pub_->publish(msg);
+
+        new_constraint_event_flag_ = false;
     }
 
     void update_persistent_human_memory_from_expanded_map() {
@@ -2456,7 +2644,8 @@ private:
     float* inflate_bound_temp_{};
     int8_t* inflate_class_temp_{};
 
-
+    bool new_constraint_event_flag_{false};
+    int constraint_event_counter_{0};
     float guidance_x_display[IMAX * JMAX];
     float guidance_y_display[IMAX * JMAX];
     float bound_display[IMAX * JMAX];
@@ -2469,6 +2658,7 @@ private:
     float* hgrid_insertion_old_{nullptr};
     float* hgrid_active_{nullptr};
     float* dhdt_active_{nullptr};
+    float* beta_grid_{nullptr};
 
     FieldInsertionState field_insertion_;
     ConstraintManager constraint_manager_;
