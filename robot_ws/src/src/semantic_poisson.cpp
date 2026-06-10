@@ -1094,9 +1094,33 @@ private:
 
         dt = std::clamp(dt, 0.0f, 0.2f);
 
-        field_insertion_.lambda_dot =
+        const float lambda_dot_cmd =
             std::clamp(
                 field_insertion_.commanded_lambda_dot,
+                field_insertion_.lambda_dot_min,
+                field_insertion_.lambda_dot_max
+            );
+
+        // Maximum allowed change in lambda_dot per second.
+        // Smaller = smoother ramp.
+        // Example: 0.5 means lambda_dot can go 0.0 -> 0.5 in about 1 second.
+        const float lambda_ddot_max = 0.5f;
+
+        const float max_delta =
+            lambda_ddot_max * dt;
+
+        const float delta =
+            std::clamp(
+                lambda_dot_cmd - field_insertion_.lambda_dot,
+                -max_delta,
+                max_delta
+            );
+
+        field_insertion_.lambda_dot += delta;
+
+        field_insertion_.lambda_dot =
+            std::clamp(
+                field_insertion_.lambda_dot,
                 field_insertion_.lambda_dot_min,
                 field_insertion_.lambda_dot_max
             );

@@ -37,10 +37,16 @@ class MPC3D{
             Pu.row(2) << 0.0, 0.0, 1.0;
             for(int k=0; k<N_HORIZON; k++) cost_P.block<INPUTS, INPUTS>(nX + k*INPUTS, nX + k*INPUTS) = Pu;
             cost_P.block<INPUTS, INPUTS>(nX + (N_HORIZON-1)*INPUTS, nX + (N_HORIZON-1)*INPUTS) *= 2.0f;
-            const float lambda_dot_weight = 0.1f;
+            lambda_dot_weight_ = 0.1f;
+
             for (int k = 0; k < N_HORIZON; ++k) {
                 const int idlambda = nX + nU + k;
-                cost_P(idlambda, idlambda) = lambda_dot_weight;
+
+                cost_P(idlambda, idlambda) = lambda_dot_weight_;
+
+                // Prefer fast insertion.
+                // This makes the unconstrained optimum lambda_dot_max_.
+                cost_q(idlambda) = -lambda_dot_weight_ * lambda_dot_max_;
             }
 
             // Build Constraints
@@ -89,8 +95,9 @@ class MPC3D{
         float cost1 = 1.0e23f;
         float resid = 1.0e23f;
         float lambda_dot_min_ = 0.05f;
-        float lambda_dot_max_ = 0.5f;
+        float lambda_dot_max_ = 0.5;
         float lambda_dot_solution_ = 0.05f;
+        float lambda_dot_weight_ = 0.1f;
 
         int setup_QP(void){
             
@@ -127,6 +134,10 @@ class MPC3D{
             Eigen::VectorXd input_goal(INPUTS);
             input_goal << ud[0], ud[1], ud[2];
             for(int k=0; k<N_HORIZON; k++) cost_q.segment(k*INPUTS + nX, INPUTS) = -input_goal.transpose() * Pu;
+            for (int k = 0; k < N_HORIZON; ++k) {
+                const int idlambda = nX + nU + k;
+                cost_q(idlambda) = -lambda_dot_weight_ * lambda_dot_max_;
+            }
             solver.updateGradient(cost_q);
             
         }
@@ -145,8 +156,12 @@ class MPC3D{
 
             for (int k = 0; k < N_HORIZON; ++k) {
                 const int idlambda = nX + nU + k;
+
                 constraint_lower(idlambda) = lambda_dot_min_;
                 constraint_upper(idlambda) = lambda_dot_max_;
+
+                // Keep the lambda-dot cost centered at the current max.
+                cost_q(idlambda) = -lambda_dot_weight_ * lambda_dot_max_;
             }
         }
 
