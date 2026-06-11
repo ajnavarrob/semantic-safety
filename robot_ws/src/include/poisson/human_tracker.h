@@ -107,6 +107,10 @@ public:
         prune_stale_tracks(current_time);
     }
 
+    float get_current_time() const {
+        return last_update_time_;
+    }
+
     /**
      * @brief Get all active tracks for labeling
      */

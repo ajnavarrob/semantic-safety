@@ -388,8 +388,265 @@ private:
         SemanticStageOutput out;
         label_human_clusters(occ1);
         out.active_tracks = human_tracker_->get_active_tracks();
+        apply_relational_constraints_to_semantic_map(out.active_tracks);
         out.tight_area = is_tight_area();
         return out;
+    }
+
+    void apply_relational_constraints_to_semantic_map(
+        const std::vector<HumanTrack>& tracks
+    ) {
+        std::fill(relational_debug_grid_.begin(), relational_debug_grid_.end(), 0);
+        if (tracks.empty()) {
+            return;
+        }
+
+        int added_cells_total = 0;
+
+        for (const auto& rc : constraint_runtime_config_.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+
+            if (rc.type != ConstraintType::Relational) {
+                continue;
+            }
+
+            bool target_is_robot = false;
+            for (const auto& target : rc.target_classes) {
+                if (target == "robot") {
+                    target_is_robot = true;
+                    break;
+                }
+            }
+
+            bool reference_is_person = false;
+            for (const auto& ref : rc.reference_classes) {
+                if (ref == "person" || ref == "human") {
+                    reference_is_person = true;
+                    break;
+                }
+            }
+
+            if (!target_is_robot || !reference_is_person) {
+                continue;
+            }
+
+            const float min_radius_m =
+                rc.min_radius_m > 0.0f ? rc.min_radius_m : 0.0f;
+
+            const float max_radius_m =
+                rc.max_radius_m > 0.0f ?
+                    rc.max_radius_m :
+                    (rc.radius_m > 0.0f ? rc.radius_m : 2.0f);
+
+            const float cone_half_angle_deg =
+                rc.cone_half_angle_deg > 0.0f ? rc.cone_half_angle_deg : 60.0f;
+
+            const float cone_half_angle_rad =
+                cone_half_angle_deg * static_cast<float>(M_PI) / 180.0f;
+
+            const float cos_cone =
+                std::cos(cone_half_angle_rad);
+
+            const float heading_timeout_sec =
+                rc.heading_timeout_sec > 0.0f ? rc.heading_timeout_sec : 5.0f;
+
+            const float now_sec = human_tracker_->get_current_time();
+
+            int added_cells_for_constraint = 0;
+            int tracks_seen = 0;
+            int tracks_heading_valid = 0;
+            int tracks_not_timed_out = 0;
+            int cells_in_radius = 0;
+            int cells_in_selected_halfspace = 0;
+            int cells_in_selected_region = 0;
+            int cells_marked_forbidden = 0;
+
+            for (const auto& track : tracks) {
+                tracks_seen++;
+
+                if (!track.heading_valid) {
+                    continue;
+                }
+
+                if (!track.yolo_confirmed && !track.yolo_ever_confirmed) {
+                    continue;
+                }
+
+                if (track.confidence < 0.15f) {
+                    continue;
+                }
+
+                tracks_heading_valid++;
+
+                const float heading_age =
+                    now_sec - track.last_update_time;
+
+                if (heading_age > heading_timeout_sec) {
+                    continue;
+                }
+
+                tracks_not_timed_out++;
+
+                float hx = track.heading_x;
+                float hy = track.heading_y;
+
+                const float hnorm = std::sqrt(hx * hx + hy * hy);
+                if (hnorm < 1.0e-3f) {
+                    continue;
+                }
+
+                hx /= hnorm;
+                hy /= hnorm;
+
+                float cone_x = hx;
+                float cone_y = hy;
+
+                if (rc.relation == "behind") {
+                    cone_x = -hx;
+                    cone_y = -hy;
+                } else if (rc.relation == "in_front_of") {
+                    cone_x = hx;
+                    cone_y = hy;
+                } else if (rc.relation == "left_of") {
+                    cone_x = -hy;
+                    cone_y = hx;
+                } else if (rc.relation == "right_of") {
+                    cone_x = hy;
+                    cone_y = -hx;
+                } else {
+                    continue;
+                }
+
+                const std::string mode =
+                    rc.mode.empty() ? "forbid_region" : rc.mode;
+
+                for (int i = 0; i < IMAX; ++i) {
+                    for (int j = 0; j < JMAX; ++j) {
+                        const int n = i * JMAX + j;
+
+                        const float cell_x =
+                            (static_cast<float>(j) -
+                            0.5f * static_cast<float>(JMAX)) * DS;
+
+                        const float cell_y =
+                            (static_cast<float>(i) -
+                            0.5f * static_cast<float>(IMAX)) * DS;
+
+                        const float rx = cell_x - track.x;
+                        const float ry = cell_y - track.y;
+
+                        const float dist =
+                            std::sqrt(rx * rx + ry * ry);
+
+                        if (dist < min_radius_m ||
+                            dist > max_radius_m) {
+                            continue;
+                        }
+
+                        cells_in_radius++;
+
+                        const float dot =
+                            rx * cone_x + ry * cone_y;
+
+                        if (dot > 0.0f) {
+                            cells_in_selected_halfspace++;
+                        }
+
+                        const float cos_angle =
+                            dot / dist;
+
+                        const bool inside_selected_region =
+                            (dot > 0.0f) && (cos_angle >= cos_cone);
+
+                        if (inside_selected_region) {
+                            cells_in_selected_region++;
+                        }
+
+                        bool mark_forbidden = false;
+
+                        if (mode == "forbid_region") {
+                            mark_forbidden = inside_selected_region;
+                        } else if (mode == "allow_region") {
+                            mark_forbidden = !inside_selected_region;
+                        } else {
+                            continue;
+                        }
+
+                        if (inside_selected_region) {
+                            relational_debug_grid_[n] = 1;
+                        }
+
+                        if (mark_forbidden) {
+                            relational_debug_grid_[n] = 100;
+                        }
+
+                        if (!mark_forbidden) {
+                            continue;
+                        }
+
+                        cells_marked_forbidden++;
+
+                        if (class_map_expanded[n] != 1) {
+                            added_cells_for_constraint++;
+                        }
+
+                        class_map_expanded[n] = 1;
+                    }
+                }
+            }
+
+            added_cells_total += added_cells_for_constraint;
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Relational '%s': relation=%s, mode=%s, tracks=%d, heading_valid=%d, not_timed_out=%d, in_radius=%d, selected_region=%d, forbidden=%d, added_cells=%d",
+                rc.id.c_str(),
+                rc.relation.c_str(),
+                rc.mode.c_str(),
+                tracks_seen,
+                tracks_heading_valid,
+                tracks_not_timed_out,
+                cells_in_radius,
+                cells_in_selected_region,
+                cells_marked_forbidden,
+                added_cells_for_constraint
+            );
+        }
+
+        nav_msgs::msg::OccupancyGrid msg;
+        msg.header.stamp = rclcpp::Time(0);
+        msg.header.frame_id = "body_link";
+
+        msg.info.resolution = DS;
+        msg.info.width = JMAX;
+        msg.info.height = IMAX;
+
+        msg.info.origin.position.x = -0.5f * JMAX * DS;
+        msg.info.origin.position.y = -0.5f * IMAX * DS;
+        msg.info.origin.position.z = 0.0;
+
+        msg.info.origin.orientation.w = 1.0;
+
+        msg.data.assign(
+            relational_debug_grid_.begin(),
+            relational_debug_grid_.end()
+        );
+
+        relational_debug_pub_->publish(msg);
+
+        if (added_cells_total > 0) {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Relational constraints added total cells=%d",
+                added_cells_total
+            );
+        }
     }
 
     void build_inflated_boundaries(bool tight_area) {
@@ -1723,7 +1980,8 @@ private:
         poisson_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/poisson/visualization", 10);
         logging_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/logging_data", 10);
         profiling_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/profiling_data", 10);
-    
+        relational_debug_grid_.resize(IMAX * JMAX, 0);
+        relational_debug_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/relational_debug_map",10);
         mpc_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
         mpc_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(10),
@@ -2730,6 +2988,9 @@ private:
     float human_direction_threshold_ = 0.15f;
     std::map<int, std::pair<float, float>> prev_human_distances_;
     std::vector<std::tuple<int, int, float, float, float>> human_boundary_info_;
+
+    std::vector<int8_t> relational_debug_grid_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr relational_debug_pub_;
 
     float tight_area_human_threshold_ = 2.0f;
     float tight_area_h_threshold_ = 0.3f;

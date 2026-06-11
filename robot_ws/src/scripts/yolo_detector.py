@@ -32,6 +32,22 @@ class YOLODetectorNode(Node):
         self.declare_parameter('model_path', 'yolo11n-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('use_tensorrt', False)
+
+        self.declare_parameter('image_topic', '/camera_front/image_rect_color')
+        self.declare_parameter('pointcloud_topic', '/camera_front/point_cloud/cloud_registered')
+        self.declare_parameter('segmentation_mask_topic', '/yolo/segmentation_mask')
+        self.declare_parameter('annotated_image_topic', '/yolo/annotated_image')
+        self.declare_parameter('human_centroid_topic', '/human_tracking/centroid')
+        self.declare_parameter('class_map_topic', '/class_map')
+        self.declare_parameter('visibility_map_topic', '/visibility_map')
+
+        self.image_topic = self.get_parameter('image_topic').value
+        self.pointcloud_topic = self.get_parameter('pointcloud_topic').value
+        self.segmentation_mask_topic = self.get_parameter('segmentation_mask_topic').value
+        self.annotated_image_topic = self.get_parameter('annotated_image_topic').value
+        self.human_centroid_topic = self.get_parameter('human_centroid_topic').value
+        self.class_map_topic = self.get_parameter('class_map_topic').value
+        self.visibility_map_topic = self.get_parameter('visibility_map_topic').value
         
         model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
@@ -92,14 +108,14 @@ class YOLODetectorNode(Node):
         # Subscribers
         self.image_sub = self.create_subscription(
             Image,
-            '/camera/image_rect_color',
+            self.image_topic,
             self.image_callback,
             10
         )
         
         self.pointcloud_sub = self.create_subscription(
             PointCloud2,
-            '/camera/point_cloud/cloud_registered',
+            self.pointcloud_topic,
             self.pointcloud_callback,
             10
         )
@@ -110,35 +126,35 @@ class YOLODetectorNode(Node):
         # Publishers
         self.seg_mask_pub = self.create_publisher(
             Image,
-            '/yolo/segmentation_mask',
+            self.segmentation_mask_topic,
             10
         )
         
         # Publisher for human centroid (for gimbal tracking)
         self.human_centroid_pub = self.create_publisher(
             Point,
-            '/human_tracking/centroid',
+            self.human_centroid_topic,
             10
         )
         
         # Publisher for class map (for semantic safety field)
         self.class_map_pub = self.create_publisher(
             OccupancyGrid,
-            '/class_map',
+            self.class_map_topic,
             10
         )
         
         # Publisher for camera visibility mask (cells the camera can see)
         self.visibility_map_pub = self.create_publisher(
             OccupancyGrid,
-            '/visibility_map',
+            self.visibility_map_topic,
             10
         )
         
         # Publisher for annotated RGB image with YOLO bounding boxes
         self.annotated_image_pub = self.create_publisher(
             Image,
-            '/yolo/annotated_image',
+            self.annotated_image_topic,
             10
         )
         
@@ -156,8 +172,18 @@ class YOLODetectorNode(Node):
         self.logging_publish_period = 1.0 / self.logging_publish_hz if self.logging_publish_hz > 0 else 0.0
         self.last_logging_publish_time = self.get_clock().now()
         
-        self.get_logger().info(f'YOLO Detector Node initialized (logging publish rate: {self.logging_publish_hz} Hz)')
-    
+        self.get_logger().info(
+            f'YOLO Detector initialized\n'
+            f'Image topic: {self.image_topic}\n'
+            f'Pointcloud topic: {self.pointcloud_topic}\n'
+            f'Logging rate: {self.logging_publish_hz} Hz'
+            f'Segmentation topic: {self.segmentation_mask_topic}\n'
+            f'Annotated topic: {self.annotated_image_topic}\n'
+            f'Class map topic: {self.class_map_topic}\n'
+            f'Visibility map topic: {self.visibility_map_topic}\n'
+            f'Human centroid topic: {self.human_centroid_topic}\n'
+        )
+
     def pointcloud_callback(self, msg):
         """Store latest organized pointcloud for synchronization with image."""
         try:
@@ -441,14 +467,20 @@ class YOLODetectorNode(Node):
                     
                     # Filter by forward, lateral, and height bounds (in BODY frame)
                     if xyz_body_filtered.shape[0] > 0:
-                        forward_mask = ((xyz_body_filtered[:, 0] > self.forward_min) & 
-                                       (xyz_body_filtered[:, 0] < self.grid_size / 2.0))
+                        if xyz_body_filtered.shape[0] > 0:
+                            self.get_logger().info(
+                                f"X range: [{np.min(xyz_body_filtered[:,0]):.2f}, "
+                                f"{np.max(xyz_body_filtered[:,0]):.2f}]",
+                                throttle_duration_sec=1.0
+                            )
+                        x_range_mask = ((xyz_body_filtered[:, 0] > -self.grid_size / 2.0) &
+                            (xyz_body_filtered[:, 0] <  self.grid_size / 2.0))
                         lateral_mask = ((xyz_body_filtered[:, 1] > -self.grid_size / 2.0) & 
                                        (xyz_body_filtered[:, 1] < self.grid_size / 2.0))
                         height_mask2 = ((xyz_body_filtered[:, 2] > self.height_min) & 
                                        (xyz_body_filtered[:, 2] < self.height_max))
                         
-                        combined_mask = forward_mask & lateral_mask & height_mask2
+                        combined_mask = x_range_mask & lateral_mask & height_mask2
                         xyz_final = xyz_body_filtered[combined_mask]  # Use body coords for grid
                         seg_mask_final = seg_mask_filtered[combined_mask]
                         

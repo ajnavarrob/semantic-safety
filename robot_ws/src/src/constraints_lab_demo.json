@@ -10,7 +10,31 @@
         "semantic_class": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 2
+        "buffer_distance_m": 1        
+      }
+    },
+    {
+      "id": "stay_behind_person",
+      "type": "relational",
+      "enabled": true,
+      "enforce": true,
+      "relation": "behind",
+      "mode": "allow_region",
+      "target": {
+        "semantic_class": ["robot"]
+      },
+      "reference": {
+        "semantic_class": ["person"]
+      },
+      "spatial_parameters": {
+        "radius_m": 2.0,
+        "cone_half_angle_deg": 90.0,
+        "min_radius_m": 0.5,
+        "max_radius_m": 2.0
+      },
+      "heading_parameters": {
+        "speed_threshold_mps": 0.01,
+        "heading_timeout_sec": 5.0
       }
     },
     {

@@ -7,6 +7,7 @@ enum class ConstraintType {
     Exclusion,
     Proximity,
     RelativePosition,
+    Relational,
     VelocityLimit,
     Heading,
     WorkspaceRegion,
@@ -15,6 +16,8 @@ enum class ConstraintType {
 
 struct RuntimeConstraint {
     std::string id;
+    std::string relation;
+    std::string mode{"forbid_region"};
     ConstraintType type{ConstraintType::Unknown};
     bool enabled{true};
     bool enforce{false};
@@ -25,9 +28,17 @@ struct RuntimeConstraint {
     float buffer_distance_m{-1.0f};
     float min_distance_m{-1.0f};
     float max_distance_m{-1.0f};
+    float min_radius_m{-1.0f};
+    float max_radius_m{-1.0f};  
 
     float max_linear_velocity_mps{-1.0f};
     float max_angular_velocity_radps{-1.0f};
+
+    float radius_m{-1.0f};
+    float cone_half_angle_deg{-1.0f};
+
+    float heading_speed_threshold_mps{-1.0f};
+    float heading_timeout_sec{-1.0f};
 
     std::string raw_type;
 };

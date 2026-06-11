@@ -19,6 +19,9 @@ ConstraintType ConstraintManager::parse_constraint_type(
     if (type == "relative_position") {
         return ConstraintType::RelativePosition;
     }
+    if (type == "relational") {
+        return ConstraintType::Relational;
+    }
     if (type == "velocity_limit") {
         return ConstraintType::VelocityLimit;
     }
@@ -42,6 +45,8 @@ std::string ConstraintManager::constraint_type_to_string(
             return "proximity";
         case ConstraintType::RelativePosition:
             return "relative_position";
+        case ConstraintType::Relational:
+            return "relational";
         case ConstraintType::VelocityLimit:
             return "velocity_limit";
         case ConstraintType::Heading:
@@ -127,6 +132,8 @@ bool ConstraintManager::load_from_json(const std::string& path) {
         rc.type = parse_constraint_type(rc.raw_type);
         rc.enabled = c.value("enabled", true);
         rc.enforce = c.value("enforce", false);
+        rc.relation = c.value("relation", "");
+        rc.mode = c.value("mode", "forbid_region");
 
         parsed_count++;
 
@@ -184,6 +191,18 @@ bool ConstraintManager::load_from_json(const std::string& path) {
 
             rc.max_distance_m =
                 sp.value("max_distance_m", -1.0f);
+
+            rc.radius_m =
+                sp.value("radius_m", -1.0f);
+
+            rc.cone_half_angle_deg =
+                sp.value("cone_half_angle_deg", -1.0f);
+
+            rc.min_radius_m =
+                sp.value("min_radius_m", -1.0f);
+
+            rc.max_radius_m =
+                sp.value("max_radius_m", -1.0f);
         }
 
         if (c.contains("control_parameters") &&
@@ -195,6 +214,17 @@ bool ConstraintManager::load_from_json(const std::string& path) {
 
             rc.max_angular_velocity_radps =
                 cp.value("max_angular_velocity_radps", -1.0f);
+        }
+
+        if (c.contains("heading_parameters") &&
+            c["heading_parameters"].is_object()) {
+            const auto& hp = c["heading_parameters"];
+
+            rc.heading_speed_threshold_mps =
+                hp.value("speed_threshold_mps", -1.0f);
+
+            rc.heading_timeout_sec =
+                hp.value("heading_timeout_sec", -1.0f);
         }
 
         config_.constraints.push_back(rc);
@@ -216,6 +246,12 @@ bool ConstraintManager::load_from_json(const std::string& path) {
                   << ", buffer=" << rc.buffer_distance_m
                   << ", min_dist=" << rc.min_distance_m
                   << ", max_dist=" << rc.max_distance_m
+                  << ", relation=" << rc.relation
+                  << ", mode=" << rc.mode
+                  << ", radius=" << rc.radius_m
+                  << ", cone_half_angle_deg=" << rc.cone_half_angle_deg
+                  << ", min_radius=" << rc.min_radius_m
+                  << ", max_radius=" << rc.max_radius_m
                   << "\n";
 
         // Legacy behavior:

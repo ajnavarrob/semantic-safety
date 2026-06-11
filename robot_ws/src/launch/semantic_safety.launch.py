@@ -252,7 +252,8 @@ def generate_launch_description():
     )
     
     # RealSense camera launch
-    realsense_launch = IncludeLaunchDescription(
+    # Front RealSense camera launch
+    front_realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
                 FindPackageShare('unitree_ros2_poisson_simple'),
@@ -261,6 +262,28 @@ def generate_launch_description():
             ])
         ]),
         launch_arguments={
+            'camera_name': 'camera_front',
+            'serial_no': "'347522071920'",
+            'fps': LaunchConfiguration('camera_fps'),
+            'point_cloud_density': LaunchConfiguration('point_cloud_density')
+        }.items(),
+        condition=IfCondition(
+            PythonExpression(["'", LaunchConfiguration('camera_type'), "' == 'realsense'"])
+        )
+    )
+
+    # Rear RealSense camera launch
+    rear_realsense_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare('unitree_ros2_poisson_simple'),
+                'launch',
+                'camera_realsense.launch.py'
+            ])
+        ]),
+        launch_arguments={
+            'camera_name': 'camera_rear',
+            'serial_no': "'247122070270'", 
             'fps': LaunchConfiguration('camera_fps'),
             'point_cloud_density': LaunchConfiguration('point_cloud_density')
         }.items(),
@@ -293,10 +316,10 @@ def generate_launch_description():
     )
     
     # YOLO Detector Node
-    yolo_detector_node = Node(
+    yolo_front_node = Node(
         package='unitree_ros2_poisson_simple',
         executable='yolo_detector.py',
-        name='yolo_detector',
+        name='yolo_front',
         output='screen',
         parameters=[{
             'model_path': LaunchConfiguration('yolo_model'),
@@ -306,6 +329,41 @@ def generate_launch_description():
             'grid_jmax': 100,  # Must match poisson.h JMAX
             'grid_ds': 0.05,   # Must match poisson.h DS
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
+            'image_topic': '/camera_front/image_rect_color',
+            'pointcloud_topic': '/camera_front/point_cloud/cloud_registered',
+
+            'class_map_topic': '/class_map_front',
+            'visibility_map_topic': '/visibility_map_front',
+
+            'segmentation_mask_topic': '/yolo_front/segmentation_mask',
+            'annotated_image_topic': '/yolo_front/annotated_image',
+            'human_centroid_topic': '/human_tracking/front_centroid',
+        }],
+    )
+
+    yolo_rear_node = Node(
+        package='unitree_ros2_poisson_simple',
+        executable='yolo_detector.py',
+        name='yolo_rear',
+        output='screen',
+        parameters=[{
+            'model_path': LaunchConfiguration('yolo_model'),
+            'confidence_threshold': 0.5,
+            'use_tensorrt': LaunchConfiguration('use_tensorrt'),
+            'grid_imax': 100,
+            'grid_jmax': 100,
+            'grid_ds': 0.05,
+            'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
+
+            'image_topic': '/camera_rear/image_rect_color',
+            'pointcloud_topic': '/camera_rear/point_cloud/cloud_registered',
+
+            'class_map_topic': '/class_map_rear',
+            'visibility_map_topic': '/visibility_map_rear',
+
+            'segmentation_mask_topic': '/yolo_rear/segmentation_mask',
+            'annotated_image_topic': '/yolo_rear/annotated_image',
+            'human_centroid_topic': '/human_tracking/rear_centroid',
         }],
     )
     
@@ -357,6 +415,13 @@ def generate_launch_description():
         }],
     )
     
+    semantic_map_fuser_node = Node(
+        package='unitree_ros2_poisson_simple',
+        executable='semantic_map_fuser.py',
+        name='semantic_map_fuser',
+        output='screen',
+    )
+
     # Human Tracking Node (Gimbal Control)
     human_tracking_node = Node(
         package='unitree_ros2_poisson_simple',
@@ -471,6 +536,21 @@ def generate_launch_description():
             'body_link', 'utlidar_lidar'
         ],
     )
+
+    
+    # Static TF: body_link -> rear RealSense camera
+    # Rear camera faces backward, so yaw is approximately pi.
+    # TODO: tune translation/rotation to actual mount
+    body_to_rear_camera_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='body_to_rear_camera_tf',
+        arguments=[
+            '-0.20', '0.0', '0.25',
+            '3.14159', '0', '0',
+            'body_link', 'camera_rear_link'
+        ],
+    )
     
     # FAST_LIO Mapping Node (LiDAR-Inertial Odometry)
     # We only enable odometry output, disabling rviz, map, and path publishing
@@ -574,7 +654,8 @@ def generate_launch_description():
         vel_max_yaw_arg,
         logging_publish_hz_arg,
         enable_data_logging_to_file_arg,
-        realsense_launch,
+        front_realsense_launch,
+        rear_realsense_launch,
         # zed_launch,
         # cloud_merger_node,
         livox_lidar_node,
@@ -582,9 +663,12 @@ def generate_launch_description():
         body_to_livox_tf,         # Connect FAST_LIO's body to livox_frame
         livox_to_body_tf,
         body_to_utlidar_tf,
+        body_to_rear_camera_tf,
         fast_lio_node,  # FAST_LIO provides /Odometry from LiDAR-inertial fusion
         odom_publisher_node,  # Subscribes to FAST_LIO /Odometry, publishes /odom and TF
-        yolo_detector_node,
+        yolo_front_node,
+        yolo_rear_node,
+        semantic_map_fuser_node,
         human_tracking_node,  # Provides odom -> camera_link TF
         semantic_poisson_node,  # Start last - needs TF from odom_publisher and human_tracking
     ])

@@ -175,6 +175,7 @@ install(TARGETS
 install(PROGRAMS
         scripts/human_tracking.py
         scripts/yolo_detector.py
+        scripts/semantic_map_fuser.py
         DESTINATION lib/${PROJECT_NAME})
 
 # Install launch files

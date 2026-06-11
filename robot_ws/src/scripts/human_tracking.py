@@ -255,10 +255,17 @@ class HumanTrackingNode(Node):
         self.image_width = None
         
         # Subscribe to human centroid from yolo_zed_ros
-        self.centroid_sub = self.create_subscription(
+        self.front_centroid_sub = self.create_subscription(
             Point,
-            '/human_tracking/centroid',
-            self.centroid_callback,
+            '/human_tracking/front_centroid',
+            self.front_centroid_callback,
+            10
+        )
+
+        self.rear_centroid_sub = self.create_subscription(
+            Point,
+            '/human_tracking/rear_centroid',
+            self.rear_centroid_callback,
             10
         )
         
@@ -277,11 +284,17 @@ class HumanTrackingNode(Node):
         
         self.get_logger().info('Human tracking node initialized')
         self.get_logger().info(f'Control loop rate: {control_rate} Hz')
-        self.get_logger().info(f'Publishing TF body_link -> camera_link at {control_rate} Hz (no gimbal)')
+        self.get_logger().info(f'Publishing TF body_link -> camera_front_link at {control_rate} Hz (no gimbal)')
         self.get_logger().info(f'Camera offset (body frame): x={self.camera_offset_x}, y={self.camera_offset_y}, z={self.camera_offset_z}')
 
-    
-    def centroid_callback(self, msg):
+
+    def front_centroid_callback(self, msg):
+        self.process_centroid(msg, 'front')
+
+    def rear_centroid_callback(self, msg):
+        self.process_centroid(msg, 'rear')
+        
+    def process_centroid(self, msg, source):
         """Receive human centroid from yolo_zed_ros - just store the latest data"""
         # Extract data: x, y are pixel coordinates, z is image width
         self.last_centroid = (msg.x, msg.y)
@@ -351,7 +364,7 @@ class HumanTrackingNode(Node):
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
         transform.header.frame_id = 'body_link'
-        transform.child_frame_id = 'camera_link'
+        transform.child_frame_id = 'camera_front_link'
         
         # Get gimbal angles
         # gimbal_yaw_deg = self.gimbal.get_yaw_angle_degrees()
@@ -396,7 +409,7 @@ def main(args=None):
         return
     
     print("\n=== Human Tracking Active ===")
-    print("Subscribing to /human_tracking/centroid from yolo_zed_ros")
+    print("Subscribing to /human_tracking/front_centroid and /human_tracking/rear_centroid")
     print("Press Ctrl+C to exit\n")
     
     try:
