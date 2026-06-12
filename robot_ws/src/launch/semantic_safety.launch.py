@@ -531,7 +531,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='body_to_utlidar_tf',
         arguments=[
-            '0.37', '0.0', '0.05',  # x, y, z (front lidar position relative to body)
+            '0.25', '0.0', '0.05',  # x, y, z (front lidar position relative to body)
             '0', '2.9', '0',    # roll, pitch, yaw (150 degrees pitch)
             'body_link', 'utlidar_lidar'
         ],

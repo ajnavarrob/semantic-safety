@@ -34,7 +34,7 @@
       },
       "heading_parameters": {
         "speed_threshold_mps": 0.01,
-        "heading_timeout_sec": 5.0
+        "heading_timeout_sec": 1.0
       }
     },
     {

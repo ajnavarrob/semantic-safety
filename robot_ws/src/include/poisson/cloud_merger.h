@@ -98,7 +98,7 @@ class CloudMergerNode : public rclcpp::Node{
 
             // Create Subscribers & Publishers
             livox_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/livox/lidar", 1, std::bind(&CloudMergerNode::lidar_callback, this, std::placeholders::_1));
-            utlidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/utlidar/cloud", 1, std::bind(&CloudMergerNode::combined_callback, this, std::placeholders::_1));
+            // utlidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/utlidar/cloud", 1, std::bind(&CloudMergerNode::combined_callback, this, std::placeholders::_1));
             // Removed SportModeState subscription - now using TF for robot pose
             cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("poisson_cloud", 1);
             map_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("occupancy_grid", 1);
@@ -119,6 +119,103 @@ class CloudMergerNode : public rclcpp::Node{
         }
 
     private:
+
+        void publish_occupancy_from_combined_cloud() {
+            Timer map_timer(true);
+            map_timer.start();
+
+            dt = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - t
+            ).count();
+            t = std::chrono::steady_clock::now();
+            dt = std::clamp(dt, 0.0f, 0.5f);
+
+            pcl::PointCloud<pcl::PointXYZI>::Ptr odom_cloud(
+                new pcl::PointCloud<pcl::PointXYZI>
+            );
+
+            *odom_cloud += *combined_cloud_;
+            combined_cloud_->clear();
+
+            if (odom_cloud->points.empty()) {
+                std::fill(old_conf, old_conf + IMAX * JMAX, 0);
+                std::fill(confidence_values, confidence_values + IMAX * JMAX, 0);
+                std::fill(map_msg.data.begin(), map_msg.data.end(), 0);
+
+                map_msg.header.stamp = this->now();
+                map_pub_->publish(map_msg);
+                return;
+            }
+
+            cv::Mat raw_map = cv::Mat::zeros(IMAX, JMAX, CV_32F);
+
+            int valid_points = 0;
+
+            for (const auto& pt : odom_cloud->points) {
+                if (!(pt.z > minZ_ && pt.z < maxZ_)) {
+                    continue;
+                }
+
+                const float ic = pt.y / DS + static_cast<float>(IMAX / 2);
+                const float jc = pt.x / DS + static_cast<float>(JMAX / 2);
+
+                if (ic <= 0.0f || ic >= static_cast<float>(IMAX - 1) ||
+                    jc <= 0.0f || jc >= static_cast<float>(JMAX - 1)) {
+                    continue;
+                }
+
+                valid_points++;
+
+                raw_map.at<float>(
+                    static_cast<int>(std::round(ic)),
+                    static_cast<int>(std::round(jc))
+                ) = 1.0f;
+            }
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "CloudMerger valid_points=%d",
+                valid_points
+            );
+
+            for (int n = 0; n < IMAX * JMAX; n++) {
+                confidence_values[n] = 0;
+            }
+
+            Filtered_Occupancy_Convolution(
+                confidence_values,
+                raw_map,
+                old_conf
+            );
+
+            std::memcpy(
+                old_conf,
+                confidence_values,
+                IMAX * JMAX * sizeof(int8_t)
+            );
+
+            pcl::toROSMsg(*odom_cloud, cloud_msg);
+            cloud_msg.header.stamp = this->now();
+            cloud_msg.header.frame_id = "body_link";
+            cloud_pub_->publish(cloud_msg);
+
+            for (int n = 0; n < IMAX * JMAX; n++) {
+                map_msg.data[n] = confidence_values[n];
+            }
+
+            map_msg.header.stamp = this->now();
+            map_msg.info.origin.position.x = -maxX;
+            map_msg.info.origin.position.y = -maxY;
+            map_pub_->publish(map_msg);
+
+            static int timing_print_counter = 0;
+            if (++timing_print_counter >= 15) {
+                timing_print_counter = 0;
+                map_timer.time("Occ Map Solve Time: ");
+            }
+        }
         
         void combined_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
             
@@ -142,18 +239,69 @@ class CloudMergerNode : public rclcpp::Node{
             *odom_cloud += *combined_cloud_;
             combined_cloud_->clear();
 
+            if (odom_cloud->points.empty()) {
+                std::fill(old_conf, old_conf + IMAX * JMAX, 0);
+                std::fill(confidence_values, confidence_values + IMAX * JMAX, 0);
+
+                for (int n = 0; n < IMAX * JMAX; ++n) {
+                    map_msg.data[n] = 0;
+                }
+
+                map_msg.header.stamp = this->now();
+                map_pub_->publish(map_msg);
+                return;
+            }
+
             // Create Occupancy Grid object
             cv::Mat raw_map = cv::Mat::zeros(IMAX, JMAX, CV_32F);
-            for(const auto& pt : odom_cloud->points){
+            int valid_points = 0;
+            float min_px = 1e9f, max_px = -1e9f;
+            float min_py = 1e9f, max_py = -1e9f;
+            float min_pz = 1e9f, max_pz = -1e9f;
+
+            for (const auto& pt : odom_cloud->points) {
                 const bool in_plane = (pt.z > minZ_) && (pt.z < maxZ_);
-                if(!in_plane) continue;
-                // Points are in body_link frame (robot-centered), no offset needed
-                const float ic = pt.y / DS + (float)(IMAX/2);
-                const float jc = pt.x / DS + (float)(JMAX/2);
-                const bool in_grid = (ic > 0.0f) && (ic < (float)(IMAX-1)) && (jc > 0.0f) && (jc < (float)(JMAX-1));
-                if(!in_grid) continue;
-                raw_map.at<float>((int)std::round(ic),(int)std::round(jc)) = 1.0f;             
+                if (!in_plane) continue;
+
+                const float ic = pt.y / DS + static_cast<float>(IMAX / 2);
+                const float jc = pt.x / DS + static_cast<float>(JMAX / 2);
+
+                const bool in_grid =
+                    (ic > 0.0f) && (ic < static_cast<float>(IMAX - 1)) &&
+                    (jc > 0.0f) && (jc < static_cast<float>(JMAX - 1));
+
+                if (!in_grid) continue;
+                
+                if (pt.x > 0.0f && pt.x < 0.8f &&
+                    pt.y > 0.0f && pt.y < 0.8f) {
+                    continue;
+                }
+
+                valid_points++;
+
+                min_px = std::min(min_px, pt.x);
+                max_px = std::max(max_px, pt.x);
+                min_py = std::min(min_py, pt.y);
+                max_py = std::max(max_py, pt.y);
+                min_pz = std::min(min_pz, pt.z);
+                max_pz = std::max(max_pz, pt.z);
+
+                raw_map.at<float>(
+                    static_cast<int>(std::round(ic)),
+                    static_cast<int>(std::round(jc))
+                ) = 1.0f;
             }
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "CloudMerger valid_points=%d x=[%.2f, %.2f] y=[%.2f, %.2f] z=[%.2f, %.2f]",
+                valid_points,
+                min_px, max_px,
+                min_py, max_py,
+                min_pz, max_pz
+            );
 
             // BUILD MAP HERE
             for(int n=0; n<IMAX*JMAX; n++) confidence_values[n] = 0;
@@ -216,6 +364,7 @@ class CloudMergerNode : public rclcpp::Node{
 
             // Add Points into Combined Cloud (already in body_link frame)
             *combined_cloud_ += *filtered;
+            publish_occupancy_from_combined_cloud();
 
         } 
 
@@ -348,6 +497,7 @@ class CloudMergerNode : public rclcpp::Node{
             filtered->height = 1;
             
             *combined_cloud_ += *filtered;
+            publish_occupancy_from_combined_cloud();
         }
 
         //  CREATE GAUSSIAN KERNEL

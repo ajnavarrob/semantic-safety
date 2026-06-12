@@ -186,15 +186,52 @@ private:
                 if (dt > 0.01f && dt < 1.0f) {
                     float obs_vx = (c.centroid_x - track.x) / dt;
                     float obs_vy = (c.centroid_y - track.y) / dt;
-                    track.vx = 0.5f * track.vx + 0.5f * obs_vx;
-                    track.vy = 0.5f * track.vy + 0.5f * obs_vy;
+                    track.vx = 0.9f * track.vx + 0.1f * obs_vx;
+                    track.vy = 0.9f * track.vy + 0.1f * obs_vy;
                     
                     // Update heading from velocity when speed exceeds threshold
                     float speed = std::sqrt(track.vx * track.vx + track.vy * track.vy);
                     if (speed > velocity_threshold_) {
-                        track.heading_x = track.vx / speed;
-                        track.heading_y = track.vy / speed;
-                        track.heading_valid = true;
+                        float new_heading_x = track.vx / speed;
+                        float new_heading_y = track.vy / speed;
+
+                        // Prevent 180-degree flips relative to previous heading.
+                        if (track.heading_valid) {
+                            const float dot =
+                                new_heading_x * track.heading_x +
+                                new_heading_y * track.heading_y;
+
+                            if (dot < 0.0f) {
+                                new_heading_x = -new_heading_x;
+                                new_heading_y = -new_heading_y;
+                            }
+                        }
+
+                        // Smooth heading update.
+                        const float alpha = 0.15f;
+
+                        if (track.heading_valid) {
+                            track.heading_x =
+                                (1.0f - alpha) * track.heading_x +
+                                alpha * new_heading_x;
+
+                            track.heading_y =
+                                (1.0f - alpha) * track.heading_y +
+                                alpha * new_heading_y;
+                        } else {
+                            track.heading_x = new_heading_x;
+                            track.heading_y = new_heading_y;
+                        }
+
+                        const float hnorm =
+                            std::sqrt(track.heading_x * track.heading_x +
+                                    track.heading_y * track.heading_y);
+
+                        if (hnorm > 1.0e-3f) {
+                            track.heading_x /= hnorm;
+                            track.heading_y /= hnorm;
+                            track.heading_valid = true;
+                        }
                     }
                     // When stationary, keep previous heading (don't invalidate)
                 }
