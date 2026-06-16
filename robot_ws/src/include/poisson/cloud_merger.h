@@ -98,7 +98,11 @@ class CloudMergerNode : public rclcpp::Node{
 
             // Create Subscribers & Publishers
             livox_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/livox/lidar", 1, std::bind(&CloudMergerNode::lidar_callback, this, std::placeholders::_1));
-            // utlidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("/utlidar/cloud", 1, std::bind(&CloudMergerNode::combined_callback, this, std::placeholders::_1));
+            utlidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                "/utlidar/cloud_deskewed",
+                1,
+                std::bind(&CloudMergerNode::combined_callback, this, std::placeholders::_1)
+            );
             // Removed SportModeState subscription - now using TF for robot pose
             cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("poisson_cloud", 1);
             map_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("occupancy_grid", 1);
@@ -109,8 +113,13 @@ class CloudMergerNode : public rclcpp::Node{
             tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
             // Camera subscription for RealSense D435 pointcloud
-            camera_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                "/camera/point_cloud/cloud_registered", 1,
+            camera_front_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                "/camera_front/point_cloud/cloud_registered", 1,
+                std::bind(&CloudMergerNode::camera_callback, this, std::placeholders::_1)
+            );
+
+            camera_rear_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                "/camera_rear/point_cloud/cloud_registered", 1,
                 std::bind(&CloudMergerNode::camera_callback, this, std::placeholders::_1)
             );
 
@@ -138,12 +147,12 @@ class CloudMergerNode : public rclcpp::Node{
             combined_cloud_->clear();
 
             if (odom_cloud->points.empty()) {
-                std::fill(old_conf, old_conf + IMAX * JMAX, 0);
-                std::fill(confidence_values, confidence_values + IMAX * JMAX, 0);
-                std::fill(map_msg.data.begin(), map_msg.data.end(), 0);
-
-                map_msg.header.stamp = this->now();
-                map_pub_->publish(map_msg);
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "CloudMerger received empty combined cloud; keeping previous occupancy map"
+                );
                 return;
             }
 
@@ -172,13 +181,15 @@ class CloudMergerNode : public rclcpp::Node{
                 ) = 1.0f;
             }
 
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                1000,
-                "CloudMerger valid_points=%d",
-                valid_points
-            );
+            if (valid_points == 0) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "CloudMerger valid_points=0 after filtering; keeping previous occupancy map"
+                );
+                return;
+            }
 
             for (int n = 0; n < IMAX * JMAX; n++) {
                 confidence_values[n] = 0;
@@ -272,10 +283,12 @@ class CloudMergerNode : public rclcpp::Node{
 
                 if (!in_grid) continue;
                 
-                if (pt.x > 0.0f && pt.x < 0.8f &&
-                    pt.y > 0.0f && pt.y < 0.8f) {
+                float ellipse_norm =
+                    std::pow(pt.x/minX, 8.0f) +
+                    std::pow(pt.y/minY, 8.0f);
+
+                if (ellipse_norm <= 1.0f)
                     continue;
-                }
 
                 valid_points++;
 
@@ -629,7 +642,8 @@ class CloudMergerNode : public rclcpp::Node{
             nav_msgs::msg::OccupancyGrid map_msg;
             rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr livox_sub_;
             rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr utlidar_sub_;
-            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr camera_sub_;
+            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr camera_front_sub_;
+            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr camera_rear_sub_;
             // Removed: robot_pose_sub_ - now using TF for robot pose
             
             rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;

@@ -168,12 +168,58 @@ class PoissonControllerNode : public rclcpp::Node{
                         tight_area_human_threshold_, tight_area_h_threshold_, tight_area_wall_slack_);
 
             // Segmentation mask + pointcloud sync
-            image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-                this, "/yolo/segmentation_mask"
+            front_image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+                this, "/yolo_front/segmentation_mask"
             );
-            cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
-                this, "/camera/point_cloud/cloud_registered"
+
+            front_cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
+                this, "/camera_front/point_cloud/cloud_registered"
             );
+
+            rear_image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+                this, "/yolo_rear/segmentation_mask"
+            );
+
+            rear_cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
+                this, "/camera_rear/point_cloud/cloud_registered"
+            );
+
+            using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+                sensor_msgs::msg::Image,
+                sensor_msgs::msg::PointCloud2
+            >;
+
+            front_sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+                SyncPolicy(10),
+                *front_image_sub_,
+                *front_cloud_sub_
+            );
+
+            front_sync_->registerCallback(
+                std::bind(
+                    &PoissonControllerNode::semantic_callback,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2
+                )
+            );
+
+            rear_sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+                SyncPolicy(10),
+                *rear_image_sub_,
+                *rear_cloud_sub_
+            );
+
+            rear_sync_->registerCallback(
+                std::bind(
+                    &PoissonControllerNode::semantic_callback,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2
+                )
+            );
+
+
             // Initialize Occupancy Grids
             for(int n = 0; n < IMAX*JMAX; n++){
                 occ1[n] = 1.0f;
@@ -2039,8 +2085,19 @@ class PoissonControllerNode : public rclcpp::Node{
         rclcpp::CallbackGroup::SharedPtr mpc_callback_group_;
         rclcpp::TimerBase::SharedPtr mpc_timer_;
         
-        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> image_sub_;
-        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> cloud_sub_;
+        using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+            sensor_msgs::msg::Image,
+            sensor_msgs::msg::PointCloud2
+        >;
+
+        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> front_image_sub_;
+        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> front_cloud_sub_;
+
+        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> rear_image_sub_;
+        std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>> rear_cloud_sub_;
+
+        std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> front_sync_;
+        std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> rear_sync_;
         
         rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr key_suber_;
         rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_suber_;

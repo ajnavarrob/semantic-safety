@@ -10,14 +10,14 @@
         "semantic_class": ["person"]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1        
+        "buffer_distance_m": 2        
       }
     },
     {
       "id": "stay_behind_person",
       "type": "relational",
       "enabled": true,
-      "enforce": true,
+      "enforce": false,
       "relation": "behind",
       "mode": "allow_region",
       "target": {

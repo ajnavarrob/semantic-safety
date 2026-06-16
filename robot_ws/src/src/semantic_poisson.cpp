@@ -742,7 +742,7 @@ private:
     }
 
     void solve_guidance_laplace(float* bound_guidance) {
-        const float v_RelTol = 1.0e-4f;
+        const float v_RelTol = 1.0e-3f;
         const int N_guidance = IMAX / 5;
         const float w_SOR_guidance = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N_guidance + 1)));
         (void)Kernel::poissonSolve(guidance_x_temp_, forcing_zero_temp_, bound_guidance, v_RelTol, w_SOR_guidance);
@@ -764,7 +764,7 @@ private:
     bool solve_safety_field(const GuidanceStageOutput& guidance){
         ScopedTimer timer(timing_.safety_field_solve_ms);
     
-        const float relTol = 1.0e-4f;
+        const float relTol = 1.0e-3f;
         const int N = IMAX / 5;
         const float w_SOR = 2.0f / (1.0f + std::sin(M_PI / static_cast<float>(N + 1)));
     

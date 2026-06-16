@@ -241,7 +241,7 @@ def generate_launch_description():
     
     logging_publish_hz_arg = DeclareLaunchArgument(
         'logging_publish_hz',
-        default_value='10.0',
+        default_value='2.0',
         description='Frequency (Hz) at which to publish visualization images and logging data'
     )
     
@@ -376,7 +376,7 @@ def generate_launch_description():
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
             'dh0_obstacle': LaunchConfiguration('dh0_obstacle'),
-            'enable_display': True,  # Show OpenCV visualization
+            'enable_display': False,  # Show OpenCV visualization
             'min_z': LaunchConfiguration('min_z'),  # Forwarded to CloudMergerNode
             'max_z': LaunchConfiguration('max_z'),  # Forwarded to CloudMergerNode
             # Tight-area wall softening
@@ -532,7 +532,7 @@ def generate_launch_description():
         name='body_to_utlidar_tf',
         arguments=[
             '0.25', '0.0', '0.05',  # x, y, z (front lidar position relative to body)
-            '0', '2.9', '0',    # roll, pitch, yaw (150 degrees pitch)
+            '2.0944', '-2.9', '0',    # roll, pitch, yaw (150 degrees pitch)
             'body_link', 'utlidar_lidar'
         ],
     )
@@ -546,7 +546,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='body_to_rear_camera_tf',
         arguments=[
-            '-0.20', '0.0', '0.25',
+            '-0.05', '0.0', '0.20',
             '3.14159', '0', '0',
             'body_link', 'camera_rear_link'
         ],

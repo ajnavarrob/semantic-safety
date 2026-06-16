@@ -11,6 +11,7 @@ import ctypes
 import os
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 from nav_msgs.msg import OccupancyGrid
@@ -22,6 +23,7 @@ import numpy as np
 from ultralytics import YOLO
 import tf2_ros
 from tf2_ros import TransformException
+import time
 
 
 class YOLODetectorNode(Node):
@@ -37,6 +39,7 @@ class YOLODetectorNode(Node):
         self.declare_parameter('pointcloud_topic', '/camera_front/point_cloud/cloud_registered')
         self.declare_parameter('segmentation_mask_topic', '/yolo/segmentation_mask')
         self.declare_parameter('annotated_image_topic', '/yolo/annotated_image')
+        self.declare_parameter('publish_annotated_image', False)
         self.declare_parameter('human_centroid_topic', '/human_tracking/centroid')
         self.declare_parameter('class_map_topic', '/class_map')
         self.declare_parameter('visibility_map_topic', '/visibility_map')
@@ -45,6 +48,7 @@ class YOLODetectorNode(Node):
         self.pointcloud_topic = self.get_parameter('pointcloud_topic').value
         self.segmentation_mask_topic = self.get_parameter('segmentation_mask_topic').value
         self.annotated_image_topic = self.get_parameter('annotated_image_topic').value
+        self.publish_annotated_image = self.get_parameter('publish_annotated_image').value
         self.human_centroid_topic = self.get_parameter('human_centroid_topic').value
         self.class_map_topic = self.get_parameter('class_map_topic').value
         self.visibility_map_topic = self.get_parameter('visibility_map_topic').value
@@ -106,18 +110,27 @@ class YOLODetectorNode(Node):
         self.grid_size = self.get_parameter('grid_size').value
         
         # Subscribers
+        # Use latest-only QoS for high-bandwidth sensor streams.
+        # If YOLO/map projection falls behind, we want to drop stale frames
+        # rather than process old camera data.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self.image_sub = self.create_subscription(
             Image,
             self.image_topic,
             self.image_callback,
-            10
+            sensor_qos
         )
-        
+
         self.pointcloud_sub = self.create_subscription(
             PointCloud2,
             self.pointcloud_topic,
             self.pointcloud_callback,
-            10
+            sensor_qos
         )
         
         # Robot pose from TF (odom -> body_link), provided by odom_publisher.py
@@ -269,13 +282,22 @@ class YOLODetectorNode(Node):
     
     def image_callback(self, msg):
         try:
+            t_total = time.perf_counter()
             # Update robot pose from TF
             self.update_pose_from_tf()  # Non-blocking, uses last known if fails
             
             # Convert ROS Image to OpenCV
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            t0 = time.perf_counter()
+
+            cv_image = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding='bgr8'
+            )
+
+            t_cv_ms = (time.perf_counter() - t0) * 1000.0
             
             # Run YOLO detection
+            t0 = time.perf_counter()
             results = self.model.predict(
                 cv_image,
                 conf=self.conf_threshold,
@@ -283,6 +305,8 @@ class YOLODetectorNode(Node):
                 show=False, 
                 device=0  # Use GPU
             )
+
+            t_infer_ms = (time.perf_counter() - t0) * 1000.0
             
             # Create segmentation mask
             seg_mask = np.zeros((cv_image.shape[0], cv_image.shape[1]), dtype=np.uint8)
@@ -314,51 +338,52 @@ class YOLODetectorNode(Node):
             self.seg_mask_pub.publish(mask_msg)
             
             # Draw bounding boxes on the RGB image and publish annotated image
-            annotated_image = cv_image.copy()
-            if results and results[0].boxes is not None:
-                boxes = results[0].boxes
-                for i, box in enumerate(boxes):
-                    # Get bounding box coordinates (xyxy format)
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    class_id = int(box.cls.item())
-                    confidence = float(box.conf.item())
-                    
-                    # Get class name from YOLO model
-                    class_name = self.model.names[class_id] if hasattr(self.model, 'names') else f'class_{class_id}'
-                    
-                    # Color: red for person (human), blue for other objects
-                    if class_id == 0:  # person
-                        color = (0, 0, 255)  # Red (BGR)
-                        label = f'HUMAN: {confidence:.2f}'
-                    else:
-                        color = (255, 0, 0)  # Blue (BGR)
-                        label = f'{class_name}: {confidence:.2f}'
-                    
-                    # Draw bounding box
-                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
-                    
-                    # Draw label background
-                    (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(annotated_image, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
-                    
-                    # Draw label text
-                    cv2.putText(annotated_image, label, (x1, y1 - 5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if self.publish_annotated_image:
+                annotated_image = cv_image.copy()
+                if results and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    for i, box in enumerate(boxes):
+                        # Get bounding box coordinates (xyxy format)
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        class_id = int(box.cls.item())
+                        confidence = float(box.conf.item())
+                        
+                        # Get class name from YOLO model
+                        class_name = self.model.names[class_id] if hasattr(self.model, 'names') else f'class_{class_id}'
+                        
+                        # Color: red for person (human), blue for other objects
+                        if class_id == 0:  # person
+                            color = (0, 0, 255)  # Red (BGR)
+                            label = f'HUMAN: {confidence:.2f}'
+                        else:
+                            color = (255, 0, 0)  # Blue (BGR)
+                            label = f'{class_name}: {confidence:.2f}'
+                        
+                        # Draw bounding box
+                        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+                        
+                        # Draw label background
+                        (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cv2.rectangle(annotated_image, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
+                        
+                        # Draw label text
+                        cv2.putText(annotated_image, label, (x1, y1 - 5), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Rate-limited publishing and display of annotated image
             current_time = self.get_clock().now()
             time_since_last = (current_time - self.last_logging_publish_time).nanoseconds / 1e9
             if time_since_last >= self.logging_publish_period:
                 self.last_logging_publish_time = current_time
-                
-                # Publish annotated image
-                annotated_msg = self.bridge.cv2_to_imgmsg(annotated_image, encoding='bgr8')
-                annotated_msg.header = msg.header
-                self.annotated_image_pub.publish(annotated_msg)
-                
-                # Display annotated RGB image with YOLO bounding boxes
-                #cv2.imshow('YOLO Bounding Boxes', annotated_image)
-                #cv2.waitKey(1)
+                if self.publish_annotated_image:
+                    # Publish annotated image
+                    annotated_msg = self.bridge.cv2_to_imgmsg(annotated_image, encoding='bgr8')
+                    annotated_msg.header = msg.header
+                    self.annotated_image_pub.publish(annotated_msg)
+                    
+                    # Display annotated RGB image with YOLO bounding boxes
+                    #cv2.imshow('YOLO Bounding Boxes', annotated_image)
+                    #cv2.waitKey(1)
             
             # Calculate and publish human centroid for gimbal tracking
             centroid_msg = Point()
@@ -385,6 +410,7 @@ class YOLODetectorNode(Node):
                 centroid_msg.z = img_width  # Image width
                 self.human_centroid_pub.publish(centroid_msg)
             
+            t0 = time.perf_counter()
             # Project human detections to class_map grid using organized 3D pointcloud
             # Pipeline: Map detections to pointcloud in camera frame -> Transform to odom -> Create grid
             # This sparse map will be expanded by brushfire in C++
@@ -411,12 +437,18 @@ class YOLODetectorNode(Node):
                 xyz_flat = xyz.reshape(-1, 3)
                 seg_mask_flat = seg_mask_pc.reshape(-1)
                 
-                # STEP 1: Get ALL valid points for visibility tracking
-                valid_mask = np.isfinite(xyz_flat).all(axis=1)
+                # STEP 1: Only transform YOLO-labeled points for class_map.
+                # This avoids transforming the full organized pointcloud every frame.
+                labeled_mask = seg_mask_flat > 0
+                valid_mask = labeled_mask & np.isfinite(xyz_flat).all(axis=1)
+
                 xyz_valid = xyz_flat[valid_mask]
                 seg_mask_valid = seg_mask_flat[valid_mask]
                 
-                # For class_map, we only use labeled points; for visibility, we use all valid points
+                # Runtime optimization:
+                # Only labeled YOLO pixels are projected into the class_map.
+                # Full visibility projection is skipped here because transforming all valid
+                # pointcloud points is expensive and causes perception lag.
                 
                 # STEP 2: Transform ALL valid points from camera frame to odom frame
                 try:
@@ -467,12 +499,12 @@ class YOLODetectorNode(Node):
                     
                     # Filter by forward, lateral, and height bounds (in BODY frame)
                     if xyz_body_filtered.shape[0] > 0:
-                        if xyz_body_filtered.shape[0] > 0:
-                            self.get_logger().info(
-                                f"X range: [{np.min(xyz_body_filtered[:,0]):.2f}, "
-                                f"{np.max(xyz_body_filtered[:,0]):.2f}]",
-                                throttle_duration_sec=1.0
-                            )
+                        # if xyz_body_filtered.shape[0] > 0:
+                            # self.get_logger().info(
+                            #     f"X range: [{np.min(xyz_body_filtered[:,0]):.2f}, "
+                            #     f"{np.max(xyz_body_filtered[:,0]):.2f}]",
+                            #     throttle_duration_sec=1.0
+                            # )
                         x_range_mask = ((xyz_body_filtered[:, 0] > -self.grid_size / 2.0) &
                             (xyz_body_filtered[:, 0] <  self.grid_size / 2.0))
                         lateral_mask = ((xyz_body_filtered[:, 1] > -self.grid_size / 2.0) & 
@@ -535,6 +567,9 @@ class YOLODetectorNode(Node):
             visibility_map_msg.info.height = self.grid_imax
             visibility_map_msg.data = visibility_grid.flatten().tolist()
             self.visibility_map_pub.publish(visibility_map_msg)
+
+            t_projection_ms = (time.perf_counter() - t0) * 1000.0
+
             
             # Visualize class_map with OpenCV for debugging
             # Create color image: human=red, object=blue, empty=black
@@ -559,12 +594,22 @@ class YOLODetectorNode(Node):
             
             # Log detection statistics
             pc_status = "synced" if self.latest_pointcloud is not None else "waiting"
+            # self.get_logger().info(
+            #     f'Detected: {int((seg_mask == 1).sum())} human pixels, '
+            #     f'{int((seg_mask == 3).sum())} object pixels, '
+            #     f'{int(np.sum(class_map_grid == 1))} grid cells, '
+            #     f'PC: {pc_status}',
+            #     throttle_duration_sec=2.0
+            # )
+
+            t_total_ms = (time.perf_counter() - t_total) * 1000.0
+
             self.get_logger().info(
-                f'Detected: {int((seg_mask == 1).sum())} human pixels, '
-                f'{int((seg_mask == 3).sum())} object pixels, '
-                f'{int(np.sum(class_map_grid == 1))} grid cells, '
-                f'PC: {pc_status}',
-                throttle_duration_sec=2.0
+                f'YOLO timing | total={t_total_ms:.1f} ms '
+                f'cv={t_cv_ms:.1f} ms '
+                f'infer={t_infer_ms:.1f} ms '
+                f'projection={t_projection_ms:.1f} ms',
+                throttle_duration_sec=1.0
             )
             
         except Exception as e:
