@@ -1,0 +1,599 @@
+[
+  {
+    "instruction": "Stay close to the operator.",
+    "category": "grounding_alias",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "directional",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": "behind",
+      "distance": 2.0,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "directional",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": "behind",
+      "distance": 2.0,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "compiled": {
+      "status": "ok",
+      "commands": [
+        {
+          "action": "add",
+          "constraint": {
+            "id": "remain_behind_person",
+            "type": "spatial",
+            "mode": "remain",
+            "region": {
+              "constructor": "directional",
+              "target": {
+                "kind": "class",
+                "class": "person"
+              },
+              "relation": "behind",
+              "distance": 2.0,
+              "angle": 120.0
+            },
+            "behavior": null,
+            "priority": 1,
+            "enforce": true,
+            "lifetime": {
+              "type": "persistent"
+            }
+          }
+        }
+      ],
+      "reason": null,
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": false,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": true,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.654348611831665
+  },
+  {
+    "instruction": "Stay where the person can see you.",
+    "category": "visibility",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "compiled": {
+      "status": "ok",
+      "commands": [
+        {
+          "action": "add",
+          "constraint": {
+            "id": "remain_person_buffer_1.5m",
+            "type": "spatial",
+            "mode": "remain",
+            "region": {
+              "constructor": "buffer",
+              "target": {
+                "kind": "class",
+                "class": "person"
+              },
+              "distance": 1.5
+            },
+            "behavior": null,
+            "priority": 1,
+            "enforce": true,
+            "lifetime": {
+              "type": "persistent"
+            }
+          }
+        }
+      ],
+      "reason": null,
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": false,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.468299150466919
+  },
+  {
+    "instruction": "Remain in the hallway.",
+    "category": "region_remain",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "hallway",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "unsupported",
+      "intent": null,
+      "mode": null,
+      "constructor": null,
+      "executable_in_v1": null,
+      "target": null,
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": "target_not_grounded: hallway",
+      "question": null
+    },
+    "compiled": {
+      "status": "unsupported",
+      "commands": [],
+      "reason": "target_not_grounded: hallway",
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.569226980209351
+  },
+  {
+    "instruction": "Do not leave the safety zone.",
+    "category": "region_remain",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "workspace",
+      "executable_in_v1": false,
+      "target": "safety_zone",
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "unsupported",
+      "intent": null,
+      "mode": null,
+      "constructor": null,
+      "executable_in_v1": null,
+      "target": null,
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": "constructor_not_executable_in_v1: workspace",
+      "question": null
+    },
+    "compiled": {
+      "status": "unsupported",
+      "commands": [],
+      "reason": "constructor_not_executable_in_v1: workspace",
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": true,
+      "target": false,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": true,
+      "reason": true,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.705072641372681
+  },
+  {
+    "instruction": "Avoid the kitchen.",
+    "category": "region_avoid",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "avoid",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "kitchen",
+      "relation": null,
+      "distance": 1.0,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "unsupported",
+      "intent": null,
+      "mode": null,
+      "constructor": null,
+      "executable_in_v1": null,
+      "target": null,
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": "target_not_grounded: kitchen",
+      "question": null
+    },
+    "compiled": {
+      "status": "unsupported",
+      "commands": [],
+      "reason": "target_not_grounded: kitchen",
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.7022435665130615
+  },
+  {
+    "instruction": "Do not enter the hallway.",
+    "category": "region_avoid",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "avoid",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "hallway",
+      "relation": null,
+      "distance": 1.0,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "unsupported",
+      "intent": null,
+      "mode": null,
+      "constructor": null,
+      "executable_in_v1": null,
+      "target": null,
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": "target_not_grounded: hallway",
+      "question": null
+    },
+    "compiled": {
+      "status": "unsupported",
+      "commands": [],
+      "reason": "target_not_grounded: hallway",
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.601516246795654
+  },
+  {
+    "instruction": "Do not enter the safety zone.",
+    "category": "region_avoid",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "avoid",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "safety_zone",
+      "relation": null,
+      "distance": 1.0,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "unsupported",
+      "intent": null,
+      "mode": null,
+      "constructor": null,
+      "executable_in_v1": null,
+      "target": null,
+      "relation": null,
+      "distance": null,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": "target_not_grounded: safety_zone",
+      "question": null
+    },
+    "compiled": {
+      "status": "unsupported",
+      "commands": [],
+      "reason": "target_not_grounded: safety_zone",
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": true,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": false,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.846146583557129
+  },
+  {
+    "instruction": "Keep people in view.",
+    "category": "visibility",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "compiled": {
+      "status": "ok",
+      "commands": [
+        {
+          "action": "add",
+          "constraint": {
+            "id": "remain_person_buffer_1.5m",
+            "type": "spatial",
+            "mode": "remain",
+            "region": {
+              "constructor": "buffer",
+              "target": {
+                "kind": "class",
+                "class": "person"
+              },
+              "distance": 1.5
+            },
+            "behavior": null,
+            "priority": 1,
+            "enforce": true,
+            "lifetime": {
+              "type": "persistent"
+            }
+          }
+        }
+      ],
+      "reason": null,
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": false,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.538151741027832
+  },
+  {
+    "instruction": "Remain visible to workers.",
+    "category": "visibility",
+    "raw_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "final_flat": {
+      "status": "ok",
+      "intent": "spatial",
+      "mode": "remain",
+      "constructor": "buffer",
+      "executable_in_v1": true,
+      "target": "person",
+      "relation": null,
+      "distance": 1.5,
+      "behavior_kind": null,
+      "max_speed": null,
+      "reason": null,
+      "question": null
+    },
+    "compiled": {
+      "status": "ok",
+      "commands": [
+        {
+          "action": "add",
+          "constraint": {
+            "id": "remain_person_buffer_1.5m",
+            "type": "spatial",
+            "mode": "remain",
+            "region": {
+              "constructor": "buffer",
+              "target": {
+                "kind": "class",
+                "class": "person"
+              },
+              "distance": 1.5
+            },
+            "behavior": null,
+            "priority": 1,
+            "enforce": true,
+            "lifetime": {
+              "type": "persistent"
+            }
+          }
+        }
+      ],
+      "reason": null,
+      "question": null
+    },
+    "checks": {
+      "parse_status": true,
+      "status": false,
+      "intent": true,
+      "mode": true,
+      "constructor": false,
+      "target": true,
+      "relation": true,
+      "distance": true,
+      "behavior_kind": true,
+      "max_speed": true,
+      "executable_in_v1": false,
+      "reason": false,
+      "schema_valid": true
+    },
+    "semantic_success": false,
+    "full_success": false,
+    "latency_sec": 4.404977083206177
+  }
+]
