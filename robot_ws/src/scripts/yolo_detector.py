@@ -78,6 +78,8 @@ class YOLODetectorNode(Node):
         else:
             self.model = YOLO(model_path)
         
+        self.get_logger().info(f"YOLO classes: {self.model.names}")
+        
         # CV Bridge for image conversion
         self.bridge = CvBridge()
         

@@ -3,6 +3,9 @@ from semantic_safety_schema import LLMCompilerOutput
 
 
 def make_id(flat: FlatParse) -> str:
+    if flat.constraint_id:
+        return flat.constraint_id
+
     target = flat.target.replace(" ", "_") if flat.target else "unknown"
 
     if flat.intent == "behavior":
@@ -11,7 +14,7 @@ def make_id(flat: FlatParse) -> str:
     if flat.constructor == "directional":
         return f"{flat.mode}_{flat.relation}_{target}"
 
-    return f"{flat.mode}_{target}_{flat.constructor}_{flat.distance}m"
+    return f"{flat.mode}_{target}_{flat.constructor}"
 
 
 def target_object(flat: FlatParse) -> dict:
@@ -51,6 +54,19 @@ def compile_flat_to_schema(flat: FlatParse) -> LLMCompilerOutput:
         }
         return LLMCompilerOutput.model_validate(payload)
 
+    if flat.action == "remove":
+        payload = {
+            "status": "ok",
+            "commands": [
+                {
+                    "action": "remove",
+                    "id": flat.constraint_id or make_id(flat),
+                    "target": flat.target,
+                }
+            ],
+        }
+        return LLMCompilerOutput.model_validate(payload)
+        
     if flat.executable_in_v1 is False:
         payload = {
             "status": "unsupported",
@@ -109,7 +125,7 @@ def compile_flat_to_schema(flat: FlatParse) -> LLMCompilerOutput:
         "status": "ok",
         "commands": [
             {
-                "action": "add",
+                "action": flat.action,
                 "constraint": constraint
             }
         ]

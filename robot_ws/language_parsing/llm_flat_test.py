@@ -11,7 +11,8 @@ MODEL = "qwen2.5:3b"
 
 class FlatParse(BaseModel):
     status: Literal["ok", "clarification_required", "unsupported", "rejected"]
-
+    action: Literal["add", "update", "remove"] = "add"
+    constraint_id: Optional[str] = None
     intent: Optional[Literal["spatial", "behavior"]] = None
     mode: Optional[Literal["avoid", "remain", "activate"]] = None
     constructor: Optional[
@@ -41,6 +42,11 @@ class FlatParse(BaseModel):
     @model_validator(mode="after")
     def validate_consistency(self):
         if self.status == "ok":
+            if self.action == "remove":
+                if self.constraint_id is None and self.target is None:
+                    raise ValueError("remove requires constraint_id or target")
+                return self
+
             missing = []
             for field in ["intent", "mode", "constructor", "target"]:
                 if getattr(self, field) is None:
@@ -135,6 +141,18 @@ front, behind, left, right
 Allowed behavior_kind:
 velocity_limit, heading_align
 
+For lifecycle action, output:
+- action "add" when the user requests a new safety constraint.
+- action "update" when the user changes an existing constraint.
+- action "remove" when the user deletes, cancels, disables, or stops enforcing a constraint.
+
+Allowed action:
+add, update, remove
+
+For remove commands, fill action, target if available, and constraint_id if explicitly named. Other fields may be null.
+For update commands, fill action plus the full updated constraint fields.
+
+
 Target extraction:
 - Extract the object, person, area, or semantic class mentioned by the user.
 - Do not replace the target with a different class.
@@ -207,6 +225,42 @@ Output:
   "target": "person",
   "relation": null,
   "distance": 1.0,
+  "behavior_kind": null,
+  "max_speed": null,
+  "reason": null,
+  "question": null
+}
+
+Instruction: Stop avoiding people.
+Output:
+{
+  "status": "ok",
+  "action": "remove",
+  "constraint_id": null,
+  "intent": null,
+  "mode": null,
+  "constructor": null,
+  "target": "person",
+  "relation": null,
+  "distance": null,
+  "behavior_kind": null,
+  "max_speed": null,
+  "reason": null,
+  "question": null
+}
+
+Instruction: Increase the distance from people to three meters.
+Output:
+{
+  "status": "ok",
+  "action": "update",
+  "constraint_id": null,
+  "intent": "spatial",
+  "mode": "avoid",
+  "constructor": "buffer",
+  "target": "person",
+  "relation": null,
+  "distance": 3.0,
   "behavior_kind": null,
   "max_speed": null,
   "reason": null,

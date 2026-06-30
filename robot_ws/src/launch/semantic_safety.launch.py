@@ -247,7 +247,7 @@ def generate_launch_description():
     
     enable_data_logging_to_file_arg = DeclareLaunchArgument(
         'enable_data_logging_to_file',
-        default_value='true',
+        default_value='false',
         description='Enable CSV and BIN data logging for experiments'
     )
     
@@ -371,7 +371,7 @@ def generate_launch_description():
     semantic_poisson_node = Node(
         package='unitree_ros2_poisson_simple',
         executable='semantic_poisson',
-        name='semantic_poisson',
+        # name='semantic_poisson',
         output='screen',
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
@@ -511,8 +511,8 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='livox_to_body_tf',
         arguments=[
-             '-0.05', '0.0', '0.18',  # x, y, z translation (body relative to livox)
-             '0', '3.14159', '0',     # roll, pitch, yaw (180° pitch for Y-axis flip)
+             '-0.08', '0.0', '0.18',  # x, y, z translation (body relative to livox)
+             '0', '3.14159265358979', '0.05',     # roll, pitch, yaw (180° pitch for Y-axis flip)
              'livox_frame', 'body_link'  # parent_frame, child_frame
         ],
 
@@ -532,7 +532,7 @@ def generate_launch_description():
         name='body_to_utlidar_tf',
         arguments=[
             '0.25', '0.0', '0.05',  # x, y, z (front lidar position relative to body)
-            '2.0944', '-2.9', '0',    # roll, pitch, yaw (150 degrees pitch)
+            '2.0944', '-2.9', '0',    # roll, pitch, yaw (150 degrees pitch) 2.0944
             'body_link', 'utlidar_lidar'
         ],
     )
@@ -546,7 +546,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='body_to_rear_camera_tf',
         arguments=[
-            '-0.05', '0.0', '0.20',
+            '-0.15', '0.0', '0.20',
             '3.14159', '0', '0',
             'body_link', 'camera_rear_link'
         ],
@@ -581,7 +581,7 @@ def generate_launch_description():
             'preprocess.scan_line': 4,
             'preprocess.blind': 0.5,
             'preprocess.timestamp_unit': 3,
-            'preprocess.scan_rate': 10,
+            'preprocess.scan_rate': 15,
             # Mapping
             'mapping.acc_cov': 0.1,
             'mapping.gyr_cov': 0.1,

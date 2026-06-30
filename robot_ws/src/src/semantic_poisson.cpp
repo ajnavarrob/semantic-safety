@@ -93,6 +93,18 @@ struct GuidanceStageOutput {
     float* bound_guidance{nullptr};
 };
 
+struct FieldBuffer {
+    std::vector<float> hgrid;
+    std::vector<float> dhdt;
+    std::vector<float> beta;
+    std::vector<float> guidance_x;
+    std::vector<float> guidance_y;
+    std::vector<float> bound;
+
+    std::chrono::steady_clock::time_point timestamp;
+    bool valid{false};
+};
+
 struct FieldInsertionState {
     bool active{false};
 
@@ -127,7 +139,7 @@ private:
 
 class PoissonControllerNode : public rclcpp::Node {
 public:
-    PoissonControllerNode() : Node("poisson_control"), sport_req(this) {
+    PoissonControllerNode() : Node("semantic_poisson"), sport_req(this) {
         declare_and_load_parameters();
 
         load_constraints_once_at_startup();
@@ -289,23 +301,30 @@ private:
         if (!update_grid_metadata_from_message(msg)) {
             return;
         }
-    
-        {
-            std::unique_lock<std::shared_mutex> lock(field_mutex_);
-    
-            preprocess_occupancy();
-            auto semantic_output = run_semantic_fusion();
-            build_inflated_boundaries(semantic_output.tight_area);
-            auto guidance_output = build_guidance_field(semantic_output.active_tracks);
-            h_flag = solve_safety_field(guidance_output);
-    
-            if (start_flag && dhdt_flag) {
-                ScopedTimer timer(timing_.dhdt_update_ms);
-                update_temporal_field_derivative();
-            }
 
-            update_active_safety_field();
-            latest_field_timestamp_ = std::chrono::steady_clock::now();
+        preprocess_occupancy();
+        auto semantic_output = run_semantic_fusion();
+
+        build_inflated_boundaries(semantic_output.tight_area);
+
+        auto guidance_output = build_guidance_field(semantic_output.active_tracks);
+
+        bool solved = solve_safety_field(guidance_output);
+
+        if (start_flag && dhdt_flag) {
+            ScopedTimer timer(timing_.dhdt_update_ms);
+            update_temporal_field_derivative();
+        }
+
+        if (solved) {
+            copy_current_globals_into_pending_field();
+
+            {
+                std::unique_lock<std::shared_mutex> lock(field_mutex_);
+                std::swap(active_field_, pending_field_);
+                latest_field_timestamp_ = active_field_.timestamp;
+                h_flag = active_field_.valid;
+            }
         }
     
         timing_.end_to_end_grid_ms = std::chrono::duration<double, std::milli>(
@@ -337,14 +356,39 @@ private:
     
         std::vector<float> v_input_body = form_nominal_body_command();
     
-        timing_.field_data_age_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - latest_field_timestamp_).count();
-    
         {
             std::shared_lock<std::shared_mutex> lock(field_mutex_);
+
+            timing_.field_data_age_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - active_field_.timestamp
+                ).count();
+
             ScopedTimer timer(timing_.realtime_filter_ms);
-            if (h_flag) compute_realtime_safe_control(v_input_body);
-            else v = v_input_body;
+
+            if (active_field_.valid) {
+                float* old_hgrid_active = hgrid_active_;
+                float* old_dhdt_active = dhdt_active_;
+                float* old_beta_grid = beta_grid_;
+                float* old_guidance_x_grid = guidance_x_grid;
+                float* old_guidance_y_grid = guidance_y_grid;
+
+                hgrid_active_ = active_field_.hgrid.data();
+                dhdt_active_ = active_field_.dhdt.data();
+                beta_grid_ = active_field_.beta.data();
+                guidance_x_grid = active_field_.guidance_x.data();
+                guidance_y_grid = active_field_.guidance_y.data();
+
+                compute_realtime_safe_control(v_input_body);
+
+                hgrid_active_ = old_hgrid_active;
+                dhdt_active_ = old_dhdt_active;
+                beta_grid_ = old_beta_grid;
+                guidance_x_grid = old_guidance_x_grid;
+                guidance_y_grid = old_guidance_y_grid;
+            } else {
+                v = v_input_body;
+            }
         }
     
         postprocess_command();
@@ -361,7 +405,28 @@ private:
     
         std::shared_lock<std::shared_mutex> field_lock(field_mutex_);
         ScopedTimer timer(timing_.predictive_control_ms);
-        compute_predictive_control();
+
+        if (active_field_.valid) {
+            float* old_hgrid_active = hgrid_active_;
+            float* old_dhdt_grid = dhdt_grid;
+            float* old_beta_grid = beta_grid_;
+            float* old_guidance_x_grid = guidance_x_grid;
+            float* old_guidance_y_grid = guidance_y_grid;
+
+            hgrid_active_ = active_field_.hgrid.data();
+            dhdt_grid = active_field_.dhdt.data();
+            beta_grid_ = active_field_.beta.data();
+            guidance_x_grid = active_field_.guidance_x.data();
+            guidance_y_grid = active_field_.guidance_y.data();
+
+            compute_predictive_control();
+
+            hgrid_active_ = old_hgrid_active;
+            dhdt_grid = old_dhdt_grid;
+            beta_grid_ = old_beta_grid;
+            guidance_x_grid = old_guidance_x_grid;
+            guidance_y_grid = old_guidance_y_grid;
+        }
     }
 
     // ============================================================
@@ -965,9 +1030,20 @@ private:
     // ============================================================
 
     void render_visualization() {
-        if (!poisson_image_pub_ || !hgrid_active_ || !bound) {
+        if (!poisson_image_pub_) {
             return;
         }
+
+        std::shared_lock<std::shared_mutex> lock(field_mutex_);
+
+        if (!active_field_.valid ||
+            active_field_.hgrid.empty() ||
+            active_field_.bound.empty()) {
+            return;
+        }
+
+        const float* hgrid_vis = active_field_.hgrid.data();
+        const float* bound_vis = active_field_.bound.data();
 
         const int q_vis = QMAX / 2;
         const int scale = 6;
@@ -981,7 +1057,7 @@ private:
         for (int i = 0; i < IMAX; ++i) {
             for (int j = 0; j < JMAX; ++j) {
                 const int n3 = q_vis * IMAX * JMAX + i * JMAX + j;
-                const float hv = hgrid_active_[n3];
+                const float hv = hgrid_vis[n3];
 
                 h_min = std::min(h_min, hv);
                 h_max = std::max(h_max, hv);
@@ -996,7 +1072,7 @@ private:
                 const int n2 = i * JMAX + j;
                 const int n3 = q_vis * IMAX * JMAX + n2;
 
-                float hv = hgrid_active_[n3];
+                float hv = hgrid_vis[n3];
                 hv = std::clamp(hv, display_min, display_max);
 
                 const float normalized =
@@ -1006,7 +1082,7 @@ private:
                 h_u8.at<uint8_t>(i, j) =
                     static_cast<uint8_t>(255.0f * normalized);
 
-                if (bound[n3] <= 0.0f) {
+                if (bound_vis[n3] <= 0.0f) {
                     boundary_u8.at<uint8_t>(i, j) = 255;
                 }
             }
@@ -1052,22 +1128,6 @@ private:
             scale,
             cv::INTER_NEAREST
         );
-
-        // RCLCPP_INFO_THROTTLE(
-        //     this->get_logger(),
-        //     *this->get_clock(),
-        //     1000,
-        //     "Poisson viz publish: q=%d h_min=%.4f h_max=%.4f display=[%.2f, %.2f] lambda=%.3f active=%d size=%dx%d",
-        //     q_vis,
-        //     h_min,
-        //     h_max,
-        //     display_min,
-        //     display_max,
-        //     field_insertion_.lambda,
-        //     field_insertion_.active,
-        //     display_img.cols,
-        //     display_img.rows
-        // );
 
         sensor_msgs::msg::Image msg;
         msg.header.stamp = this->now();
@@ -1208,6 +1268,19 @@ private:
     // ============================================================
     // 7. HELPERS / INITIALIZATION
     // ============================================================
+    void copy_current_globals_into_pending_field() {
+        const int N = IMAX * JMAX * QMAX;
+
+        std::memcpy(pending_field_.hgrid.data(), hgrid1, N * sizeof(float));
+        std::memcpy(pending_field_.dhdt.data(), dhdt_grid, N * sizeof(float));
+        std::memcpy(pending_field_.beta.data(), beta_grid_, N * sizeof(float));
+        std::memcpy(pending_field_.guidance_x.data(), guidance_x_grid, N * sizeof(float));
+        std::memcpy(pending_field_.guidance_y.data(), guidance_y_grid, N * sizeof(float));
+        std::memcpy(pending_field_.bound.data(), bound, N * sizeof(float));
+
+        pending_field_.timestamp = std::chrono::steady_clock::now();
+        pending_field_.valid = true;
+    }
 
     void start_field_insertion() {
         if (!hgrid1 || !hgrid_insertion_old_) {
@@ -1868,6 +1941,21 @@ private:
         dhdt_active_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         beta_grid_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
 
+        const int N_field = IMAX * JMAX * QMAX;
+
+        auto resize_field_buffer = [N_field](FieldBuffer& fb) {
+            fb.hgrid.resize(N_field, 1.0f);
+            fb.dhdt.resize(N_field, 0.0f);
+            fb.beta.resize(N_field, 0.0f);
+            fb.guidance_x.resize(N_field, 0.0f);
+            fb.guidance_y.resize(N_field, 0.0f);
+            fb.bound.resize(N_field, 1.0f);
+            fb.timestamp = std::chrono::steady_clock::now();
+            fb.valid = false;
+        };
+
+        resize_field_buffer(active_field_);
+        resize_field_buffer(pending_field_);
         if (!hgrid_insertion_old_ || !hgrid_active_ || !dhdt_active_ || !beta_grid_) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for field insertion buffers");
             throw std::runtime_error("Field insertion buffer allocation failed");
@@ -2860,6 +2948,9 @@ private:
     std::mutex mpc_mutex;
     MPC3D mpc3d_controller;
     mutable std::shared_mutex field_mutex_;
+
+    FieldBuffer active_field_;
+    FieldBuffer pending_field_;
 
     const float h0 = 0.0f;
     const float dh0 = 1.0f;

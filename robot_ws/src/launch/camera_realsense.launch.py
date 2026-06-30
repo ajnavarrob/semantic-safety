@@ -13,13 +13,13 @@ from launch_ros.actions import Node
 def generate_launch_description():
     fps_arg = DeclareLaunchArgument(
         'fps',
-        default_value='30',
+        default_value='6',
         description='Camera FPS (6, 15, 30, or 60)'
     )
     
     point_cloud_density_arg = DeclareLaunchArgument(
         'point_cloud_density',
-        default_value='1.0',
+        default_value='0.05',
         description='Pointcloud density ratio (1.0 = full organized cloud for YOLO)'
     )
     camera_name_arg = DeclareLaunchArgument(

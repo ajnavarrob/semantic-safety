@@ -32,8 +32,8 @@ class OutputStatus(str, Enum):
 
 class CommandAction(str, Enum):
     ADD = "add"
-    # UPDATE = "update"
-    # REMOVE = "remove"
+    UPDATE = "update"
+    REMOVE = "remove"
 
 
 class ConstraintType(str, Enum):
@@ -234,6 +234,21 @@ Constraint = Annotated[
     Field(discriminator="type"),
 ]
 
+class AddCommand(BaseModel):
+    action: Literal[CommandAction.ADD] = CommandAction.ADD
+    constraint: Constraint
+
+
+class UpdateCommand(BaseModel):
+    action: Literal[CommandAction.UPDATE] = CommandAction.UPDATE
+    constraint: Constraint
+
+
+class RemoveCommand(BaseModel):
+    action: Literal[CommandAction.REMOVE] = CommandAction.REMOVE
+    id: str
+    target: Optional[str] = None
+
 
 # -----------------------------
 # Command models
@@ -255,12 +270,12 @@ class AddCommand(BaseModel):
 #     target_constraint_id: str
 
 
-# Command = Annotated[
-#     Union[AddCommand, UpdateCommand, RemoveCommand],
-#     Field(discriminator="action"),
-# ]
+Command = Annotated[
+    Union[AddCommand, UpdateCommand, RemoveCommand],
+    Field(discriminator="action"),
+]
 
-Command = AddCommand
+
 
 
 # -----------------------------

@@ -2,83 +2,25 @@
   "schema_version": "0.2",
   "constraints": [
     {
-      "id": "avoid_people",
+      "id": "avoid_wall_buffer",
       "type": "exclusion",
-      "enabled": true,                             
+      "enabled": true,
       "enforce": true,
       "target": {
-        "semantic_class": ["person"]
+        "semantic_class": [
+          "wall"
+        ]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 2        
-      }
-    },
-    {
-      "id": "stay_behind_person",
-      "type": "relational",
-      "enabled": true,
-      "enforce": false,
-      "relation": "behind",
-      "mode": "allow_region",
-      "target": {
-        "semantic_class": ["robot"]
-      },
-      "reference": {
-        "semantic_class": ["person"]
-      },
-      "spatial_parameters": {
-        "radius_m": 2.0,
-        "cone_half_angle_deg": 90.0,
-        "min_radius_m": 0.5,
-        "max_radius_m": 2.0
-      },
-      "heading_parameters": {
-        "speed_threshold_mps": 0.01,
-        "heading_timeout_sec": 1.0
-      }
-    },
-    {
-      "id": "slow_near_people",
-      "type": "velocity_limit",
-      "enabled": true,
-      "enforce": false,
-      "target": {
-        "semantic_class": ["person"]
-      },
-      "spatial_parameters": {
-        "buffer_distance_m": 0.5
-      },
-      "control_parameters": {
-        "max_linear_velocity_mps": 0.1,
-        "max_angular_velocity_radps": 1
-      }
-    },
-    {
-      "id": "stay_near_chair",
-      "type": "proximity",
-      "enabled": true,
-      "enforce": false,
-      "target": {
-        "semantic_class": ["robot"]
-      },
-      "reference": {
-        "semantic_class": ["chair"]
-      },
-      "spatial_parameters": {
-        "max_distance_m": 2
-      }
-    },
-    {
-      "id": "face_person",
-      "type": "heading",
-      "enabled": true,
-      "enforce": false,
-      "target": {
-        "semantic_class": ["robot"]
-      },
-      "reference": {
-        "semantic_class": ["person"]
+        "buffer_distance_m": 1.0
       }
     }
-  ]
+  ],
+  "metadata": {
+    "source": "live_command_demo",
+    "timestamp": "2026-06-30T00:00:01.840641",
+    "instruction": "stay away from the wall",
+    "flat_status": "ok",
+    "action": "add"
+  }
 }

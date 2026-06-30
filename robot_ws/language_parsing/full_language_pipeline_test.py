@@ -4,6 +4,8 @@ from llm_flat_test import parse_instruction, FlatParse
 from compile_flat_to_schema import compile_flat_to_schema
 from grounding_validator import ground_target
 from schema_to_runtime_json import schema_to_runtime_json
+from pathlib import Path
+from constraint_set_lifecycle import apply_runtime_lifecycle
 
 
 OBSERVABLE_CLASSES = [
@@ -16,6 +18,25 @@ OBSERVABLE_CLASSES = [
     "cup",
 ]
 
+RUNTIME_CONSTRAINTS_PATH = Path(
+    "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json"
+)
+
+def load_json_or_default(path: Path) -> dict:
+    if not path.exists():
+        return {
+            "schema_version": "0.1",
+            "constraints": []
+        }
+
+    with path.open("r") as f:
+        return json.load(f)
+
+
+def save_json(path: Path, data: dict) -> None:
+    with path.open("w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
 
 def apply_runtime_checks(flat: FlatParse) -> FlatParse:
     if flat.status != "ok":
@@ -61,17 +82,33 @@ def run_pipeline(instruction: str):
     checked_flat = apply_runtime_checks(flat)
     grounded_flat = apply_grounding(checked_flat)
 
-    formal_json = compile_flat_to_schema(grounded_flat)
+    formal_delta = compile_flat_to_schema(grounded_flat)
 
-    print("\nFINAL VALIDATED FORMAL JSON:")
-    print(formal_json.model_dump_json(by_alias=True, indent=2))
+    print("\nFORMAL DELTA JSON:")
+    print(formal_delta.model_dump_json(by_alias=True, indent=2))
 
-    runtime_json = schema_to_runtime_json(formal_json)
+    if formal_delta.status != "ok":
+        return formal_delta, None
 
-    print("\nRUNTIME CONTROL-STACK JSON:")
-    print(json.dumps(runtime_json, indent=2))
+    runtime_delta = schema_to_runtime_json(formal_delta)
 
-    return formal_json, runtime_json
+    print("\nRUNTIME DELTA JSON:")
+    print(json.dumps(runtime_delta, indent=2))
+
+    current_runtime = load_json_or_default(RUNTIME_CONSTRAINTS_PATH)
+
+    updated_runtime = apply_runtime_lifecycle(
+        current_runtime,
+        runtime_delta,
+        grounded_flat.action
+    )
+
+    print("\nUPDATED RUNTIME CONTROL-STACK JSON:")
+    print(json.dumps(updated_runtime, indent=2))
+
+    save_json(RUNTIME_CONSTRAINTS_PATH, updated_runtime)
+
+    return formal_delta, updated_runtime
 
 
 if __name__ == "__main__":

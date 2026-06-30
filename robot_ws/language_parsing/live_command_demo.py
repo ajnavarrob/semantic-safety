@@ -7,6 +7,7 @@ from llm_flat_test import parse_instruction, FlatParse
 from compile_flat_to_schema import compile_flat_to_schema
 from grounding_validator import ground_target
 from schema_to_runtime_json import schema_to_runtime_json
+from constraint_set_lifecycle import apply_runtime_lifecycle
 
 
 RUNTIME_JSON_PATH = "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json"
@@ -21,9 +22,21 @@ OBSERVABLE_CLASSES = [
     "cup",
 ]
 
+def load_runtime_json_or_default(path: str) -> dict:
+    if not os.path.exists(path):
+        return {
+            "schema_version": "0.2",
+            "constraints": []
+        }
+
+    with open(path, "r") as f:
+        return json.load(f)
 
 def apply_runtime_checks(flat: FlatParse) -> FlatParse:
     if flat.status != "ok":
+        return flat
+
+    if flat.action == "remove":
         return flat
 
     if flat.executable_in_v1 is False:
@@ -90,7 +103,16 @@ def compile_instruction_to_runtime_json(instruction: str):
     grounded_flat = apply_grounding(checked_flat)
 
     formal_json = compile_flat_to_schema(grounded_flat)
-    runtime_json = schema_to_runtime_json(formal_json)
+
+    if grounded_flat.action == "remove":
+        runtime_json = {
+            "schema_version": "0.2",
+            "constraints": [],
+            "remove_id": grounded_flat.constraint_id,
+            "remove_target": grounded_flat.target,
+        }
+    else:
+        runtime_json = schema_to_runtime_json(formal_json)
 
     return flat, grounded_flat, formal_json, runtime_json
 
@@ -159,11 +181,19 @@ def main():
                 instruction
             )
 
-            runtime_json["metadata"] = {
+            current_runtime = load_runtime_json_or_default(RUNTIME_JSON_PATH)
+            updated_runtime = apply_runtime_lifecycle(
+                current_runtime=current_runtime,
+                runtime_delta=runtime_json,
+                action=grounded_flat.action,
+            )
+
+            updated_runtime["metadata"] = {
                 "source": "live_command_demo",
                 "timestamp": datetime.now().isoformat(),
                 "instruction": instruction,
                 "flat_status": grounded_flat.status,
+                "action": grounded_flat.action,
             }
 
             print_summary(
@@ -171,18 +201,16 @@ def main():
                 flat,
                 grounded_flat,
                 formal_json,
-                runtime_json,
+                updated_runtime,
             )
 
-            if runtime_json.get("constraints"):
-                atomic_write_json(RUNTIME_JSON_PATH, runtime_json)
-                print(f"\nWROTE RUNTIME JSON:")
-                print(RUNTIME_JSON_PATH)
-            else:
-                print("\nDID NOT WRITE ACTIVE CONSTRAINTS.")
-                print(f"status: {runtime_json.get('status')}")
-                print(f"reason: {runtime_json.get('reason')}")
-                print(f"question: {runtime_json.get('question')}")
+            atomic_write_json(RUNTIME_JSON_PATH, updated_runtime)
+
+            print(f"\nWROTE UPDATED RUNTIME JSON:")
+            print(RUNTIME_JSON_PATH)
+            print(f"status: {runtime_json.get('status')}")
+            print(f"reason: {runtime_json.get('reason')}")
+            print(f"question: {runtime_json.get('question')}")
 
         except KeyboardInterrupt:
             print("\nInterrupted.")
