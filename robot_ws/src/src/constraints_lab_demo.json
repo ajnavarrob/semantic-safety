@@ -2,24 +2,24 @@
   "schema_version": "0.2",
   "constraints": [
     {
-      "id": "avoid_wall_buffer",
+      "id": "avoid_person_buffer",
       "type": "exclusion",
       "enabled": true,
       "enforce": true,
       "target": {
         "semantic_class": [
-          "wall"
+          "person"
         ]
       },
       "spatial_parameters": {
-        "buffer_distance_m": 1.0
+        "buffer_distance_m": 2.0
       }
     }
   ],
   "metadata": {
     "source": "live_command_demo",
-    "timestamp": "2026-06-30T00:00:01.840641",
-    "instruction": "stay away from the wall",
+    "timestamp": "2026-07-08T04:03:37.424102",
+    "instruction": "stay 2 meters away from people",
     "flat_status": "ok",
     "action": "add"
   }

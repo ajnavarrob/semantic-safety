@@ -105,7 +105,15 @@ struct FieldBuffer {
     bool valid{false};
 };
 
-struct FieldInsertionState {
+enum class SemanticUpdateMode {
+    NORMAL = 0,
+    INSERTING_CONSTRAINT = 1,
+    REMOVING_CONSTRAINT = 2
+};
+
+struct SemanticUpdateState {
+    SemanticUpdateMode mode{SemanticUpdateMode::NORMAL};
+
     bool active{false};
 
     float lambda{1.0f};
@@ -113,9 +121,9 @@ struct FieldInsertionState {
 
     float lambda_dot_min{0.05f};
     float lambda_dot_max{0.5f};
-    float max_insertion_time_sec{20.0f};
+    float max_update_time_sec{20.0f};
 
-    // Temporary until MPC outputs lambda_dot.
+    // Temporary until MPC controls semantic update speed.
     float commanded_lambda_dot{0.5f};
 
     std::chrono::steady_clock::time_point start_time;
@@ -302,6 +310,7 @@ private:
             return;
         }
 
+        update_semantic_update_state();
         preprocess_occupancy();
         auto semantic_output = run_semantic_fusion();
 
@@ -451,9 +460,24 @@ private:
     SemanticStageOutput run_semantic_fusion() {
         ScopedTimer timer(timing_.semantic_fusion_ms);
         SemanticStageOutput out;
+
+        std::fill(semantic_target_grid_.begin(), semantic_target_grid_.end(), 0);
+
         label_human_clusters(occ1);
+
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            semantic_target_grid_[n] = class_map_expanded[n];
+        }
+
         out.active_tracks = human_tracker_->get_active_tracks();
+
+        semantic_occupancy_grid_.swap(semantic_target_grid_);
         apply_relational_constraints_to_semantic_map(out.active_tracks);
+        semantic_target_grid_.swap(semantic_occupancy_grid_);
+
+        update_interpolated_semantic_grid();
+        publish_semantic_occupancy_grid();
+
         out.tight_area = is_tight_area();
         return out;
     }
@@ -653,33 +677,33 @@ private:
 
                         cells_marked_forbidden++;
 
-                        if (class_map_expanded[n] != 1) {
+                        if (semantic_occupancy_grid_[n] != 1) {
                             added_cells_for_constraint++;
                         }
 
-                        class_map_expanded[n] = 1;
+                        semantic_occupancy_grid_[n] = 1;
                     }
                 }
             }
 
             added_cells_total += added_cells_for_constraint;
 
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                1000,
-                "Relational '%s': relation=%s, mode=%s, tracks=%d, heading_valid=%d, not_timed_out=%d, in_radius=%d, selected_region=%d, forbidden=%d, added_cells=%d",
-                rc.id.c_str(),
-                rc.relation.c_str(),
-                rc.mode.c_str(),
-                tracks_seen,
-                tracks_heading_valid,
-                tracks_not_timed_out,
-                cells_in_radius,
-                cells_in_selected_region,
-                cells_marked_forbidden,
-                added_cells_for_constraint
-            );
+            // RCLCPP_INFO_THROTTLE(
+            //     this->get_logger(),
+            //     *this->get_clock(),
+            //     1000,
+            //     "Relational '%s': relation=%s, mode=%s, tracks=%d, heading_valid=%d, not_timed_out=%d, in_radius=%d, selected_region=%d, forbidden=%d, added_cells=%d",
+            //     rc.id.c_str(),
+            //     rc.relation.c_str(),
+            //     rc.mode.c_str(),
+            //     tracks_seen,
+            //     tracks_heading_valid,
+            //     tracks_not_timed_out,
+            //     cells_in_radius,
+            //     cells_in_selected_region,
+            //     cells_marked_forbidden,
+            //     added_cells_for_constraint
+            // );
         }
 
         nav_msgs::msg::OccupancyGrid msg;
@@ -704,13 +728,13 @@ private:
         relational_debug_pub_->publish(msg);
 
         if (added_cells_total > 0) {
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                1000,
-                "Relational constraints added total cells=%d",
-                added_cells_total
-            );
+            // RCLCPP_INFO_THROTTLE(
+            //     this->get_logger(),
+            //     *this->get_clock(),
+            //     1000,
+            //     "Relational constraints added total cells=%d",
+            //     added_cells_total
+            // );
         }
     }
 
@@ -719,7 +743,7 @@ private:
 
         float* bound_q0 = bound;
         std::memcpy(bound_q0, occ1, IMAX * JMAX * sizeof(float));
-        inflate_occupancy_grid(bound_q0, class_map_expanded);
+        inflate_occupancy_grid(bound_q0, semantic_current_grid_.data());
 
         #pragma omp parallel for num_threads(4)
         for (int q = 0; q < QMAX; ++q) {
@@ -727,9 +751,9 @@ private:
             float* hgrid_slice = hgrid_temp_ + q * IMAX * JMAX;
             if (q != 0) {
                 std::memcpy(bound_slice, occ1, IMAX * JMAX * sizeof(float));
-                inflate_occupancy_grid(bound_slice, class_map_expanded);
+                inflate_occupancy_grid(bound_slice, semantic_current_grid_.data());
             }
-            find_boundary(hgrid_slice, bound_slice, true, tight_area, class_map_expanded);
+            find_boundary(hgrid_slice, bound_slice, true, tight_area, semantic_current_grid_.data());
         }
     }
 
@@ -754,7 +778,7 @@ private:
         {
             ScopedTimer timer(timing_.guidance_boundary_setup_ms);
         
-            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, class_map_expanded,
+            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, semantic_current_grid_.data(),
                                        x[0], x[1], vn_body_x, vn_body_y, true);
         
             #pragma omp parallel for num_threads(4)
@@ -762,7 +786,7 @@ private:
                 float* bound_slice = bound + q * IMAX * JMAX;
                 float* gx = guidance_x_temp_ + q * IMAX * JMAX;
                 float* gy = guidance_y_temp_ + q * IMAX * JMAX;
-                compute_boundary_gradients(gx, gy, bound_slice, class_map_expanded,
+                compute_boundary_gradients(gx, gy, bound_slice, semantic_current_grid_.data(),
                                            x[0], x[1], vn_body_x, vn_body_y, false);
             }
         }
@@ -885,14 +909,16 @@ private:
             const float s = std::sin(x[2]);
             std::vector<float> vn_body = {c * vn[0] + s * vn[1], -s * vn[0] + c * vn[1], vn[2]};
             mpc3d_controller.update_cost(vn_body);
+
+            mpc3d_controller.set_alpha_optimization_enabled(
+                semantic_update_.active,
+                std::exp(-wn * DT)
+            );
+
             mpc3d_controller.update_constraints(hgrid_active_, dhdt_grid, beta_grid_, guidance_x_grid, guidance_y_grid,
                                                 x_body_link, xc, grid_age, wn, issf,
                                                 cbf_sigma_epsilon_, cbf_sigma_kappa_);
             mpc3d_controller.solve();
-            if (field_insertion_.active) {
-                field_insertion_.commanded_lambda_dot =
-                    mpc3d_controller.get_lambda_dot();
-            }
 
             if (mpc3d_controller.update_residual() < 1.0f) break;
         }
@@ -1000,15 +1026,16 @@ private:
                 wz = std::min(wz, rc.max_angular_velocity_radps);
             }
     
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(),
-                *this->get_clock(),
-                1000,
-                "Velocity limit active from constraint '%s': linear<=%.2f, yaw<=%.2f",
-                rc.id.c_str(),
-                vx_fwd,
-                wz
-            );
+        //     RCLCPP_INFO_THROTTLE(
+        //         this->get_logger(),
+        //         *this->get_clock(),
+        //         1000,
+        //         "Velocity limit active from constraint '%s': linear<=%.2f, yaw<=%.2f",
+        //         rc.id.c_str(),
+        //         vx_fwd,
+        //         wz
+        //     );
+        // }
         }
     }
 
@@ -1224,9 +1251,9 @@ private:
             wn,
             static_cast<float>(realtime_sf_flag | predictive_sf_flag),
 
-            field_insertion_.lambda,
-            field_insertion_.lambda_dot,
-            static_cast<float>(field_insertion_.active),
+            semantic_update_.lambda,
+            semantic_update_.lambda_dot,
+            static_cast<float>(semantic_update_.active),
             new_constraint_event_flag_ ? 1.0f : 0.0f,
             static_cast<float>(constraint_event_counter_)
         };
@@ -1268,6 +1295,168 @@ private:
     // ============================================================
     // 7. HELPERS / INITIALIZATION
     // ============================================================
+
+    void publish_semantic_occupancy_grid()
+    {
+        if (!semantic_occupancy_pub_) {
+            return;
+        }
+
+        nav_msgs::msg::OccupancyGrid msg;
+
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "body_link";
+
+        msg.info.resolution = DS;
+        msg.info.width = JMAX;
+        msg.info.height = IMAX;
+
+        msg.info.origin.position.x = -0.5 * JMAX * DS;
+        msg.info.origin.position.y = -0.5 * IMAX * DS;
+        msg.info.origin.position.z = 0.0;
+
+        msg.info.origin.orientation.x = 0.0;
+        msg.info.origin.orientation.y = 0.0;
+        msg.info.origin.orientation.z = 0.0;
+        msg.info.origin.orientation.w = 1.0;
+
+        msg.data.resize(IMAX * JMAX);
+
+        int occupied_cells = 0;
+
+        for (int n = 0; n < IMAX * JMAX; ++n)
+        {
+            if (semantic_current_grid_[n] > 0)
+            {
+                msg.data[n] = 100;      // Occupied for RViz
+                occupied_cells++;
+            }
+            else
+            {
+                msg.data[n] = 0;        // Free
+            }
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "Publishing semantic occupancy grid with %d occupied cells.",
+            occupied_cells
+        );
+
+        semantic_occupancy_pub_->publish(msg);
+    }
+
+    float distance_to_nearest_occupied_cell(
+        const std::vector<int8_t>& grid,
+        int i0,
+        int j0
+    ) {
+        float best = 1.0e6f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                if (grid[n] <= 0) {
+                    continue;
+                }
+
+                const float di = static_cast<float>(i - i0);
+                const float dj = static_cast<float>(j - j0);
+                const float d = std::sqrt(di * di + dj * dj) * DS;
+
+                best = std::min(best, d);
+            }
+        }
+
+        return best;
+    }
+
+    float distance_to_nearest_free_cell(
+        const std::vector<int8_t>& grid,
+        int i0,
+        int j0
+    ) {
+        float best = 1.0e6f;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                if (grid[n] > 0) {
+                    continue;
+                }
+
+                const float di = static_cast<float>(i - i0);
+                const float dj = static_cast<float>(j - j0);
+                const float d = std::sqrt(di * di + dj * dj) * DS;
+
+                best = std::min(best, d);
+            }
+        }
+
+        return best;
+    }
+
+    void update_interpolated_semantic_grid() {
+        if (!semantic_update_.active) {
+            semantic_current_grid_ = semantic_target_grid_;
+            return;
+        }
+
+        const float lam = std::clamp(semantic_update_.lambda, 0.0f, 1.0f);
+
+        semantic_current_grid_.assign(IMAX * JMAX, 0);
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                const bool old_occ = semantic_previous_grid_[n] > 0;
+                const bool new_occ = semantic_target_grid_[n] > 0;
+
+                if (old_occ && new_occ) {
+                    semantic_current_grid_[n] = 1;
+                    continue;
+                }
+
+                if (semantic_update_.mode == SemanticUpdateMode::INSERTING_CONSTRAINT) {
+                    if (new_occ) {
+                        float d_old = distance_to_nearest_occupied_cell(
+                            semantic_previous_grid_, i, j
+                        );
+
+                        float d_new_boundary = distance_to_nearest_free_cell(
+                            semantic_target_grid_, i, j
+                        );
+
+                        if (d_old <= lam * (d_old + d_new_boundary + 1.0e-3f)) {
+                            semantic_current_grid_[n] = 1;
+                        }
+                    }
+                }
+
+                if (semantic_update_.mode == SemanticUpdateMode::REMOVING_CONSTRAINT) {
+                    if (old_occ) {
+                        float d_target = distance_to_nearest_occupied_cell(
+                            semantic_target_grid_, i, j
+                        );
+
+                        float d_old_boundary = distance_to_nearest_free_cell(
+                            semantic_previous_grid_, i, j
+                        );
+
+                        if (d_target <= (1.0f - lam) * (d_target + d_old_boundary + 1.0e-3f)) {
+                            semantic_current_grid_[n] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     void copy_current_globals_into_pending_field() {
         const int N = IMAX * JMAX * QMAX;
 
@@ -1282,37 +1471,57 @@ private:
         pending_field_.valid = true;
     }
 
-    void start_field_insertion() {
-        if (!hgrid1 || !hgrid_insertion_old_) {
-            return;
-        }
-
+    void start_semantic_insertion() {
         new_constraint_event_flag_ = true;
         constraint_event_counter_++;
 
-        std::memcpy(
-            hgrid_insertion_old_,
-            hgrid1,
-            IMAX * JMAX * QMAX * sizeof(float)
-        );
+        semantic_update_.mode = SemanticUpdateMode::INSERTING_CONSTRAINT;
+        semantic_update_.active = true;
+        semantic_previous_grid_ = semantic_current_grid_;
+        semantic_update_.lambda = 0.0f;
 
-        field_insertion_.active = true;
-        field_insertion_.lambda = 0.0f;
+        semantic_update_.lambda_dot_min =
+            1.0f / std::max(semantic_update_.max_update_time_sec, 1.0e-3f);
 
-        field_insertion_.lambda_dot_min =
-            1.0f / std::max(field_insertion_.max_insertion_time_sec, 1.0e-3f);
+        semantic_update_.commanded_lambda_dot =
+            semantic_update_.lambda_dot_max;
 
-        field_insertion_.commanded_lambda_dot = field_insertion_.lambda_dot_max; // temporary fallback
+        semantic_update_.lambda_dot =
+            semantic_update_.lambda_dot_min;
 
-        field_insertion_.lambda_dot =
-            field_insertion_.lambda_dot_min;
-
-        field_insertion_.start_time = std::chrono::steady_clock::now();
-        field_insertion_.last_update_time = field_insertion_.start_time;
+        semantic_update_.start_time = std::chrono::steady_clock::now();
+        semantic_update_.last_update_time = semantic_update_.start_time;
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Started smooth Poisson field insertion"
+            "Started semantic constraint insertion"
+        );
+    }
+
+    void start_semantic_removal() {
+        new_constraint_event_flag_ = true;
+        constraint_event_counter_++;
+
+        semantic_update_.mode = SemanticUpdateMode::REMOVING_CONSTRAINT;
+        semantic_update_.active = true;
+        semantic_previous_grid_ = semantic_current_grid_;
+        semantic_update_.lambda = 0.0f;
+
+        semantic_update_.lambda_dot_min =
+            1.0f / std::max(semantic_update_.max_update_time_sec, 1.0e-3f);
+
+        semantic_update_.commanded_lambda_dot =
+            semantic_update_.lambda_dot_max;
+
+        semantic_update_.lambda_dot =
+            semantic_update_.lambda_dot_min;
+
+        semantic_update_.start_time = std::chrono::steady_clock::now();
+        semantic_update_.last_update_time = semantic_update_.start_time;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Started semantic constraint removal"
         );
     }
 
@@ -1361,13 +1570,13 @@ private:
         //     "========== RELOAD CALLBACK FIRED =========="
         // );
 
-        RCLCPP_INFO_THROTTLE(
-            this->get_logger(),
-            *this->get_clock(),
-            2000,
-            "reload_constraints_callback is alive. path=%s",
-            constraints_path_.c_str()
-        );
+        // RCLCPP_INFO_THROTTLE(
+        //     this->get_logger(),
+        //     *this->get_clock(),
+        //     2000,
+        //     "reload_constraints_callback is alive. path=%s",
+        //     constraints_path_.c_str()
+        // );
         ConstraintManager fresh_manager;
 
         if (!fresh_manager.load_from_json(constraints_path_)) {
@@ -1404,90 +1613,40 @@ private:
         constraint_runtime_config_ = fresh_config;
     }
 
-    void update_active_safety_field() {
-        const int N = IMAX * JMAX * QMAX;
-
-        if (!field_insertion_.active) {
-            std::memcpy(hgrid_active_, hgrid1, N * sizeof(float));
-            std::memcpy(dhdt_active_, dhdt_grid, N * sizeof(float));
-            std::memset(beta_grid_, 0, N * sizeof(float));
+    void update_semantic_update_state() {
+        if (!semantic_update_.active) {
+            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            semantic_update_.lambda = 1.0f;
+            semantic_update_.lambda_dot = 0.0f;
             return;
         }
 
         const auto now = std::chrono::steady_clock::now();
+
         float dt =
             std::chrono::duration<float>(
-                now - field_insertion_.last_update_time
+                now - semantic_update_.last_update_time
             ).count();
 
-        field_insertion_.last_update_time = now;
-
+        semantic_update_.last_update_time = now;
         dt = std::clamp(dt, 0.0f, 0.2f);
 
-        const float lambda_dot_cmd =
-            std::clamp(
-                field_insertion_.commanded_lambda_dot,
-                field_insertion_.lambda_dot_min,
-                field_insertion_.lambda_dot_max
-            );
+        // Fixed insertion/removal schedule for now.
+        semantic_update_.lambda_dot = semantic_update_.lambda_dot_max;
 
-        // Maximum allowed change in lambda_dot per second.
-        // Smaller = smoother ramp.
-        // Example: 0.5 means lambda_dot can go 0.0 -> 0.5 in about 1 second.
-        const float lambda_ddot_max = 0.5f;
+        semantic_update_.lambda += dt * semantic_update_.lambda_dot;
+        semantic_update_.lambda =
+            std::clamp(semantic_update_.lambda, 0.0f, 1.0f);
 
-        const float max_delta =
-            lambda_ddot_max * dt;
-
-        const float delta =
-            std::clamp(
-                lambda_dot_cmd - field_insertion_.lambda_dot,
-                -max_delta,
-                max_delta
-            );
-
-        field_insertion_.lambda_dot += delta;
-
-        field_insertion_.lambda_dot =
-            std::clamp(
-                field_insertion_.lambda_dot,
-                field_insertion_.lambda_dot_min,
-                field_insertion_.lambda_dot_max
-            );
-
-        field_insertion_.lambda += dt * field_insertion_.lambda_dot;
-        field_insertion_.lambda =
-            std::clamp(field_insertion_.lambda, 0.0f, 1.0f);
-
-        const float lam = field_insertion_.lambda;
-
-        #pragma omp parallel for num_threads(4)
-        for (int n = 0; n < N; ++n) {
-            const float h_old = hgrid_insertion_old_[n];
-            const float h_new = hgrid1[n];
-
-            beta_grid_[n] = h_new - h_old;
-
-            hgrid_active_[n] =
-                (1.0f - lam) * h_old + lam * h_new;
-
-            dhdt_active_[n] =
-                lam * dhdt_grid[n]
-                + beta_grid_[n] * field_insertion_.lambda_dot;
-
-        }
-
-        if (field_insertion_.lambda >= 0.999f) {
-            field_insertion_.active = false;
-            field_insertion_.lambda = 1.0f;
-            field_insertion_.lambda_dot = 0.0f;
-
-            std::memcpy(hgrid_active_, hgrid1, N * sizeof(float));
-            std::memcpy(dhdt_active_, dhdt_grid, N * sizeof(float));
+        if (semantic_update_.lambda >= 0.999f) {
+            semantic_update_.active = false;
+            semantic_update_.lambda = 1.0f;
+            semantic_update_.lambda_dot = 0.0f;
+            semantic_update_.mode = SemanticUpdateMode::NORMAL;
 
             RCLCPP_INFO(
                 this->get_logger(),
-                "Completed smooth Poisson field insertion"
+                "Completed semantic update"
             );
         }
     }
@@ -1498,19 +1657,15 @@ private:
     ) {
         bool need_rebuild_kernels = false;
 
-        if (cfg.human_buffer_m > 0.0f &&
-            std::abs(cfg.human_buffer_m - robot_MOS_human) > 1.0e-4f) {
-
-            start_field_insertion();
+        if (std::abs(cfg.human_buffer_m - robot_MOS_human) > 1e-4f) {
+            if (cfg.human_buffer_m > robot_MOS_human) {
+                start_semantic_insertion();
+            } else {
+                start_semantic_removal();
+            }
 
             robot_MOS_human = cfg.human_buffer_m;
             need_rebuild_kernels = true;
-
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Applied runtime human buffer: %.2f m",
-                robot_MOS_human
-            );
         }
 
         // if (cfg.obstacle_buffer_m > 0.0f &&
@@ -1564,11 +1719,6 @@ private:
             vel_max_x_bwd_,
             vel_max_y_,
             vel_max_yaw_
-        );
-
-        mpc3d_controller.set_lambda_dot_bounds(
-            field_insertion_.lambda_dot_min,
-            field_insertion_.lambda_dot_max
         );
 
         mpc3d_controller.setup_QP();
@@ -1650,15 +1800,20 @@ private:
             robot_kernel_dim_obstacle =
                 initialize_robot_kernel(robot_kernel_obstacle, robot_MOS_obstacle);
     
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Rebuilt robot kernels from JSON constraints: human=%.2f, obstacle=%.2f",
-                robot_MOS_human,
-                robot_MOS_obstacle
-            );
+            // RCLCPP_INFO(
+            //     this->get_logger(),
+            //     "Rebuilt robot kernels from JSON constraints: human=%.2f, obstacle=%.2f",
+            //     robot_MOS_human,
+            //     robot_MOS_obstacle
+            // );
         }
 
     void initialize_static_grids() {
+        semantic_occupancy_grid_.assign(IMAX * JMAX, 0);
+        semantic_previous_grid_.assign(IMAX * JMAX, 0);
+        semantic_target_grid_.assign(IMAX * JMAX, 0);
+        semantic_current_grid_.assign(IMAX * JMAX, 0);
+        
         for (int n = 0; n < IMAX * JMAX; ++n) {
             occ1[n] = 1.0f;
             occ0[n] = 1.0f;
@@ -1768,8 +1923,8 @@ private:
         this->declare_parameter("social_layer_thickness", 1);
         this->declare_parameter("human_direction_threshold", 0.15);
     
-        this->declare_parameter("robot_mos_human", 0.5);
-        this->declare_parameter("robot_mos_obstacle", 0.1);
+        this->declare_parameter("robot_mos_human", 0.01);
+        this->declare_parameter("robot_mos_obstacle", 0.01);
     
         dh0_human = this->get_parameter("dh0_human").as_double();
         dh0_obstacle = this->get_parameter("dh0_obstacle").as_double();
@@ -2021,14 +2176,16 @@ private:
         options_cmd.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         options_yolo.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-      image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-          this, "/yolo/segmentation_mask"
-      );
+        image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+            this, "/yolo/segmentation_mask"
+        );
       
-      cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
-          this, "/camera/point_cloud/cloud_registered"
-      );
-    
+        cloud_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
+            this, "/camera/point_cloud/cloud_registered"
+        );
+
+        semantic_occupancy_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("semantic_occupancy_grid",1);
+            
         occ_grid_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
             "occupancy_grid", 1,
             std::bind(&PoissonControllerNode::occ_grid_callback, this, std::placeholders::_1),
@@ -2095,9 +2252,9 @@ private:
             wn,
             static_cast<float>(realtime_sf_flag | predictive_sf_flag),
 
-            field_insertion_.lambda,
-            field_insertion_.lambda_dot,
-            static_cast<float>(field_insertion_.active),
+            semantic_update_.lambda,
+            semantic_update_.lambda_dot,
+            static_cast<float>(semantic_update_.active),
             new_constraint_event_flag_ ? 1.0f : 0.0f,
             static_cast<float>(constraint_event_counter_)
         };
@@ -3033,7 +3190,7 @@ private:
     float* dhdt_active_{nullptr};
     float* beta_grid_{nullptr};
 
-    FieldInsertionState field_insertion_;
+    SemanticUpdateState semantic_update_;
     ConstraintManager constraint_manager_;
     ConstraintRuntimeConfig constraint_runtime_config_;
     std::string constraints_path_;
@@ -3058,6 +3215,10 @@ private:
     int8_t visibility_map[IMAX * JMAX];
     int8_t class_map_expanded[IMAX * JMAX];
 
+    std::vector<int8_t> semantic_occupancy_grid_;
+    std::vector<int8_t> semantic_previous_grid_;
+    std::vector<int8_t> semantic_target_grid_;
+    std::vector<int8_t> semantic_current_grid_;
     std::vector<float> persistent_human_confidence_;
     std::vector<uint8_t> persistent_human_mask_;
     
@@ -3101,6 +3262,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr poisson_image_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_data_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr profiling_data_pub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr semantic_occupancy_pub_;
     double logging_publish_hz_ = 10.0;
     double logging_publish_period_ = 0.1;
     std::chrono::steady_clock::time_point last_logging_publish_time_;
@@ -3120,11 +3282,11 @@ int main(int argc, char* argv[]) {
     const float min_z = poissonNode->get_parameter("min_z").as_double();
     const float max_z = poissonNode->get_parameter("max_z").as_double();
 
-    RCLCPP_INFO(
-        poissonNode->get_logger(),
-        "Passing min_z=%.2f, max_z=%.2f to CloudMergerNode",
-        min_z, max_z
-    );
+    // RCLCPP_INFO(
+    //     poissonNode->get_logger(),
+    //     "Passing min_z=%.2f, max_z=%.2f to CloudMergerNode",
+    //     min_z, max_z
+    // );
 
     auto mappingNode = std::make_shared<CloudMergerNode>(min_z, max_z);
 

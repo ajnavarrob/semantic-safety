@@ -70,13 +70,13 @@ def generate_launch_description():
     
     min_z_arg = DeclareLaunchArgument(
         'min_z',
-        default_value='0.1',
+        default_value='0.05',
         description='Minimum height (Z) for point cloud filtering in occupancy grid'
     )
     
     max_z_arg = DeclareLaunchArgument(
         'max_z',
-        default_value='0.5',
+        default_value='0.7',
         description='Maximum height (Z) for point cloud filtering in occupancy grid'
     )
     
@@ -132,7 +132,7 @@ def generate_launch_description():
     
     enable_human_tracker_dilation_arg = DeclareLaunchArgument(
         'enable_human_tracker_dilation',
-        default_value='true',
+        default_value='false',
         description='Enable brushfire dilation of human labels (set to false to disable)'
     )
     
@@ -168,7 +168,7 @@ def generate_launch_description():
 
     social_tangent_layers_arg = DeclareLaunchArgument(
         'social_tangent_layers',
-        default_value='8',
+        default_value='3',
         description='Number of layers outward from human boundary with tangential bias (0=disable, preserves CBF at boundary)'
     )
     
@@ -186,7 +186,7 @@ def generate_launch_description():
     
     robot_mos_human_arg = DeclareLaunchArgument(
         'robot_mos_human',
-        default_value='1.5', #'1.5',
+        default_value='1.0', #'1.5',
         description='Margin of Safety multiplier for human boundary inflation. Larger = more buffer around humans'
     )
     
@@ -198,7 +198,7 @@ def generate_launch_description():
     
     enable_social_navigation_arg = DeclareLaunchArgument(
         'enable_social_navigation',
-        default_value='true',
+        default_value='false',
         description='Enable social navigation - robot passes on human right (goes left)'
     )
       
@@ -376,7 +376,7 @@ def generate_launch_description():
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
             'dh0_obstacle': LaunchConfiguration('dh0_obstacle'),
-            'enable_display': False,  # Show OpenCV visualization
+            'enable_display': True,  # Show OpenCV visualization
             'min_z': LaunchConfiguration('min_z'),  # Forwarded to CloudMergerNode
             'max_z': LaunchConfiguration('max_z'),  # Forwarded to CloudMergerNode
             # Tight-area wall softening
@@ -511,7 +511,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='livox_to_body_tf',
         arguments=[
-             '-0.08', '0.0', '0.18',  # x, y, z translation (body relative to livox)
+             '-0.08', '0.0', '0.45',  # x, y, z translation (body relative to livox)
              '0', '3.14159265358979', '0.05',     # roll, pitch, yaw (180° pitch for Y-axis flip)
              'livox_frame', 'body_link'  # parent_frame, child_frame
         ],
@@ -546,8 +546,8 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='body_to_rear_camera_tf',
         arguments=[
-            '-0.15', '0.0', '0.20',
-            '3.14159', '0', '0',
+            '-0.15', '0.0', '0.20+0.45',
+            '3.14159265389', '0', '0',
             'body_link', 'camera_rear_link'
         ],
     )

@@ -1,0 +1,21 @@
+project_lidar_debug_node:
+  ros__parameters:
+    lidar_topic: "/livox/lidar"
+
+    front_camera_info_topic: "/oak_front/rgb/camera_info"
+    front_image_topic: "/oak_front/rgb/image_raw"
+    front_output_image_topic: "/debug/oak_front_projected_lidar_image"
+
+    rear_camera_info_topic: "/oak_rear/rgb/camera_info"
+    rear_image_topic: "/oak_rear/rgb/image_raw"
+    rear_output_image_topic: "/debug/oak_rear_projected_lidar_image"
+
+    base_frame: "body_link"
+    lidar_frame: "livox_frame"
+
+    front_camera_frame: "oak_front_rgb_camera_optical_frame"
+    rear_camera_frame: "oak_rear_rgb_camera_optical_frame"
+
+    max_projection_depth_m: 12.0
+    min_projection_depth_m: 0.15
+    point_stride: 3

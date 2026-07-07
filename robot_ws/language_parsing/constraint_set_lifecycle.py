@@ -49,7 +49,6 @@ def remove_constraint(constraints: list, runtime_delta: dict) -> None:
     remove_id = runtime_delta.get("remove_id")
     remove_target = runtime_delta.get("remove_target")
 
-    # Ignore malformed generated IDs from underspecified remove commands.
     if remove_id and not remove_id.startswith("None_"):
         before = len(constraints)
         constraints[:] = [
@@ -63,20 +62,30 @@ def remove_constraint(constraints: list, runtime_delta: dict) -> None:
     if not remove_target:
         raise ValueError("Remove command missing remove_target.")
 
+    def constraint_mentions_target(c: dict, remove_target: str) -> bool:
+        target = c.get("target", {})
+        reference = c.get("reference", {})
+
+        return (
+            remove_target in target.get("semantic_class", [])
+            or remove_target in target.get("semantic_instance", [])
+            or remove_target in reference.get("semantic_class", [])
+            or remove_target in reference.get("semantic_instance", [])
+        )
+
     before = len(constraints)
 
     constraints[:] = [
         c for c in constraints
-        if remove_target not in c.get("target", {}).get("semantic_class", [])
+        if not constraint_mentions_target(c, remove_target)
     ]
 
     removed = before - len(constraints)
 
     if removed == 0:
-        raise ValueError(f"No active constraint found for target: {remove_target}")
+        raise ValueError(f"No active constraint found for target/reference: {remove_target}")
 
-    print(f"Removed {removed} constraint(s) targeting {remove_target}")
-
+    print(f"Removed {removed} constraint(s) involving {remove_target}")
 
 def deep_merge(base: dict, patch: dict) -> dict:
     out = deepcopy(base)
