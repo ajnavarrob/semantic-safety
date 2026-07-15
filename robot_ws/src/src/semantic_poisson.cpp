@@ -29,9 +29,13 @@
 
 #include <opencv2/opencv.hpp>
 
+#include <cstdint>
+#include <unordered_set>
+
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "std_msgs/msg/int32.hpp"
@@ -44,6 +48,190 @@
 #include <message_filters/sync_policies/approximate_time.h>
 
 namespace ss {
+
+enum class SemanticClass : std::uint16_t
+{
+    Unknown = 0,
+    Person,
+    Chair,
+    Table,
+    Sofa,
+    Door,
+    Cabinet,
+    Plant,
+    Shelf,
+    Desk,
+    Refrigerator,
+    Stairs,
+    Computer,
+    Television,
+    Screen
+};
+
+
+static const char* semantic_class_name(
+    SemanticClass semantic_class)
+{
+    switch (semantic_class) {
+        case SemanticClass::Person:
+            return "person";
+        case SemanticClass::Chair:
+            return "chair";
+        case SemanticClass::Table:
+            return "table";
+        case SemanticClass::Sofa:
+            return "sofa";
+        case SemanticClass::Door:
+            return "door";
+        case SemanticClass::Cabinet:
+            return "cabinet";
+        case SemanticClass::Plant:
+            return "plant";
+        case SemanticClass::Shelf:
+            return "shelf";
+        case SemanticClass::Desk:
+            return "desk";
+        case SemanticClass::Refrigerator:
+            return "refrigerator";
+        case SemanticClass::Stairs:
+            return "stairs";
+        case SemanticClass::Computer:
+            return "computer";
+        case SemanticClass::Television:
+            return "television";
+        case SemanticClass::Screen:
+            return "screen";
+        default:
+            return "unknown";
+    }
+}
+
+static SemanticClass topformer_class_to_semantic_class(
+    std::uint16_t model_class_id)
+{
+    // TopFormer ADE20K class IDs after class_id_offset = 1.
+    switch (model_class_id) {
+        case 11:
+            return SemanticClass::Cabinet;
+        case 13:
+            return SemanticClass::Person;
+        case 15:
+            return SemanticClass::Door;
+        case 16:
+            return SemanticClass::Table;
+        case 18:
+            return SemanticClass::Plant;
+        case 20:
+            return SemanticClass::Chair;
+        case 24:
+            return SemanticClass::Sofa;
+        case 25:
+            return SemanticClass::Shelf;
+        case 34:
+            return SemanticClass::Desk;
+        case 51:
+            return SemanticClass::Refrigerator;
+        case 54:
+            return SemanticClass::Stairs;
+        case 76:
+            return SemanticClass::Computer;
+        case 90:
+            return SemanticClass::Television;
+        case 131:
+            return SemanticClass::Screen;
+        default:
+            return SemanticClass::Unknown;
+    }
+}
+
+static SemanticClass semantic_class_from_name(
+    std::string name)
+{
+    std::transform(
+        name.begin(),
+        name.end(),
+        name.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+    if (name == "person" ||
+        name == "human" ||
+        name == "people")
+    {
+        return SemanticClass::Person;
+    }
+    if (name == "chair") {
+        return SemanticClass::Chair;
+    }
+    if (name == "table" ||
+        name == "diningtable" ||
+        name == "dining_table")
+    {
+        return SemanticClass::Table;
+    }
+    if (name == "sofa" ||
+        name == "couch")
+    {
+        return SemanticClass::Sofa;
+    }
+    if (name == "door" ||
+        name == "doorway")
+    {
+        return SemanticClass::Door;
+    }
+    if (name == "cabinet") {
+        return SemanticClass::Cabinet;
+    }
+    if (name == "plant" ||
+        name == "pottedplant" ||
+        name == "potted_plant")
+    {
+        return SemanticClass::Plant;
+    }
+    if (name == "shelf" ||
+        name == "bookshelf")
+    {
+        return SemanticClass::Shelf;
+    }
+    if (name == "desk") {
+        return SemanticClass::Desk;
+    }
+    if (name == "refrigerator" ||
+        name == "fridge")
+    {
+        return SemanticClass::Refrigerator;
+    }
+    if (name == "stairs" ||
+        name == "staircase")
+    {
+        return SemanticClass::Stairs;
+    }
+    if (name == "computer") {
+        return SemanticClass::Computer;
+    }
+    if (name == "television" ||
+        name == "tv")
+    {
+        return SemanticClass::Television;
+    }
+    if (name == "screen" ||
+        name == "monitor")
+    {
+        return SemanticClass::Screen;
+    }
+    return SemanticClass::Unknown;
+}
+
+static constexpr std::size_t NUM_CANONICAL_SEMANTIC_CLASSES =
+    static_cast<std::size_t>(SemanticClass::Screen) + 1U;
+
+
+static std::size_t semantic_class_index(
+    SemanticClass semantic_class)
+{
+    return static_cast<std::size_t>(semantic_class);
+}
 
 enum class PipelineStage {
     OccupancyPreprocess,
@@ -242,6 +430,12 @@ private:
             visibility_map[n] = msg->data[n];
         }
     }
+    void semantic_observation_callback(
+        sensor_msgs::msg::PointCloud2::UniquePtr msg)
+    {
+        handle_semantic_observation(*msg);
+    }
+
 
     void state_update_callback(const nav_msgs::msg::Odometry::SharedPtr data) {
         handle_state_update(*data);
@@ -254,6 +448,237 @@ private:
     // ============================================================
     // 2. HIGH-LEVEL HANDLERS
     // ============================================================
+    void handle_semantic_observation(
+        const sensor_msgs::msg::PointCloud2& msg)
+    {
+        if (msg.width == 0 || msg.height == 0) {
+            return;
+        }
+
+        if (!msg.header.frame_id.empty() &&
+            msg.header.frame_id != semantic_observation_frame_)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Semantic observation frame is '%s', expected '%s'. "
+                "The current implementation assumes the points are already "
+                "expressed in the semantic_poisson body frame.",
+                msg.header.frame_id.c_str(),
+                semantic_observation_frame_.c_str()
+            );
+
+            return;
+        }
+
+        const float now_sec =
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+
+        std::size_t valid_points = 0;
+        std::size_t ignored_classes = 0;
+        std::size_t outside_grid = 0;
+        std::size_t outside_height = 0;
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_);
+
+        try {
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_x(msg, "x");
+
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_y(msg, "y");
+
+            sensor_msgs::PointCloud2ConstIterator<float>
+                iter_z(msg, "z");
+
+            sensor_msgs::PointCloud2ConstIterator<std::uint16_t>
+                iter_class(msg, "class_id");
+
+            for (
+                ;
+                iter_x != iter_x.end();
+                ++iter_x,
+                ++iter_y,
+                ++iter_z,
+                ++iter_class)
+            {
+                const float px = *iter_x;
+                const float py = *iter_y;
+                const float pz = *iter_z;
+
+                if (!std::isfinite(px) ||
+                    !std::isfinite(py) ||
+                    !std::isfinite(pz))
+                {
+                    continue;
+                }
+
+                if (pz < semantic_observation_min_z_ ||
+                    pz > semantic_observation_max_z_)
+                {
+                    ++outside_height;
+                    continue;
+                }
+
+                const std::uint16_t model_class_id =
+                    *iter_class;
+
+                const SemanticClass semantic_class =
+                    topformer_class_to_semantic_class(
+                        model_class_id);
+
+                if (semantic_class == SemanticClass::Unknown) {
+                    ++ignored_classes;
+                    continue;
+                }
+
+                // The semantic_volume cloud is in body_link.
+                //
+                // Existing semantic_poisson grid convention:
+                //   x -> grid column j
+                //   y -> grid row i
+                //   grid origin is centered on body_link.
+                const int j = static_cast<int>(
+                    std::floor(
+                        px / DS +
+                        0.5f * static_cast<float>(JMAX)));
+
+                const int i = static_cast<int>(
+                    std::floor(
+                        py / DS +
+                        0.5f * static_cast<float>(IMAX)));
+
+                if (i < 0 ||
+                    i >= IMAX ||
+                    j < 0 ||
+                    j >= JMAX)
+                {
+                    ++outside_grid;
+                    continue;
+                }
+
+                const int grid_index =
+                    i * JMAX + j;
+
+                const std::size_t class_index =
+                    semantic_class_index(
+                        semantic_class);
+
+                semantic_class_layers_[class_index][grid_index] =
+                    1;
+
+                semantic_class_last_seen_[class_index][grid_index] =
+                    now_sec;
+
+                semantic_model_class_grid_[grid_index] =
+                    model_class_id;
+
+                semantic_canonical_class_grid_[grid_index] =
+                    static_cast<std::uint16_t>(
+                        semantic_class);
+
+                ++valid_points;
+            }
+        } catch (const std::runtime_error& exception) {
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Invalid semantic PointCloud2 fields: %s",
+                exception.what()
+            );
+
+            return;
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "OAK semantic observations: accepted=%zu, "
+            "ignored_class=%zu, outside_grid=%zu, outside_z=%zu",
+            valid_points,
+            ignored_classes,
+            outside_grid,
+            outside_height
+        );
+    }
+
+    void expire_stale_semantic_observations()
+    {
+        const float now_sec =
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_);
+
+        for (
+            std::size_t class_index = 1;
+            class_index < NUM_CANONICAL_SEMANTIC_CLASSES;
+            ++class_index)
+        {
+            auto& layer =
+                semantic_class_layers_[class_index];
+
+            auto& last_seen =
+                semantic_class_last_seen_[class_index];
+
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (layer[n] == 0) {
+                    continue;
+                }
+
+                const float observation_age =
+                    now_sec - last_seen[n];
+
+                if (observation_age >
+                    semantic_observation_timeout_sec_)
+                {
+                    layer[n] = 0;
+                    last_seen[n] = 0.0f;
+                }
+            }
+        }
+    }
+
+    void merge_active_oak_semantics_into_target_grid()
+    {
+        expire_stale_semantic_observations();
+
+        std::lock_guard<std::mutex> lock(
+            semantic_observation_mutex_
+        );
+
+        for (
+            const SemanticClass semantic_class :
+            active_semantic_classes_)
+        {
+            const std::size_t class_index =
+                semantic_class_index(semantic_class);
+
+            if (class_index == 0 ||
+                class_index >= NUM_CANONICAL_SEMANTIC_CLASSES)
+            {
+                continue;
+            }
+
+            const auto& layer =
+                semantic_class_layers_[class_index];
+
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (layer[n] > 0) {
+                    semantic_target_grid_[n] = 1;
+                }
+            }
+        }
+    }
+
 
     void handle_teleop_input(const geometry_msgs::msg::Twist& msg) {
         const std::vector<float> vtb = {
@@ -461,12 +886,29 @@ private:
         ScopedTimer timer(timing_.semantic_fusion_ms);
         SemanticStageOutput out;
 
-        std::fill(semantic_target_grid_.begin(), semantic_target_grid_.end(), 0);
+        std::fill(
+            semantic_target_grid_.begin(),
+            semantic_target_grid_.end(),
+            0);
 
-        label_human_clusters(occ1);
+        // ------------------------------------------------------------
+        // Legacy YOLO/human semantic source
+        // ------------------------------------------------------------
+        if (enable_legacy_yolo_semantics_) {
+            label_human_clusters(occ1);
 
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            semantic_target_grid_[n] = class_map_expanded[n];
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                if (class_map_expanded[n] > 0) {
+                    semantic_target_grid_[n] = 1;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // New OAK/TopFormer class-labelled semantic source
+        // ------------------------------------------------------------
+        if (enable_oak_semantic_observations_) {
+            merge_active_oak_semantics_into_target_grid();
         }
 
         out.active_tracks = human_tracker_->get_active_tracks();
@@ -738,22 +1180,158 @@ private:
         }
     }
 
-    void build_inflated_boundaries(bool tight_area) {
+    void inflate_grid_with_kernel(
+        float* grid,
+        const float* kernel,
+        int kernel_dim)
+    {
+        if (!grid || !kernel || kernel_dim <= 0) {
+            return;
+        }
+
+        const int grid_size = IMAX * JMAX;
+        const int center = kernel_dim / 2;
+
+        // Snapshot the original source occupancy.
+        // Newly inflated cells must not become new inflation sources.
+        std::vector<float> source_grid(
+            grid,
+            grid + grid_size
+        );
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int source_index =
+                    i * JMAX + j;
+
+                // Only original occupied cells seed a kernel.
+                if (source_grid[source_index] >= 0.0f) {
+                    continue;
+                }
+
+                for (int ki = 0; ki < kernel_dim; ++ki) {
+                    const int destination_i =
+                        i + ki - center;
+
+                    if (destination_i < 0 ||
+                        destination_i >= IMAX)
+                    {
+                        continue;
+                    }
+
+                    for (int kj = 0; kj < kernel_dim; ++kj) {
+                        const int destination_j =
+                            j + kj - center;
+
+                        if (destination_j < 0 ||
+                            destination_j >= JMAX)
+                        {
+                            continue;
+                        }
+
+                        const float kernel_value =
+                            kernel[
+                                ki * kernel_dim + kj
+                            ];
+
+                        // Convention: negative means occupied.
+                        if (kernel_value >= 0.0f) {
+                            continue;
+                        }
+
+                        const int destination_index =
+                            destination_i * JMAX +
+                            destination_j;
+
+                        grid[destination_index] =
+                            std::min(
+                                grid[destination_index],
+                                kernel_value
+                            );
+                    }
+                }
+            }
+        }
+
+        for (int n = 0; n < grid_size; ++n) {
+            grid[n] = std::clamp(
+                grid[n],
+                -1.0f,
+                1.0f
+            );
+        }
+    }
+
+    void build_inflated_boundaries(bool tight_area)
+    {
         ScopedTimer timer(timing_.geometry_shaping_ms);
 
-        float* bound_q0 = bound;
-        std::memcpy(bound_q0, occ1, IMAX * JMAX * sizeof(float));
-        inflate_occupancy_grid(bound_q0, semantic_current_grid_.data());
+        const int grid_size = IMAX * JMAX;
 
         #pragma omp parallel for num_threads(4)
         for (int q = 0; q < QMAX; ++q) {
-            float* bound_slice = bound + q * IMAX * JMAX;
-            float* hgrid_slice = hgrid_temp_ + q * IMAX * JMAX;
-            if (q != 0) {
-                std::memcpy(bound_slice, occ1, IMAX * JMAX * sizeof(float));
-                inflate_occupancy_grid(bound_slice, semantic_current_grid_.data());
+            float* bound_slice =
+                bound + q * grid_size;
+
+            float* hgrid_slice =
+                hgrid_temp_ + q * grid_size;
+
+            // --------------------------------------------------------
+            // 1. Physical occupancy only
+            // --------------------------------------------------------
+            std::memcpy(
+                bound_slice,
+                occ1,
+                grid_size * sizeof(float)
+            );
+
+            inflate_grid_with_kernel(
+                bound_slice,
+                robot_kernel_obstacle +
+                    q * robot_kernel_dim_obstacle *
+                    robot_kernel_dim_obstacle,
+                robot_kernel_dim_obstacle
+            );
+
+            // --------------------------------------------------------
+            // 2. Semantic-human occupancy only
+            // --------------------------------------------------------
+            std::vector<float> human_bound(
+                grid_size,
+                1.0f
+            );
+
+            for (int n = 0; n < grid_size; ++n) {
+                if (semantic_current_grid_[n] > 0) {
+                    human_bound[n] = -1.0f;
+                }
             }
-            find_boundary(hgrid_slice, bound_slice, true, tight_area, semantic_current_grid_.data());
+
+            inflate_grid_with_kernel(
+                human_bound.data(),
+                robot_kernel_human +
+                    q * robot_kernel_dim_human *
+                    robot_kernel_dim_human,
+                robot_kernel_dim_human
+            );
+
+            // --------------------------------------------------------
+            // 3. Union physical and human occupancy
+            // --------------------------------------------------------
+            for (int n = 0; n < grid_size; ++n) {
+                bound_slice[n] = std::min(
+                    bound_slice[n],
+                    human_bound[n]
+                );
+            }
+
+            find_boundary(
+                hgrid_slice,
+                bound_slice,
+                true,
+                tight_area,
+                semantic_current_grid_.data()
+            );
         }
     }
 
@@ -1241,22 +1819,27 @@ private:
         const std::vector<float> save_data = {
             t_ms,
             static_cast<float>(space_counter),
-
             x[0], x[1], x[2],
-
+            // Realtime safety command
             v[0], v[1], v[2],
-            vt[0], vt[1], vt[2],
-
+            // MPC output
+            vd[0], vd[1], vd[2],
+            // Measured body velocity
+            v_meas_body[0], v_meas_body[1], v_meas_body[2],
+            // MPC tracking error
+            vd[0] - v_meas_body[0],
+            vd[1] - v_meas_body[1],
+            vd[2] - v_meas_body[2],
             h, dhdx, dhdy, dhdq, dhdt,
             wn,
             static_cast<float>(realtime_sf_flag | predictive_sf_flag),
-
             semantic_update_.lambda,
             semantic_update_.lambda_dot,
             static_cast<float>(semantic_update_.active),
             new_constraint_event_flag_ ? 1.0f : 0.0f,
             static_cast<float>(constraint_event_counter_)
         };
+
         for (size_t n = 0; n < save_data.size(); ++n) {
             outFileCSV << save_data[n];
             if (n + 1 < save_data.size()) outFileCSV << ",";
@@ -1651,38 +2234,87 @@ private:
         }
     }
 
-    void apply_runtime_constraint_config(
-        const ConstraintRuntimeConfig& cfg,
-        bool allow_kernel_rebuild
-    ) {
-        bool need_rebuild_kernels = false;
+    float get_person_buffer_from_constraints(
+        const ConstraintRuntimeConfig& cfg) const
+    {
+        float person_buffer_m = 0.0f;
 
-        if (std::abs(cfg.human_buffer_m - robot_MOS_human) > 1e-4f) {
-            if (cfg.human_buffer_m > robot_MOS_human) {
-                start_semantic_insertion();
-            } else {
-                start_semantic_removal();
+        for (const auto& constraint : cfg.constraints) {
+            if (!constraint.enabled ||
+                !constraint.enforce)
+            {
+                continue;
             }
 
-            robot_MOS_human = cfg.human_buffer_m;
-            need_rebuild_kernels = true;
+            bool targets_person = false;
+
+            for (const auto& target :
+                constraint.target_classes)
+            {
+                if (target == "person") {
+                    targets_person = true;
+                    break;
+                }
+            }
+
+            if (!targets_person) {
+                continue;
+            }
+
+            if (constraint.buffer_distance_m <= 0.0f) {
+                continue;
+            }
+
+            person_buffer_m = std::max(
+                person_buffer_m,
+                constraint.buffer_distance_m
+            );
         }
 
-        // if (cfg.obstacle_buffer_m > 0.0f &&
-        //     std::abs(cfg.obstacle_buffer_m - robot_MOS_obstacle) > 1.0e-4f) {
+        return person_buffer_m;
+    }
 
-        //     robot_MOS_obstacle = cfg.obstacle_buffer_m;
-        //     need_rebuild_kernels = true;
+    void apply_runtime_constraint_config(
+        const ConstraintRuntimeConfig& cfg,
+        bool allow_kernel_rebuild)
+    {
+        const float requested_person_buffer_m =
+            get_person_buffer_from_constraints(cfg);
 
-        //     RCLCPP_INFO(
-        //         this->get_logger(),
-        //         "Applied runtime obstacle buffer: %.2f m",
-        //         robot_MOS_obstacle
-        //     );
-        // }
+        const bool person_buffer_changed =
+            std::abs(
+                requested_person_buffer_m -
+                robot_MOS_human
+            ) > 1.0e-4f;
 
-        if (allow_kernel_rebuild && need_rebuild_kernels) {
-            rebuild_robot_kernels();
+        if (!person_buffer_changed) {
+            return;
+        }
+
+        const float previous_person_buffer_m =
+            robot_MOS_human;
+
+        robot_MOS_human =
+            requested_person_buffer_m;
+
+        if (robot_MOS_human >
+            previous_person_buffer_m)
+        {
+            start_semantic_insertion();
+        } else {
+            start_semantic_removal();
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Person buffer updated from constraints JSON: "
+            "%.3f m -> %.3f m",
+            previous_person_buffer_m,
+            robot_MOS_human
+        );
+
+        if (allow_kernel_rebuild) {
+            rebuild_human_kernel();
         }
     }
 
@@ -1725,18 +2357,43 @@ private:
         mpc3d_controller.solve();
     }
 
-    void update_robot_state(const nav_msgs::msg::Odometry& data) {
-        dt_state = std::chrono::duration<float>(std::chrono::steady_clock::now() - t_state).count();
+    void update_robot_state(const nav_msgs::msg::Odometry& data)
+    {
+        dt_state = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - t_state).count();
         t_state = std::chrono::steady_clock::now();
         grid_age += dt_state;
-    
+
+        // Save previous pose
+        float x_prev = x[0];
+        float y_prev = x[1];
+        float yaw_prev = x[2];
+
+        // Update pose
         x[0] = data.pose.pose.position.x;
         x[1] = data.pose.pose.position.y;
-    
+
         const auto& q = data.pose.pose.orientation;
-        const float sin_yaw = 2.0f * (q.w * q.z + q.x * q.y);
-        const float cos_yaw = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
+        const float sin_yaw = 2.0f * (q.w*q.z + q.x*q.y);
+        const float cos_yaw = 1.0f - 2.0f*(q.y*q.y + q.z*q.z);
         x[2] = std::atan2(sin_yaw, cos_yaw);
+
+        const float dt = std::max(dt_state, 1.0e-3f);
+
+        float dx_world = (x[0] - x_prev) / dt;
+        float dy_world = (x[1] - y_prev) / dt;
+
+        float c = std::cos(x[2]);
+        float s = std::sin(x[2]);
+
+        v_meas_body[0] =  c * dx_world + s * dy_world;
+        v_meas_body[1] = -s * dx_world + c * dy_world;
+
+        float dyaw = x[2] - yaw_prev;
+        while (dyaw > M_PI)  dyaw -= 2.0f * M_PI;
+        while (dyaw < -M_PI) dyaw += 2.0f * M_PI;
+
+        v_meas_body[2] = dyaw / dt;
     }
 
     bool update_grid_metadata_from_message(const nav_msgs::msg::OccupancyGrid& msg) {
@@ -1781,6 +2438,32 @@ private:
         robot_kernel_dim_human = initialize_robot_kernel(robot_kernel_human, robot_MOS_human);
     }
 
+    void rebuild_human_kernel()
+    {
+        std::unique_lock<std::shared_mutex> lock(
+            field_mutex_);
+
+        if (robot_kernel_human) {
+            std::free(robot_kernel_human);
+            robot_kernel_human = nullptr;
+        }
+
+        robot_kernel_dim_human =
+            initialize_robot_kernel(
+                robot_kernel_human,
+                robot_MOS_human
+            );
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Rebuilt human kernel from JSON: "
+            "buffer=%.3f m, dimension=%d, resolution=%.3f m",
+            robot_MOS_human,
+            robot_kernel_dim_human,
+            DS
+        );
+    }
+
     void rebuild_robot_kernels() {
             std::unique_lock<std::shared_mutex> lock(field_mutex_);
     
@@ -1813,6 +2496,25 @@ private:
         semantic_previous_grid_.assign(IMAX * JMAX, 0);
         semantic_target_grid_.assign(IMAX * JMAX, 0);
         semantic_current_grid_.assign(IMAX * JMAX, 0);
+
+        for (std::size_t class_index = 0; class_index < NUM_CANONICAL_SEMANTIC_CLASSES; ++class_index)
+        {
+            semantic_class_layers_[class_index].assign(
+                IMAX * JMAX,
+                0);
+
+            semantic_class_last_seen_[class_index].assign(
+                IMAX * JMAX,
+                0.0f);
+        }
+
+        semantic_model_class_grid_.assign(
+            IMAX * JMAX,
+            0);
+
+        semantic_canonical_class_grid_.assign(
+            IMAX * JMAX,
+            0);
         
         for (int n = 0; n < IMAX * JMAX; ++n) {
             occ1[n] = 1.0f;
@@ -1860,8 +2562,10 @@ private:
         const std::vector<std::string> header = {
             "t_ms", "space_counter",
             "rx", "ry", "yaw",
-            "vx", "vy", "vyaw",
-            "vxd", "vyd", "vyawd",
+            "vx_rt", "vy_rt", "wz_rt",
+            "vx_mpc", "vy_mpc", "wz_mpc",
+            "vx_meas", "vy_meas", "wz_meas",
+            "vx_mpc_err", "vy_mpc_err", "wz_mpc_err",
             "h", "dhdx", "dhdy", "dhdq", "dhdt",
             "alpha", "on_off",
             "lambda", "lambda_dot", "insertion_active",
@@ -1897,6 +2601,14 @@ private:
         this->declare_parameter("human_persistence_threshold", 0.25);
         this->declare_parameter("human_persistence_observation_value", 1.0);
         this->declare_parameter("constraints_reload_hz", 0.1);
+        this->declare_parameter("enable_oak_semantic_observations", true);
+        this->declare_parameter("enable_legacy_yolo_semantics", false);
+        this->declare_parameter("semantic_observation_topic","/semantic_volume/occupied_voxels");
+        this->declare_parameter("semantic_observation_frame","body_link");
+        this->declare_parameter("semantic_observation_timeout_sec",1.0);
+        this->declare_parameter("semantic_observation_min_z",-0.50);
+        this->declare_parameter("semantic_observation_max_z",1.50);
+        this->declare_parameter<std::vector<std::string>>("active_semantic_classes",std::vector<std::string>{"person"});
     
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
@@ -1908,7 +2620,46 @@ private:
         human_persistence_decay_ = static_cast<float>(this->get_parameter("human_persistence_decay").as_double());
         human_persistence_threshold_ = static_cast<float>(this->get_parameter("human_persistence_threshold").as_double());
         human_persistence_observation_value_ = static_cast<float>(this->get_parameter("human_persistence_observation_value").as_double());
-    
+        enable_oak_semantic_observations_ = this->get_parameter("enable_oak_semantic_observations").as_bool();
+        enable_legacy_yolo_semantics_ = this->get_parameter("enable_legacy_yolo_semantics").as_bool();
+        semantic_observation_topic_ = this->get_parameter("semantic_observation_topic").as_string();
+        semantic_observation_frame_ = this->get_parameter("semantic_observation_frame").as_string();
+        semantic_observation_timeout_sec_ = static_cast<float>(this->get_parameter("semantic_observation_timeout_sec").as_double());
+        semantic_observation_min_z_ = static_cast<float>(this->get_parameter("semantic_observation_min_z").as_double());
+        semantic_observation_max_z_ = static_cast<float>(this->get_parameter("semantic_observation_max_z").as_double());
+        
+        active_semantic_classes_.clear();
+
+        const auto active_class_names =
+            this->get_parameter(
+                "active_semantic_classes").as_string_array();
+
+        for (const auto& class_name : active_class_names) {
+            const SemanticClass semantic_class =
+                semantic_class_from_name(
+                    class_name);
+
+            if (semantic_class ==
+                SemanticClass::Unknown)
+            {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Unknown active semantic class '%s'.",
+                    class_name.c_str());
+
+                continue;
+            }
+
+            active_semantic_classes_.insert(
+                semantic_class);
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Activated semantic occupancy class: %s",
+                semantic_class_name(
+                    semantic_class));
+        }
+
         initialize_logging_outputs();
     
         // ------------------------------------------------------------
@@ -2170,11 +2921,13 @@ private:
         rclcpp::SubscriptionOptions options_state;
         rclcpp::SubscriptionOptions options_cmd;
         rclcpp::SubscriptionOptions options_yolo;
+        rclcpp::SubscriptionOptions options_semantic_observation;
     
         options_occ.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         options_state.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         options_cmd.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         options_yolo.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        options_semantic_observation.callback_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         image_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
             this, "/yolo/segmentation_mask"
@@ -2185,7 +2938,19 @@ private:
         );
 
         semantic_occupancy_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("semantic_occupancy_grid",1);
-            
+        semantic_observation_suber_ =
+            this->create_subscription<
+                sensor_msgs::msg::PointCloud2>(
+                semantic_observation_topic_,
+                rclcpp::SensorDataQoS().keep_last(1),
+                std::bind(
+                    &PoissonControllerNode::
+                        semantic_observation_callback,
+                    this,
+                    std::placeholders::_1),
+                options_semantic_observation
+            );
+       
         occ_grid_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
             "occupancy_grid", 1,
             std::bind(&PoissonControllerNode::occ_grid_callback, this, std::placeholders::_1),
@@ -2385,36 +3150,83 @@ private:
         }
     }
 
-    int initialize_robot_kernel(float*& kernel, float mos) {
+    int initialize_robot_kernel(
+        float*& kernel,
+        float buffer_m)
+    {
         robot_length = 0.7f;
         robot_width = 0.3f;
-    
-        const float ar = mos * robot_length / 2.0f;
-        const float br = mos * robot_width / 2.0f;
-        const float D = 2.0f * std::sqrt(ar * ar + br * br);
-    
-        int dim = 2 * static_cast<int>(std::ceil(std::ceil(D / DS) / 2.0f));
-        if (dim < 2) dim = 2;
-    
-        kernel = static_cast<float*>(std::malloc(dim * dim * QMAX * sizeof(float)));
+
+        buffer_m = std::max(buffer_m, 0.0f);
+        const float ar =
+            robot_length / 2.0f + buffer_m;
+        const float br =
+            robot_width / 2.0f + buffer_m;
+
+        // const float ar = buffer_m * robot_length / 2.0f;
+        // const float br = buffer_m * robot_width / 2.0f;
+
+        const float half_extent_m =
+            std::sqrt(ar * ar + br * br);
+
+
+        int dim =
+            2 * static_cast<int>(
+                std::ceil(half_extent_m / DS)
+            ) + 1;
+        dim = std::max(dim, 3);
+        if ((dim % 2) == 0) {
+            ++dim;
+        }
+        kernel = static_cast<float*>(
+            std::malloc(
+                dim * dim * QMAX * sizeof(float)
+            )
+        );
         if (!kernel) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to allocate robot kernel");
-            throw std::runtime_error("Robot kernel allocation failed");
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to allocate robot kernel"
+            );
+
+            throw std::runtime_error(
+                "Robot kernel allocation failed"
+            );
         }
-    
+
+        std::memset(
+            kernel,
+            0,
+            dim * dim * QMAX * sizeof(float)
+        );
+
         for (int q = 0; q < QMAX; ++q) {
-            float* kernel_slice = kernel + q * dim * dim;
-            const float yawq = q_to_yaw(q, xc[2]);
-            fill_elliptical_robot_kernel(kernel_slice, yawq, dim, 2.0f, mos);
+            float* kernel_slice =
+                kernel + q * dim * dim;
+
+            const float yawq =
+                q_to_yaw(q, xc[2]);
+
+            fill_elliptical_robot_kernel(
+                kernel_slice,
+                yawq,
+                dim,
+                2.0f,       // ellipse exponent, not buffer distance
+                buffer_m    // value read from JSON
+            );
         }
-    
+
         return dim;
     }
 
 
-    void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float mos) {
-        const float ar = mos * robot_length / 2.0f;
-        const float br = mos * robot_width / 2.0f;
+    void fill_elliptical_robot_kernel(float* kernel, float yawq, int dim, float expo, float buffer_m) {
+        // Inflate the robot footprint by the requested clearance distance.
+        buffer_m = std::max(buffer_m, 0.0f);
+        const float ar =
+            robot_length / 2.0f + buffer_m;
+        const float br =
+            robot_width / 2.0f + buffer_m;
     
         if (ar < 0.001f || br < 0.001f) {
             for (int i = 0; i < dim * dim; ++i) kernel[i] = 0.0f;
@@ -3118,7 +3930,7 @@ private:
     bool dhdt_flag = false;
     bool save_flag = false;
     bool start_flag = false;
-    bool enable_display = false;
+    bool enable_display = true;
     bool sit_flag = false;
     bool stop_flag = false;
     bool predictive_sf_flag = false;
@@ -3147,6 +3959,7 @@ private:
     std::vector<float> vd = {0.0f, 0.0f, 0.0f};
     std::vector<float> v = {0.0f, 0.0f, 0.0f};
     std::vector<float> vb = {0.0f, 0.0f, 0.0f};
+    std::vector<float> v_meas_body{0.0f, 0.0f, 0.0f};
     float h{}, dhdt{}, dhdx{}, dhdy{}, dhdq{};
 
     float occ1[IMAX * JMAX];
@@ -3206,6 +4019,7 @@ private:
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr occ_grid_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr class_map_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr visibility_map_suber_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr semantic_observation_suber_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_suber_;
 
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> image_sub_;
@@ -3221,6 +4035,33 @@ private:
     std::vector<int8_t> semantic_current_grid_;
     std::vector<float> persistent_human_confidence_;
     std::vector<uint8_t> persistent_human_mask_;
+    std::array<
+    std::vector<int8_t>,
+        NUM_CANONICAL_SEMANTIC_CLASSES>
+        semantic_class_layers_;
+    std::array<
+        std::vector<float>,
+        NUM_CANONICAL_SEMANTIC_CLASSES>
+        semantic_class_last_seen_;
+    std::vector<std::uint16_t>
+        semantic_model_class_grid_;
+    std::vector<std::uint16_t>
+        semantic_canonical_class_grid_;
+    std::unordered_set<SemanticClass>
+        active_semantic_classes_;
+    std::mutex semantic_observation_mutex_;
+
+    bool enable_oak_semantic_observations_{true};
+    bool enable_legacy_yolo_semantics_{true};
+
+    std::string semantic_observation_topic_{
+        "/semantic_volume/occupied_voxels"};
+    std::string semantic_observation_frame_{
+        "body_link"};
+
+    float semantic_observation_timeout_sec_{1.0f};
+    float semantic_observation_min_z_{-0.50f};
+    float semantic_observation_max_z_{1.50f};
     
     float human_persistence_decay_{0.96f};
     float human_persistence_threshold_{0.25f};
@@ -3266,7 +4107,7 @@ private:
     double logging_publish_hz_ = 10.0;
     double logging_publish_period_ = 0.1;
     std::chrono::steady_clock::time_point last_logging_publish_time_;
-    bool enable_data_logging_to_file_ = false;
+    bool enable_data_logging_to_file_ = true;
 };
 
 } // namespace ss

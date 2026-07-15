@@ -1,0 +1,59 @@
+oak_segmentation_node:
+  ros__parameters:
+    blob_path: "/home/unitree/models/topformers_openvino_2021.4_6shave.blob"
+    mxid: "1944301031DDF18B00"
+
+    camera_frame: "oak_left_rgb_camera_optical_frame"
+
+    rgb_topic: "/oak_left/rgb/image_raw"
+    camera_info_topic: "/oak_left/rgb/camera_info"
+    class_map_topic: "/oak_left/segmentation/class_map"
+    overlay_topic: "/oak_left/segmentation/overlay"
+
+    preview_width: 512
+    preview_height: 512
+    fps: 20.0
+
+    output_width: 64
+    output_height: 64
+    output_layer: ""
+
+    class_id_offset: 1
+
+    publish_rgb: true
+    publish_overlay: true
+    overlay_alpha: 0.45
+    queue_size: 4
+
+
+semantic_volume_node:
+  ros__parameters:
+    cloud_topic: "/livox/lidar"
+    class_map_topic: "/oak_left/segmentation/class_map"
+    camera_info_topic: "/oak_left/rgb/camera_info"
+
+    output_topic: "/semantic_volume/occupied_voxels"
+    debug_hits_topic: "/semantic_volume/all_first_hits"
+
+    target_frame: "body_link"
+    camera_frame: "oak_left_rgb_camera_optical_frame"
+
+    voxel_size_m: 0.10
+    min_range_m: 0.35
+    max_range_m: 8.0
+
+    mask_cell_size_pixels: 2
+    minimum_cell_class_fraction: 0.60
+    mask_erosion_pixels: 1
+    minimum_class_id: 1
+
+    minimum_region_cells: 2
+    maximum_rays_per_frame: 1500
+
+    hit_connectivity_radius_voxels: 1
+    minimum_component_hits: 3
+    minimum_hit_coverage: 0.05
+    minimum_dominant_fraction: 0.50
+
+    publish_every_n_frames: 1
+    tf_timeout_sec: 0.10

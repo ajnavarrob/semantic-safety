@@ -38,7 +38,7 @@ const float minX = 0.40f;
 const float maxX = (float)(JMAX/2) * DS;
 const float minY = 0.20f;
 const float maxY = (float)(IMAX/2) * DS;
-const float minZ_default = 0.05f;
+const float minZ_default = 0.1f;
 const float maxZ_default = 0.80f;
 
 class CloudMergerNode : public rclcpp::Node {

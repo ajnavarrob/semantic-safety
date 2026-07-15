@@ -1,26 +1,9 @@
 {
   "schema_version": "0.2",
-  "constraints": [
-    {
-      "id": "avoid_person_buffer",
-      "type": "exclusion",
-      "enabled": true,
-      "enforce": true,
-      "target": {
-        "semantic_class": [
-          "person"
-        ]
-      },
-      "spatial_parameters": {
-        "buffer_distance_m": 2.0
-      }
-    }
-  ],
+  "constraints": [],
   "metadata": {
     "source": "live_command_demo",
-    "timestamp": "2026-07-08T04:03:37.424102",
-    "instruction": "stay 2 meters away from people",
-    "flat_status": "ok",
-    "action": "add"
+    "timestamp": "2026-07-15T21:28:57.966924",
+    "instruction": "clear"
   }
 }

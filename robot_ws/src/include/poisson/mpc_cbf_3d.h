@@ -491,14 +491,25 @@ public:
 
             // Update body-frame input saturation linearization.
             if (k != N_HORIZON) {
-                constraint_A.block<1, INPUTS>(idu + 0, idu)
-                    << std::cos(yawk), std::sin(yawk), 0.0f;
+                const int idxp1 = (k + 1) * STATES;
 
-                constraint_A.block<1, INPUTS>(idu + 1, idu)
-                    << -std::sin(yawk), std::cos(yawk), 0.0f;
+                const float c = std::cos(yawk);
+                const float s = std::sin(yawk);
 
-                constraint_A.block<1, INPUTS>(idu + 2, idu)
-                    << 0.0f, 0.0f, 1.0f;
+                // Dynamics input map for body-frame velocity commands:
+                // x_{k+1} = x_k + DT * (vx_body cos(theta) - vy_body sin(theta))
+                // y_{k+1} = y_k + DT * (vx_body sin(theta) + vy_body cos(theta))
+                // theta_{k+1} = theta_k + DT * wz
+                constraint_A.block<STATES, INPUTS>(idxp1, idu)
+                    <<
+                    DT * c, -DT * s, 0.0,
+                    DT * s,  DT * c, 0.0,
+                    0.0,     0.0,    DT;
+
+                // Since the optimization variables are now body-frame commands,
+                // input bounds are direct box constraints.
+                constraint_A.block<INPUTS, INPUTS>(idu, idu)
+                    = Eigen::MatrixXd::Identity(INPUTS, INPUTS);
             }
         }
 

@@ -70,7 +70,7 @@ def generate_launch_description():
     
     min_z_arg = DeclareLaunchArgument(
         'min_z',
-        default_value='0.05',
+        default_value='0.1',
         description='Minimum height (Z) for point cloud filtering in occupancy grid'
     )
     
@@ -192,7 +192,7 @@ def generate_launch_description():
     
     robot_mos_obstacle_arg = DeclareLaunchArgument(
         'robot_mos_obstacle',
-        default_value='1.0',
+        default_value='0.1',
         description='Margin of Safety multiplier for obstacle boundary inflation. Smaller = closer to walls'
     )
     
@@ -247,8 +247,38 @@ def generate_launch_description():
     
     enable_data_logging_to_file_arg = DeclareLaunchArgument(
         'enable_data_logging_to_file',
-        default_value='false',
+        default_value='true',
         description='Enable CSV and BIN data logging for experiments'
+    )
+
+    oak_blob_path_arg = DeclareLaunchArgument(
+        'oak_blob_path',
+        default_value=(
+            '/home/unitree/models/'
+            'topformers_openvino_2021.4_6shave.blob'
+        ),
+        description='TopFormer-S ADE20K Myriad-X blob'
+    )
+
+    oak_left_mxid_arg = DeclareLaunchArgument(
+        'oak_left_mxid',
+        default_value='1944301031DDF18B00',
+        description='MXID of the left OAK-1 camera'
+    )
+
+    oak_right_mxid_arg = DeclareLaunchArgument(
+        'oak_right_mxid',
+        default_value='194430101172F18B00',
+        description='MXID of the right OAK-1 camera'
+    )
+
+    active_semantic_classes_arg = DeclareLaunchArgument(
+        'active_semantic_classes',
+        default_value="['person']",
+        description=(
+            'Canonical semantic classes currently converted '
+            'into safety constraints'
+        )
     )
     
     # RealSense camera launch
@@ -411,7 +441,15 @@ def generate_launch_description():
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
             'enable_data_logging_to_file': LaunchConfiguration('enable_data_logging_to_file'),
             "constraints_path": "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json",
-            "constraints_reload_hz": 0.1
+            "constraints_reload_hz": 0.1, 
+            'enable_oak_semantic_observations': True,
+            'enable_legacy_yolo_semantics': True,
+            'semantic_observation_topic': '/semantic_volume/occupied_voxels',
+            'semantic_observation_frame': 'body_link',
+            'semantic_observation_timeout_sec': 1.0,
+            'semantic_observation_min_z': 0.10,
+            'semantic_observation_max_z': 1.50,
+            'active_semantic_classes': ['person'],
         }],
     )
     
@@ -511,7 +549,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='livox_to_body_tf',
         arguments=[
-             '-0.08', '0.0', '0.45',  # x, y, z translation (body relative to livox)
+             '-0.05', '0.0', '0.45',  # x, y, z translation (body relative to livox)
              '0', '3.14159265358979', '0.05',     # roll, pitch, yaw (180° pitch for Y-axis flip)
              'livox_frame', 'body_link'  # parent_frame, child_frame
         ],
@@ -540,18 +578,259 @@ def generate_launch_description():
     
     # Static TF: body_link -> rear RealSense camera
     # Rear camera faces backward, so yaw is approximately pi.
-    # TODO: tune translation/rotation to actual mount
     body_to_rear_camera_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='body_to_rear_camera_tf',
         arguments=[
-            '-0.15', '0.0', '0.20+0.45',
+            '-0.076', '0.0', '0.20+0.45',
             '3.14159265389', '0', '0',
             'body_link', 'camera_rear_link'
         ],
     )
+
+    oak_left_optical_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='oak_left_optical_tf',
+        output='screen',
+        arguments=[
+            '-0.05',
+            '0.05',
+            '0.65',
+
+            # Foxy positional order:
+            # yaw, pitch, roll
+            '0.0',
+            '0.0',
+            '-1.570796',
+
+            'body_link',
+            'oak_left_rgb_camera_optical_frame'
+        ],
+    )
+
+    oak_right_optical_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='oak_right_optical_tf',
+        output='screen',
+        arguments=[
+            '-0.05',       # x: same fore/aft location as left camera
+            '-0.05',       # y: negative means robot-right
+            '0.65',        # z: same height as left camera
+
+            # Foxy positional rotation order:
+            # yaw, pitch, roll
+            '0.0',
+            '0.0',
+            '1.570796',
+
+            'body_link',
+            'oak_right_rgb_camera_optical_frame'
+        ],
+    )
+
+    oak_left_segmentation_node = Node(
+        package='oak_semantic_volume_poc',
+        executable='oak_segmentation_node.py',
+        name='oak_left_segmentation_node',
+        output='screen',
+        parameters=[{
+            'blob_path':
+                LaunchConfiguration('oak_blob_path'),
+            'mxid':
+                LaunchConfiguration('oak_left_mxid'),
+            'camera_frame':
+                'oak_left_rgb_camera_optical_frame',
+            'rgb_topic':
+                '/oak_left/rgb/image_raw',
+            'camera_info_topic':
+                '/oak_left/rgb/camera_info',
+            'class_map_topic':
+                '/oak_left/segmentation/class_map',
+            'overlay_topic':
+                '/oak_left/segmentation/overlay',
+            'preview_width': 512,
+            'preview_height': 512,
+            'fps': 20.0,
+            'output_width': 64,
+            'output_height': 64,
+            'output_layer': '',
+            'class_id_offset': 1,
+            'publish_rgb': True,
+            'publish_overlay': True,
+            'overlay_alpha': 0.45,
+            'queue_size': 4,
+        }],
+    )
+
+    oak_right_segmentation_node = Node(
+        package='oak_semantic_volume_poc',
+        executable='oak_segmentation_node.py',
+        name='oak_right_segmentation_node',
+        output='screen',
+        parameters=[{
+            'blob_path':
+                LaunchConfiguration('oak_blob_path'),
+            'mxid':
+                LaunchConfiguration('oak_right_mxid'),
+            'camera_frame':
+                'oak_right_rgb_camera_optical_frame',
+            'rgb_topic':
+                '/oak_right/rgb/image_raw',
+            'camera_info_topic':
+                '/oak_right/rgb/camera_info',
+            'class_map_topic':
+                '/oak_right/segmentation/class_map',
+            'overlay_topic':
+                '/oak_right/segmentation/overlay',
+            'preview_width': 512,
+            'preview_height': 512,
+            'fps': 20.0,
+            'output_width': 64,
+            'output_height': 64,
+            'output_layer': '',
+            'class_id_offset': 1,
+            'publish_rgb': True,
+            'publish_overlay': True,
+            'overlay_alpha': 0.45,
+            'queue_size': 4,
+        }],
+    )
+
+    semantic_volume_left_node = Node(
+        package='oak_semantic_volume_poc',
+        executable='semantic_volume_node',
+        name='semantic_volume_left',
+        output='screen',
+        parameters=[{
+            'cloud_topic':
+                '/livox/lidar',
+
+            'class_map_topic':
+                '/oak_left/segmentation/class_map',
+
+            'camera_info_topic':
+                '/oak_left/rgb/camera_info',
+
+            'output_topic':
+                '/semantic_volume/occupied_voxels',
+
+            'debug_hits_topic':
+                '/semantic_volume/left/all_first_hits',
+
+            'target_frame':
+                'body_link',
+
+            'camera_frame':
+                'oak_left_rgb_camera_optical_frame',
+
+            'voxel_size_m': 0.10,
+            'min_range_m': 0.35,
+            'max_range_m': 8.0,
+
+            'mask_cell_size_pixels': 2,
+            'minimum_cell_class_fraction': 0.60,
+            'mask_erosion_pixels': 1,
+            'minimum_class_id': 1,
+
+            'minimum_region_cells': 2,
+            'maximum_rays_per_frame': 1500,
+
+            'hit_connectivity_radius_voxels': 1,
+            'minimum_component_hits': 3,
+            'minimum_hit_coverage': 0.05,
+            'minimum_dominant_fraction': 0.50,
+
+            'publish_every_n_frames': 1,
+            'tf_timeout_sec': 0.10,
+
+            'allowed_class_ids': [
+                11,   # cabinet
+                13,   # person
+                15,   # door
+                16,   # table
+                18,   # plant
+                20,   # chair
+                24,   # sofa
+                25,   # shelf
+                34,   # desk
+                51,   # refrigerator
+                54,   # stairs
+                76,   # computer
+                90,   # television
+                131,  # screen
+            ],
+        }],
+    )
     
+    semantic_volume_right_node = Node(
+        package='oak_semantic_volume_poc',
+        executable='semantic_volume_node',
+        name='semantic_volume_right',
+        output='screen',
+        parameters=[{
+            'cloud_topic':
+                '/livox/lidar',
+
+            'class_map_topic':
+                '/oak_right/segmentation/class_map',
+
+            'camera_info_topic':
+                '/oak_right/rgb/camera_info',
+
+            # Shared class-labelled observation topic.
+            'output_topic':
+                '/semantic_volume/occupied_voxels',
+
+            'debug_hits_topic':
+                '/semantic_volume/right/all_first_hits',
+
+            'target_frame':
+                'body_link',
+
+            'camera_frame':
+                'oak_right_rgb_camera_optical_frame',
+
+            'voxel_size_m': 0.10,
+            'min_range_m': 0.35,
+            'max_range_m': 8.0,
+
+            'mask_cell_size_pixels': 2,
+            'minimum_cell_class_fraction': 0.60,
+            'mask_erosion_pixels': 1,
+            'minimum_class_id': 1,
+
+            'minimum_region_cells': 2,
+            'maximum_rays_per_frame': 1500,
+
+            'hit_connectivity_radius_voxels': 1,
+            'minimum_component_hits': 3,
+            'minimum_hit_coverage': 0.05,
+            'minimum_dominant_fraction': 0.50,
+
+            'publish_every_n_frames': 1,
+            'tf_timeout_sec': 0.10,
+
+            'allowed_class_ids': [
+                11,
+                13,
+                15,
+                16,
+                18,
+                20,
+                24,
+                25,
+                34,
+                51,
+                54,
+                76,
+                90,
+                131,
+            ],
+        }],
+    )
     # FAST_LIO Mapping Node (LiDAR-Inertial Odometry)
     # We only enable odometry output, disabling rviz, map, and path publishing
     
@@ -622,6 +901,11 @@ def generate_launch_description():
         yolo_model_arg,
         use_tensorrt_arg,
         point_cloud_density_arg,
+
+        oak_blob_path_arg,
+        oak_left_mxid_arg,
+        oak_right_mxid_arg,
+        
         dh0_human_arg,
         dh0_obstacle_arg,
         min_z_arg,
@@ -664,6 +948,12 @@ def generate_launch_description():
         livox_to_body_tf,
         body_to_utlidar_tf,
         body_to_rear_camera_tf,
+        oak_left_optical_tf,
+        oak_right_optical_tf,
+        oak_left_segmentation_node,
+        oak_right_segmentation_node,
+        semantic_volume_left_node,
+        semantic_volume_right_node,
         fast_lio_node,  # FAST_LIO provides /Odometry from LiDAR-inertial fusion
         odom_publisher_node,  # Subscribes to FAST_LIO /Odometry, publishes /odom and TF
         yolo_front_node,

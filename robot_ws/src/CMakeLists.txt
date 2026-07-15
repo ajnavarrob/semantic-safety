@@ -142,6 +142,7 @@ add_executable(semantic_poisson
 add_executable(odom_publisher src/odom_publisher.cpp)
 add_executable(odom_publisher_t265 src/odom_publisher_t265.cpp)
 add_executable(odom_publisher_fastlio src/odom_publisher_fastlio.cpp)
+add_executable(velocity_tracking_logger src/velocity_tracking_logger.cpp)
 
 # target_link_libraries(poissonLocal Eigen3::Eigen OsqpEigen::OsqpEigen cuda_kernel ${OpenCV_LIBS} ${PCL_LIBRARIES})
 target_link_libraries(teleOp ${CURSES_LIBRARIES})
@@ -161,6 +162,7 @@ ament_target_dependencies(semantic_poisson ${DEPENDENCY_LIST})
 ament_target_dependencies(odom_publisher ${DEPENDENCY_LIST})
 ament_target_dependencies(odom_publisher_t265 ${DEPENDENCY_LIST})
 ament_target_dependencies(odom_publisher_fastlio ${DEPENDENCY_LIST})
+ament_target_dependencies(velocity_tracking_logger ${DEPENDENCY_LIST})
 
 install(TARGETS
         # poissonLocal
@@ -169,6 +171,7 @@ install(TARGETS
         odom_publisher
         odom_publisher_t265
         odom_publisher_fastlio
+        velocity_tracking_logger
         DESTINATION lib/${PROJECT_NAME})
 
 # Install Python scripts
