@@ -1,0 +1,413 @@
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <std_msgs/msg/int32.hpp>
+
+#include <ncurses.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+
+class TeleopNode : public rclcpp::Node
+{
+public:
+    TeleopNode()
+        : Node("teleop_node")
+    {
+        // Velocity limits
+        this->declare_parameter("vel_max_x_fwd", 0.9);
+        this->declare_parameter("vel_max_x_bwd", 0.9);
+        this->declare_parameter("vel_max_y", 0.9);
+        this->declare_parameter("vel_max_yaw", 0.8);
+
+        vel_max_x_fwd_ =
+            static_cast<float>(
+                this->get_parameter("vel_max_x_fwd").as_double());
+
+        vel_max_x_bwd_ =
+            static_cast<float>(
+                this->get_parameter("vel_max_x_bwd").as_double());
+
+        vel_max_y_ =
+            static_cast<float>(
+                this->get_parameter("vel_max_y").as_double());
+
+        vel_max_yaw_ =
+            static_cast<float>(
+                this->get_parameter("vel_max_yaw").as_double());
+
+        // Ethernet watchdog parameters
+        this->declare_parameter("ethernet_interface", "eth0");
+        this->declare_parameter("link_down_debounce", 2);
+        this->declare_parameter("zero_publish_cycles", 50);
+
+        ethernet_interface_ =
+            this->get_parameter("ethernet_interface").as_string();
+
+        link_down_debounce_ =
+            this->get_parameter("link_down_debounce").as_int();
+
+        zero_publish_cycles_ =
+            this->get_parameter("zero_publish_cycles").as_int();
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Velocity bounds: x_fwd=%.2f, x_bwd=%.2f, y=%.2f, yaw=%.2f",
+            vel_max_x_fwd_,
+            vel_max_x_bwd_,
+            vel_max_y_,
+            vel_max_yaw_);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Monitoring Ethernet interface '%s'",
+            ethernet_interface_.c_str());
+
+        twist_puber_ =
+            this->create_publisher<geometry_msgs::msg::Twist>(
+                "u_des",
+                1);
+
+        key_puber_ =
+            this->create_publisher<std_msgs::msg::Int32>(
+                "key_press",
+                1);
+
+        // Teleop command publisher: 100 Hz
+        teleop_timer_ =
+            this->create_wall_timer(
+                std::chrono::milliseconds(10),
+                std::bind(
+                    &TeleopNode::teleop_callback,
+                    this));
+
+        // Ethernet watchdog: 5 Hz
+        ethernet_timer_ =
+            this->create_wall_timer(
+                std::chrono::milliseconds(200),
+                std::bind(
+                    &TeleopNode::ethernet_callback,
+                    this));
+
+        initscr();
+        cbreak();
+        noecho();
+        nodelay(stdscr, TRUE);
+        keypad(stdscr, TRUE);
+
+        printw("Use Arrow Keys to Move, 'q' to quit.\n");
+        printw("Ethernet watchdog monitoring: %s\n",
+               ethernet_interface_.c_str());
+        refresh();
+    }
+
+    ~TeleopNode() override
+    {
+        endwin();
+    }
+
+private:
+    bool ethernet_link_up() const
+    {
+        const std::string carrier_path =
+            "/sys/class/net/" +
+            ethernet_interface_ +
+            "/carrier";
+
+        std::ifstream carrier_file(carrier_path);
+
+        if (!carrier_file.is_open()) {
+            return false;
+        }
+
+        int carrier = 0;
+        carrier_file >> carrier;
+
+        return carrier == 1;
+    }
+
+    void ethernet_callback()
+    {
+        if (safety_triggered_) {
+            return;
+        }
+
+        const bool link_up = ethernet_link_up();
+
+        if (link_up) {
+            if (!link_seen_up_) {
+                link_seen_up_ = true;
+
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Ethernet watchdog ARMED on '%s'",
+                    ethernet_interface_.c_str());
+            }
+
+            link_down_counter_ = 0;
+            return;
+        }
+
+        // Do not trigger immediately at startup. The interface must first
+        // have been observed with carrier=1.
+        if (!link_seen_up_) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                5000,
+                "Waiting for Ethernet carrier on '%s'",
+                ethernet_interface_.c_str());
+
+            return;
+        }
+
+        ++link_down_counter_;
+
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Ethernet carrier DOWN on '%s': %d/%d",
+            ethernet_interface_.c_str(),
+            link_down_counter_,
+            link_down_debounce_);
+
+        if (link_down_counter_ >= link_down_debounce_) {
+            trigger_safety_shutdown();
+        }
+    }
+
+    void trigger_safety_shutdown()
+    {
+        if (safety_triggered_) {
+            return;
+        }
+
+        safety_triggered_ = true;
+
+        // Remember exactly one snapshot of the most recent teleop command.
+        disconnect_vxb_ = vxb_;
+        disconnect_vyb_ = vyb_;
+        disconnect_vyaw_ = vyaw_;
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Ethernet connection lost. Last command was "
+            "vx=%.3f, vy=%.3f, yaw=%.3f",
+            disconnect_vxb_,
+            disconnect_vyb_,
+            disconnect_vyaw_);
+
+        // Latch all commands to zero immediately.
+        vxb_ = 0.0f;
+        vyb_ = 0.0f;
+        vyaw_ = 0.0f;
+        idle_counter_ = 0;
+
+        zero_publish_counter_ = 0;
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Publishing zero velocity before terminating semantic_poisson");
+    }
+
+    void publish_zero_command()
+    {
+        geometry_msgs::msg::Twist zero_msg;
+
+        zero_msg.linear.x = 0.0;
+        zero_msg.linear.y = 0.0;
+        zero_msg.linear.z = 0.0;
+
+        zero_msg.angular.x = 0.0;
+        zero_msg.angular.y = 0.0;
+        zero_msg.angular.z = 0.0;
+
+        twist_puber_->publish(zero_msg);
+    }
+
+    void terminate_semantic_poisson()
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Terminating semantic_poisson");
+
+        // SIGINT first, allowing semantic_poisson to execute its normal
+        // shutdown handlers.
+        int result = std::system(
+            "pkill -INT -f "
+            "'/unitree_ros2_poisson_simple/semantic_poisson'");
+
+        if (result != 0) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "SIGINT command returned status %d; trying broader match",
+                result);
+
+            result = std::system(
+                "pkill -INT -f semantic_poisson");
+        }
+
+        // Check whether it remains after SIGINT.
+        const int still_running =
+            std::system(
+                "pgrep -f "
+                "'/unitree_ros2_poisson_simple/semantic_poisson' "
+                "> /dev/null 2>&1");
+
+        if (still_running == 0) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "semantic_poisson still running; sending SIGTERM");
+
+            std::system(
+                "pkill -TERM -f "
+                "'/unitree_ros2_poisson_simple/semantic_poisson'");
+        }
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "semantic_poisson termination requested; "
+            "shutting down teleop_node");
+
+        shutdown_requested_ = true;
+        rclcpp::shutdown();
+    }
+
+    void teleop_callback()
+    {
+        // Once Ethernet loss is detected, ignore all keyboard commands.
+        if (safety_triggered_) {
+            publish_zero_command();
+
+            ++zero_publish_counter_;
+
+            // Do not publish key_press messages after disconnection.
+            // This prevents adding ERR or previous teleop inputs to the
+            // semantic_poisson logging stream.
+
+            if (
+                zero_publish_counter_ >= zero_publish_cycles_ &&
+                !shutdown_requested_)
+            {
+                terminate_semantic_poisson();
+            }
+
+            return;
+        }
+
+        const int ch = getch();
+
+        switch (ch) {
+            case KEY_UP:
+                vxb_ = vel_max_x_fwd_;
+                break;
+
+            case KEY_DOWN:
+                vxb_ = -vel_max_x_bwd_;
+                break;
+
+            case KEY_LEFT:
+                vyb_ = vel_max_y_;
+                break;
+
+            case KEY_RIGHT:
+                vyb_ = -vel_max_y_;
+                break;
+
+            case ',':
+                vyaw_ = vel_max_yaw_;
+                break;
+
+            case '.':
+                vyaw_ = -vel_max_yaw_;
+                break;
+
+            case 'q':
+                publish_zero_command();
+                rclcpp::shutdown();
+                return;
+
+            case ERR:
+                break;
+
+            default:
+                break;
+        }
+
+        if (ch == ERR) {
+            ++idle_counter_;
+
+            if (idle_counter_ > 20) {
+                vxb_ = 0.0f;
+                vyb_ = 0.0f;
+                vyaw_ = 0.0f;
+            }
+        } else {
+            idle_counter_ = 0;
+        }
+
+        geometry_msgs::msg::Twist twist_msg;
+
+        twist_msg.linear.x = vxb_;
+        twist_msg.linear.y = vyb_;
+        twist_msg.linear.z = 0.0f;
+
+        twist_msg.angular.x = 0.0f;
+        twist_msg.angular.y = 0.0f;
+        twist_msg.angular.z = vyaw_;
+
+        twist_puber_->publish(twist_msg);
+
+        std_msgs::msg::Int32 key_msg;
+        key_msg.data = ch;
+        key_puber_->publish(key_msg);
+    }
+
+    float vxb_ = 0.0f;
+    float vyb_ = 0.0f;
+    float vyaw_ = 0.0f;
+
+    int idle_counter_ = 0;
+
+    // Last command snapshot at Ethernet loss
+    float disconnect_vxb_ = 0.0f;
+    float disconnect_vyb_ = 0.0f;
+    float disconnect_vyaw_ = 0.0f;
+
+    float vel_max_x_fwd_ = 0.9f;
+    float vel_max_x_bwd_ = 0.9f;
+    float vel_max_y_ = 0.9f;
+    float vel_max_yaw_ = 0.8f;
+
+    std::string ethernet_interface_ = "eth0";
+
+    int link_down_debounce_ = 2;
+    int link_down_counter_ = 0;
+
+    int zero_publish_cycles_ = 50;
+    int zero_publish_counter_ = 0;
+
+    bool link_seen_up_ = false;
+    bool safety_triggered_ = false;
+    bool shutdown_requested_ = false;
+
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr key_puber_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_puber_;
+
+    rclcpp::TimerBase::SharedPtr teleop_timer_;
+    rclcpp::TimerBase::SharedPtr ethernet_timer_;
+};
+
+int main(int argc, char *argv[])
+{
+    rclcpp::init(argc, argv);
+
+    auto node = std::make_shared<TeleopNode>();
+    rclcpp::spin(node);
+
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
+
+    return 0;
+}

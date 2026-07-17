@@ -186,13 +186,13 @@ def generate_launch_description():
     
     robot_mos_human_arg = DeclareLaunchArgument(
         'robot_mos_human',
-        default_value='1.0', #'1.5',
+        default_value='0.5', #'1.5',
         description='Margin of Safety multiplier for human boundary inflation. Larger = more buffer around humans'
     )
     
     robot_mos_obstacle_arg = DeclareLaunchArgument(
         'robot_mos_obstacle',
-        default_value='1.0',
+        default_value='0.5',
         description='Margin of Safety multiplier for obstacle boundary inflation. Smaller = closer to walls'
     )
     
@@ -247,7 +247,7 @@ def generate_launch_description():
     
     enable_data_logging_to_file_arg = DeclareLaunchArgument(
         'enable_data_logging_to_file',
-        default_value='false',
+        default_value='true',
         description='Enable CSV and BIN data logging for experiments'
     )
     

@@ -20,6 +20,10 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Int32
 import threading
+import os
+import signal
+import subprocess
+import time
 import inputs
 
 
@@ -63,16 +67,47 @@ class TeleopControllerNode(Node):
             'LB': 0, 'RB': 0,
             'DU': 0, 'DD': 0, 'DL': 0, 'DR': 0
         }
-        
+
+        # --- Ethernet link-loss safety watchdog ---------------------------
+        # If the monitored ethernet interface drops, the robot must not keep
+        # running on the last commanded velocity ("going rogue"). Instead we
+        # smoothly decay u_des to 0, then tell semantic_poisson to stop and
+        # shut down. ROS/DDS traffic between these co-located nodes goes over
+        # loopback, so it is unaffected by the external NIC dropping.
+        self.eth_interface = 'eth0'      # SSH Ethernet interface on the Jetson
+        self.link_poll_hz = 5.0          # link state poll rate
+        self.link_down_debounce = 2      # 2 polls at 5 Hz = about 0.4 s
+        self.zero_publish_cycles = 50   # publish zero for 0.5 s before termination
+        self.semantic_process_pattern = 'semantic_poisson'
+
+        # Safety state machine: 'active' -> 'zeroing' -> 'terminating' -> 'done'
+        self.safety_state = 'active'
+        self.link_lost = False
+        self._link_seen_up = False       # only arm after link has been up once
+        self._zero_publish_count = 0
+        self._semantic_kill_sent = False
+        # Snapshot of the single most recent command at disconnect time.
+        self.disconnect_command = None
+        # Last published velocity command. No command history is retained.
+        self.last_vx = 0.0
+        self.last_vy = 0.0
+        self.last_vyaw = 0.0
+
         # Timer for publishing at constant rate (matches C++ 100Hz)
         self.timer = self.create_timer(1.0 / publish_rate, self.publish_callback)
-        
+
         # Start controller input thread
         self.running = True
         self.input_thread = threading.Thread(target=self.read_controller, daemon=True)
         self.input_thread.start()
-        
-        self.get_logger().info('Xbox controller teleop started. Waiting for controller...')
+
+        # Start ethernet link-loss watchdog thread
+        self.eth_monitor_thread = threading.Thread(target=self.monitor_ethernet, daemon=True)
+        self.eth_monitor_thread.start()
+
+        self.get_logger().info(
+            f'Xbox controller teleop started. Monitoring ethernet link on '
+            f"'{self.eth_interface}'. Waiting for controller...")
     
     def normalize_axis(self, value: int, max_val: int = 32768) -> float:
         """Normalize axis value to -1 to 1 range with deadzone."""
@@ -182,26 +217,243 @@ class TeleopControllerNode(Node):
         msg = Int32()
         msg.data = key_code
         self.key_pub.publish(msg)
-    
+
+    def _eth_link_up(self) -> bool:
+        """Return True when the monitored Ethernet interface has carrier."""
+        carrier_path = f'/sys/class/net/{self.eth_interface}/carrier'
+        try:
+            with open(carrier_path, 'r', encoding='utf-8') as file:
+                return file.read().strip() == '1'
+        except OSError as exc:
+            self.get_logger().error(
+                f"Cannot read Ethernet carrier from {carrier_path}: {exc}"
+            )
+            return False
+
+    def monitor_ethernet(self):
+        """Trip the watchdog after the previously-up Ethernet link drops."""
+        period = 1.0 / self.link_poll_hz
+        down_count = 0
+        previous_link_up = None
+
+        self.get_logger().warn(
+            f"Ethernet watchdog thread started on '{self.eth_interface}'"
+        )
+
+        while self.running:
+            link_up = self._eth_link_up()
+
+            if link_up != previous_link_up:
+                self.get_logger().warn(
+                    f"Ethernet carrier changed: interface={self.eth_interface}, "
+                    f"carrier={'UP' if link_up else 'DOWN'}, "
+                    f"armed={self._link_seen_up}"
+                )
+                previous_link_up = link_up
+
+            if link_up:
+                if not self._link_seen_up:
+                    self.get_logger().warn(
+                        f"Ethernet watchdog ARMED on '{self.eth_interface}'"
+                    )
+                self._link_seen_up = True
+                down_count = 0
+            else:
+                down_count += 1
+                if (
+                    self._link_seen_up
+                    and not self.link_lost
+                    and down_count >= self.link_down_debounce
+                ):
+                    with self.lock:
+                        self.link_lost = True
+                    self.get_logger().error(
+                        f"Ethernet link '{self.eth_interface}' lost after "
+                        f"{down_count} consecutive checks. Safety shutdown triggered."
+                    )
+
+            time.sleep(period)
+
+    def _find_semantic_pids(self):
+        """Return semantic_poisson process IDs, excluding this teleop process."""
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', self.semantic_process_pattern],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 1:
+                return []
+            if result.returncode != 0:
+                self.get_logger().error(
+                    f'pgrep failed with code {result.returncode}: '
+                    f'{result.stderr.strip()}'
+                )
+                return []
+
+            own_pid = os.getpid()
+            return [
+                int(value) for value in result.stdout.split()
+                if value.isdigit() and int(value) != own_pid
+            ]
+        except Exception as exc:
+            self.get_logger().error(f'Failed to locate semantic_poisson: {exc}')
+            return []
+
+    @staticmethod
+    def _pid_alive(pid):
+        """Return True while a process exists, including during signal handling."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _signal_and_wait(self, pids, sig, timeout_sec):
+        """Signal all supplied PIDs and wait up to timeout_sec for exit."""
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                self.get_logger().error(
+                    f'Permission denied signaling semantic_poisson PID {pid}: {exc}'
+                )
+
+        deadline = time.monotonic() + timeout_sec
+        remaining = list(pids)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.05)
+            remaining = [pid for pid in remaining if self._pid_alive(pid)]
+        return remaining
+
+    def _terminate_semantic_poisson(self):
+        """Synchronously stop semantic_poisson before teleop exits.
+
+        SIGINT permits ROS cleanup, SIGTERM handles a stuck executor, and
+        SIGKILL is the final safety fallback. The function verifies process
+        exit after every stage rather than launching a daemon fallback thread.
+        """
+        if self._semantic_kill_sent:
+            return
+        self._semantic_kill_sent = True
+
+        pids = self._find_semantic_pids()
+        if not pids:
+            self.get_logger().error(
+                f'No process matched pattern {self.semantic_process_pattern!r}. '
+                'Check the executable command with: pgrep -af semantic_poisson'
+            )
+            return
+
+        self.get_logger().error(f'Terminating semantic_poisson PID(s): {pids}')
+
+        remaining = self._signal_and_wait(pids, signal.SIGINT, 0.75)
+        if remaining:
+            self.get_logger().warn(
+                f'PID(s) {remaining} ignored SIGINT; sending SIGTERM'
+            )
+            remaining = self._signal_and_wait(remaining, signal.SIGTERM, 0.50)
+
+        if remaining:
+            self.get_logger().error(
+                f'PID(s) {remaining} ignored SIGTERM; sending SIGKILL'
+            )
+            remaining = self._signal_and_wait(remaining, signal.SIGKILL, 0.25)
+
+        if remaining:
+            self.get_logger().error(
+                f'Unable to terminate semantic_poisson PID(s): {remaining}'
+            )
+        else:
+            self.get_logger().error('semantic_poisson process terminated.')
+
+    def _safety_publish(self):
+        """Latch zero velocity after Ethernet loss and terminate both nodes.
+
+        The command present at disconnect is captured exactly once in
+        ``disconnect_command``. No decayed/intermediate teleop commands are
+        generated or replayed.
+        """
+        zero_twist = Twist()
+
+        if self.safety_state == 'active':
+            self.disconnect_command = (
+                self.last_vx,
+                self.last_vy,
+                self.last_vyaw,
+            )
+            self.pending_key = 0
+            self.axis_lx = 0.0
+            self.axis_ly = 0.0
+            self.axis_rx = 0.0
+            self.axis_ry = 0.0
+            self.safety_state = 'zeroing'
+            self.get_logger().error(
+                'Ethernet lost. Latched latest command '
+                f'{self.disconnect_command}; commanding zero immediately.'
+            )
+
+        if self.safety_state == 'zeroing':
+            self.last_vx = 0.0
+            self.last_vy = 0.0
+            self.last_vyaw = 0.0
+            self.twist_pub.publish(zero_twist)
+            self._zero_publish_count += 1
+
+            if self._zero_publish_count >= self.zero_publish_cycles:
+                self.safety_state = 'terminating'
+            return
+
+        if self.safety_state == 'terminating':
+            self.twist_pub.publish(zero_twist)
+            self._terminate_semantic_poisson()
+            self.safety_state = 'done'
+            self.running = False
+            self.get_logger().error(
+                'semantic_poisson termination requested; shutting down teleop.'
+            )
+            if rclpy.ok():
+                rclpy.shutdown()
+            return
+
+        # Keep the command latched at zero if shutdown takes another callback.
+        self.twist_pub.publish(zero_twist)
+
     def publish_callback(self):
         """Timer callback to publish velocity commands and key_press (for timing)."""
         with self.lock:
+            # Link-loss safety override: ignore controller input, latch zero,
+            # terminate semantic_poisson, and shut down this teleop node.
+            if self.link_lost:
+                self._safety_publish()
+                return
+
             twist = Twist()
-            
+
             # Left stick Y -> forward/backward
             if self.axis_ly > 0:
                 twist.linear.x = self.axis_ly * self.vel_max_x_fwd
             else:
                 twist.linear.x = self.axis_ly * self.vel_max_x_bwd
-            
+
             # Left stick X -> strafe
             twist.linear.y = self.axis_lx * self.vel_max_y
-            
+
             # Right stick X -> rotation
             twist.angular.z = self.axis_rx * self.vel_max_yaw
-            
+
+            # Remember only the latest command for the disconnect snapshot
+            self.last_vx = twist.linear.x
+            self.last_vy = twist.linear.y
+            self.last_vyaw = twist.angular.z
+
             self.twist_pub.publish(twist)
-            
+
             # Throttle print to 10Hz (every 10th callback) to avoid I/O blocking lag
             if not hasattr(self, '_print_counter'):
                 self._print_counter = 0
@@ -234,11 +486,11 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    #finally:
-        #node.running = False
-        #node.destroy_node()
-        #if rclpy.ok():
-            #rclpy.shutdown()
+    finally:
+        node.running = False
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

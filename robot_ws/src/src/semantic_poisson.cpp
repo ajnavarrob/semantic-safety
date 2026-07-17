@@ -192,6 +192,7 @@ public:
 
         if (outFileCSV.is_open()) outFileCSV.close();
         if (outFileBIN.is_open()) outFileBIN.close();
+        if (outFileMPCVel.is_open()) outFileMPCVel.close();
     }
 
 private:
@@ -301,6 +302,7 @@ private:
 
         apply_parameter_deck_selection(param, ch);
         maybe_write_experiment_data();
+        maybe_write_mpc_command_velocities();
     }
 
     void handle_occupancy_update(const nav_msgs::msg::OccupancyGrid& msg) {
@@ -1236,6 +1238,23 @@ private:
         }
     }
 
+    void maybe_write_mpc_command_velocities() {
+        if (!(save_flag && enable_data_logging_to_file_)) return;
+        if (!outFileMPCVel.is_open()) return;
+        const std::vector<float> vel_data = {
+            t_ms,
+            static_cast<float>(space_counter),
+            vd[0], vd[1], vd[2],
+            v[0],  v[1],  v[2],
+            vb[0], vb[1], vb[2]
+        };
+        for (size_t n = 0; n < vel_data.size(); ++n) {
+            outFileMPCVel << vel_data[n];
+            if (n + 1 < vel_data.size()) outFileMPCVel << ",";
+        }
+        outFileMPCVel << std::endl;
+    }
+
     void maybe_write_experiment_data() {
         if (!(save_flag && enable_data_logging_to_file_)) return;
         const std::vector<float> save_data = {
@@ -1882,6 +1901,33 @@ private:
         }
     
         RCLCPP_INFO(this->get_logger(), "Data logging ENABLED: %s", fileNameCSV.c_str());
+
+        // Dedicated command-velocity log for the MPC solver:
+        //   vd  = raw MPC solver output   (mpc3d_controller.set_input)
+        //   v   = safe control after the realtime filter
+        //   vb  = final command sent to the robot (sport_req.Move)
+        std::string fileNameMPCVel = baseFileName + "_mpc_cmd_vel_" + dateTime + ".csv";
+        outFileMPCVel.open(fileNameMPCVel);
+        if (!outFileMPCVel.is_open()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open MPC command-velocity log file: %s",
+                         fileNameMPCVel.c_str());
+            throw std::runtime_error("Failed to open MPC command-velocity log file");
+        }
+
+        const std::vector<std::string> mpc_vel_header = {
+            "t_ms", "space_counter",
+            "vd_x", "vd_y", "vd_yaw",
+            "v_x", "v_y", "v_yaw",
+            "vb_x", "vb_y", "vb_yaw"
+        };
+        for (size_t n = 0; n < mpc_vel_header.size(); ++n) {
+            outFileMPCVel << mpc_vel_header[n];
+            if (n + 1 < mpc_vel_header.size()) outFileMPCVel << ",";
+        }
+        outFileMPCVel << std::endl;
+
+        RCLCPP_INFO(this->get_logger(), "MPC command-velocity logging ENABLED: %s",
+                    fileNameMPCVel.c_str());
     }
     
     void declare_and_load_parameters() {
@@ -2389,8 +2435,8 @@ private:
         robot_length = 0.7f;
         robot_width = 0.3f;
     
-        const float ar = mos * robot_length / 2.0f;
-        const float br = mos * robot_width / 2.0f;
+        const float ar = robot_length / 2.0f + mos;
+        const float br = robot_width / 2.0f + mos;
         const float D = 2.0f * std::sqrt(ar * ar + br * br);
     
         int dim = 2 * static_cast<int>(std::ceil(std::ceil(D / DS) / 2.0f));
@@ -3259,6 +3305,7 @@ private:
     SportClient sport_req;
     std::ofstream outFileCSV;
     std::ofstream outFileBIN;
+    std::ofstream outFileMPCVel;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr poisson_image_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_data_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr profiling_data_pub_;
