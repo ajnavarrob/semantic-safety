@@ -49,6 +49,24 @@ def generate_launch_description():
         default_value='true' if IS_JETSON else 'false',
         description='Use TensorRT for YOLO inference (auto-enabled on Jetson)'
     )
+
+    enable_rule_based_yolo_gating_arg = DeclareLaunchArgument(
+        'enable_rule_based_yolo_gating',
+        default_value='true',
+        description='Enable YOLO only when semantic_poisson reports an active semantic rule'
+    )
+
+    yolo_process_every_n_frames_arg = DeclareLaunchArgument(
+        'yolo_process_every_n_frames',
+        default_value='3',
+        description='Run YOLO inference once every N received camera images'
+    )
+
+    semantic_perception_enable_topic_arg = DeclareLaunchArgument(
+        'semantic_perception_enable_topic',
+        default_value='/semantic_perception_required',
+        description='Boolean topic used to enable or disable YOLO inference'
+    )
     
     point_cloud_density_arg = DeclareLaunchArgument(
         'point_cloud_density',
@@ -338,6 +356,11 @@ def generate_launch_description():
             'segmentation_mask_topic': '/yolo_front/segmentation_mask',
             'annotated_image_topic': '/yolo_front/annotated_image',
             'human_centroid_topic': '/human_tracking/front_centroid',
+
+            'enable_rule_based_gating': LaunchConfiguration('enable_rule_based_yolo_gating'),
+            'semantic_enable_topic': LaunchConfiguration('semantic_perception_enable_topic'),
+            'process_every_n_frames': LaunchConfiguration('yolo_process_every_n_frames'),
+            'inference_enabled_at_startup': False,
         }],
     )
 
@@ -364,6 +387,11 @@ def generate_launch_description():
             'segmentation_mask_topic': '/yolo_rear/segmentation_mask',
             'annotated_image_topic': '/yolo_rear/annotated_image',
             'human_centroid_topic': '/human_tracking/rear_centroid',
+
+            'enable_rule_based_gating': LaunchConfiguration('enable_rule_based_yolo_gating'),
+            'semantic_enable_topic': LaunchConfiguration('semantic_perception_enable_topic'),
+            'process_every_n_frames': LaunchConfiguration('yolo_process_every_n_frames'),
+            'inference_enabled_at_startup': False,
         }],
     )
     
@@ -376,7 +404,7 @@ def generate_launch_description():
         parameters=[{
             'dh0_human': LaunchConfiguration('dh0_human'),
             'dh0_obstacle': LaunchConfiguration('dh0_obstacle'),
-            'enable_display': True,  # Show OpenCV visualization
+            'enable_display': False,  # Show OpenCV visualization
             'min_z': LaunchConfiguration('min_z'),  # Forwarded to CloudMergerNode
             'max_z': LaunchConfiguration('max_z'),  # Forwarded to CloudMergerNode
             # Tight-area wall softening
@@ -501,27 +529,45 @@ def generate_launch_description():
             'body', 'livox_frame'
         ],
     )
+
+    # body_to_body_link_tf = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     name='body_to_body_link_tf',
+    #     arguments=[
+    #         '0', '0', '0',
+    #         '0', '0', '0',
+    #         'body', 'body_link'
+    #     ],
+    # )
     
     # Static TF: livox_frame -> body_link
     # From cloud_merger.h: lidar is at (0.05, 0, -0.18) from body, with 180° flip
     # So body is at (-0.05, 0, 0.18) from lidar in lidar coords, then apply inverse rotation
     # R_flip = diag(-1, 1, -1) means 180° rotation around Y axis
+    # body_link_to_livox_tf = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     name='body_link_to_livox_tf',
+    #     arguments=[
+    #         '-0.0254', '0.0', '0.33',
+    #         '0', '3.14159265358979', '0.05',
+    #         'body_link', 'livox_frame'
+    #     ],
+    # )
+
     livox_to_body_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='livox_to_body_tf',
         arguments=[
-             '-0.08', '0.0', '0.45',  # x, y, z translation (body relative to livox)
-             '0', '3.14159265358979', '0.05',     # roll, pitch, yaw (180° pitch for Y-axis flip)
-             'livox_frame', 'body_link'  # parent_frame, child_frame
+            '-0.0254', '0.0', '0.33',
+            '0', '3.14159265358979', '0.05',
+            'livox_frame', 'body_link'
         ],
-
-        # arguments=[
-        #     '-0.05', '0.0', '0.18',  # x, y, z translation (body relative to livox)
-        #     '0', '3.14159', '0',     # roll, pitch, yaw (180° pitch for Y-axis flip)
-        #     'livox_frame', 'body_link'  # parent_frame, child_frame
-        # ],
     )
+
+
     
     # Static TF: body_link -> utlidar_link (front UTLidar on Go2)
     # The Go2 front lidar is approximately 37cm forward from body center
@@ -546,7 +592,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='body_to_rear_camera_tf',
         arguments=[
-            '-0.15', '0.0', '0.20+0.45',
+            '-0.1', '0.0', '0.30',
             '3.14159265389', '0', '0',
             'body_link', 'camera_rear_link'
         ],
@@ -621,6 +667,9 @@ def generate_launch_description():
         camera_fps_arg,
         yolo_model_arg,
         use_tensorrt_arg,
+        enable_rule_based_yolo_gating_arg,
+        yolo_process_every_n_frames_arg,
+        semantic_perception_enable_topic_arg,
         point_cloud_density_arg,
         dh0_human_arg,
         dh0_obstacle_arg,
@@ -672,3 +721,4 @@ def generate_launch_description():
         human_tracking_node,  # Provides odom -> camera_link TF
         semantic_poisson_node,  # Start last - needs TF from odom_publisher and human_tracking
     ])
+    

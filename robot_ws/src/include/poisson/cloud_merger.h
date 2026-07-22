@@ -39,7 +39,7 @@ const float maxX = (float)(JMAX/2) * DS;
 const float minY = 0.20f;
 const float maxY = (float)(IMAX/2) * DS;
 const float minZ_default = 0.05f;
-const float maxZ_default = 0.80f;
+const float maxZ_default = 1.50f;
 
 class CloudMergerNode : public rclcpp::Node {
 
@@ -131,7 +131,7 @@ public:
         combined_cloud_.reset(new pcl::PointCloud<pcl::PointXYZI>());
 
         occupancy_publish_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(100),
+            std::chrono::milliseconds(67),
             std::bind(&CloudMergerNode::publish_occupancy_from_combined_cloud, this)
         );
     }

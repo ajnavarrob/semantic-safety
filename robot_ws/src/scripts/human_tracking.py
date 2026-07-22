@@ -276,7 +276,7 @@ class HumanTrackingNode(Node):
         # Testing: X is forward, Y is left, Z is up
         self.camera_offset_x = 0.35 # 35 cm forward (X-axis)
         self.camera_offset_y = 0.0 # centered (Y-axis)
-        self.camera_offset_z = 0.20  # 20 cm above
+        self.camera_offset_z = 0.2  # 20 cm above
         
         # Create 100 Hz control timer for smooth gimbal control
         control_rate = 100  # Hz

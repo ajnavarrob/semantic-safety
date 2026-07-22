@@ -35,6 +35,7 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "std_msgs/msg/int32.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "unitree_api/msg/request.hpp"
@@ -158,6 +159,7 @@ public:
         initialize_robot_kernels();
         initialize_mpc();
         initialize_ros_interfaces();
+        publish_semantic_perception_required(true);
         startup_robot();
 
         initialize_constraint_reload_timer();
@@ -1544,6 +1546,90 @@ private:
         );
     }
 
+    static std::string normalized_semantic_class(std::string value) {
+        std::transform(
+            value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
+        );
+        std::replace(value.begin(), value.end(), '-', '_');
+        std::replace(value.begin(), value.end(), ' ', '_');
+        return value;
+    }
+
+    bool class_requires_yolo(const std::string& raw_class) const {
+        const std::string cls = normalized_semantic_class(raw_class);
+
+        // Keep this list centralized. Add aliases here when the rule compiler
+        // introduces another YOLO-backed semantic class.
+        static const std::set<std::string> yolo_classes = {
+            "person", "human", "people",
+            "object", "obstacle",
+            "traffic_cone", "cone",
+            "caution_tape", "tape",
+            "spill", "spills"
+        };
+
+        return yolo_classes.count(cls) > 0;
+    }
+
+    template <typename ConstraintT>
+    bool constraint_requires_yolo(const ConstraintT& rc) const {
+        if (!rc.enabled || !rc.enforce) {
+            return false;
+        }
+
+        for (const auto& target : rc.target_classes) {
+            if (class_requires_yolo(target)) {
+                return true;
+            }
+        }
+
+        for (const auto& reference : rc.reference_classes) {
+            if (class_requires_yolo(reference)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool any_active_constraint_requires_yolo() const {
+        for (const auto& rc : constraint_runtime_config_.constraints) {
+            if (constraint_requires_yolo(rc)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void publish_semantic_perception_required(bool force_publish = false) {
+        if (!semantic_perception_required_pub_) {
+            return;
+        }
+
+        const bool required = any_active_constraint_requires_yolo();
+        if (!force_publish &&
+            semantic_perception_state_initialized_ &&
+            required == semantic_perception_required_) {
+            return;
+        }
+
+        semantic_perception_required_ = required;
+        semantic_perception_state_initialized_ = true;
+
+        std_msgs::msg::Bool msg;
+        msg.data = required;
+        semantic_perception_required_pub_->publish(msg);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Semantic perception %s: %s",
+            required ? "ENABLED" : "DISABLED",
+            required ? "an active enforced rule references a YOLO semantic class"
+                     : "no active enforced rule references a YOLO semantic class"
+        );
+    }
+
     void initialize_constraint_reload_timer() {
 
         if (constraints_path_.empty()) {
@@ -1630,6 +1716,7 @@ private:
         apply_runtime_constraint_config(fresh_config, true);
 
         constraint_runtime_config_ = fresh_config;
+        publish_semantic_perception_required();
     }
 
     void update_semantic_update_state() {
@@ -1934,8 +2021,8 @@ private:
         // ------------------------------------------------------------
         // Logging / visualization
         // ------------------------------------------------------------
-        this->declare_parameter("enable_data_logging_to_file", true);
-        this->declare_parameter("enable_display", true);
+        this->declare_parameter("enable_data_logging_to_file", false);
+        this->declare_parameter("enable_display", false);
         this->declare_parameter("logging_publish_hz", 10.0);
         this->declare_parameter("constraints_path", "");
         this->declare_parameter("enable_human_persistence", true);
@@ -2231,6 +2318,15 @@ private:
         );
 
         semantic_occupancy_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("semantic_occupancy_grid",1);
+
+        const auto semantic_control_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+            .reliable()
+            .transient_local();
+        semantic_perception_required_pub_ =
+            this->create_publisher<std_msgs::msg::Bool>(
+                "/semantic_perception_required",
+                semantic_control_qos
+            );
             
         occ_grid_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
             "occupancy_grid", 1,
@@ -3240,6 +3336,10 @@ private:
     ConstraintManager constraint_manager_;
     ConstraintRuntimeConfig constraint_runtime_config_;
     std::string constraints_path_;
+
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr semantic_perception_required_pub_;
+    bool semantic_perception_required_{false};
+    bool semantic_perception_state_initialized_{false};
 
     rclcpp::TimerBase::SharedPtr constraints_reload_timer_;
     rclcpp::CallbackGroup::SharedPtr constraints_reload_callback_group_;

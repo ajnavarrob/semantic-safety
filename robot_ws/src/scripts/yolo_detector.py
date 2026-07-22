@@ -11,11 +11,12 @@ import ctypes
 import os
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Point, TransformStamped
+from std_msgs.msg import Bool
 # Removed: unitree_go.msg.SportModeState - now using TF for robot pose
 import cv2
 from cv_bridge import CvBridge
@@ -34,6 +35,12 @@ class YOLODetectorNode(Node):
         self.declare_parameter('model_path', 'yolo11n-seg.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('use_tensorrt', False)
+
+        # YOLO workload controls
+        self.declare_parameter('enable_rule_based_gating', True)
+        self.declare_parameter('semantic_enable_topic', '/semantic_perception_required')
+        self.declare_parameter('process_every_n_frames', 3)
+        self.declare_parameter('inference_enabled_at_startup', False)
 
         self.declare_parameter('image_topic', '/camera_front/image_rect_color')
         self.declare_parameter('pointcloud_topic', '/camera_front/point_cloud/cloud_registered')
@@ -191,13 +198,84 @@ class YOLODetectorNode(Node):
             f'YOLO Detector initialized\n'
             f'Image topic: {self.image_topic}\n'
             f'Pointcloud topic: {self.pointcloud_topic}\n'
-            f'Logging rate: {self.logging_publish_hz} Hz'
+            f'Rule gating: {self.enable_rule_based_gating}\n'
+            f'Enable topic: {self.semantic_enable_topic}\n'
+            f'Inference initially enabled: {self.inference_enabled}\n'
+            f'Process every N frames: {self.process_every_n_frames}\n'
+            f'Logging rate: {self.logging_publish_hz} Hz\n'
             f'Segmentation topic: {self.segmentation_mask_topic}\n'
             f'Annotated topic: {self.annotated_image_topic}\n'
             f'Class map topic: {self.class_map_topic}\n'
             f'Visibility map topic: {self.visibility_map_topic}\n'
             f'Human centroid topic: {self.human_centroid_topic}\n'
         )
+
+    def semantic_enable_callback(self, msg):
+        """Enable/disable inference from the current semantic-rule state."""
+        requested_state = bool(msg.data)
+        if requested_state == self.inference_enabled:
+            return
+
+        self.inference_enabled = requested_state
+        self.frame_counter = 0
+
+        if self.inference_enabled:
+            self.get_logger().info(
+                'YOLO inference ENABLED; the next camera image will be processed'
+            )
+        else:
+            self.get_logger().info(
+                'YOLO inference DISABLED; clearing YOLO-derived map outputs'
+            )
+            self.publish_empty_semantic_outputs()
+
+    def publish_empty_semantic_outputs(self):
+        """Invalidate cached YOLO-derived outputs after inference is disabled."""
+        if self.last_image_header is None:
+            return
+
+        class_map = OccupancyGrid()
+        class_map.header = self.last_image_header
+        class_map.header.stamp = self.get_clock().now().to_msg()
+        class_map.header.frame_id = 'body_link'
+        class_map.info.resolution = self.grid_ds
+        class_map.info.width = self.grid_jmax
+        class_map.info.height = self.grid_imax
+        class_map.data = [0] * (self.grid_imax * self.grid_jmax)
+        self.class_map_pub.publish(class_map)
+
+        visibility_map = OccupancyGrid()
+        visibility_map.header = class_map.header
+        visibility_map.info = class_map.info
+        visibility_map.data = [0] * (self.grid_imax * self.grid_jmax)
+        self.visibility_map_pub.publish(visibility_map)
+
+        if self.last_image_shape is not None:
+            height, width = self.last_image_shape
+            empty_mask = np.zeros((height, width), dtype=np.uint8)
+            mask_msg = self.bridge.cv2_to_imgmsg(empty_mask, encoding='mono8')
+            mask_msg.header = class_map.header
+            self.seg_mask_pub.publish(mask_msg)
+
+    def should_process_image(self, msg):
+        """Return True only for enabled frames selected by the configured stride."""
+        self.received_image_count += 1
+        self.last_image_header = msg.header
+        self.last_image_shape = (msg.height, msg.width)
+
+        if self.enable_rule_based_gating and not self.inference_enabled:
+            self.skipped_disabled_count += 1
+            return False
+
+        current_index = self.frame_counter
+        self.frame_counter += 1
+
+        if current_index % self.process_every_n_frames != 0:
+            self.skipped_stride_count += 1
+            return False
+
+        self.inference_count += 1
+        return True
 
     def pointcloud_callback(self, msg):
         """Store latest organized pointcloud for synchronization with image."""
@@ -284,6 +362,10 @@ class YOLODetectorNode(Node):
     
     def image_callback(self, msg):
         try:
+            # Gate before image conversion, TF lookup, GPU inference, and projection.
+            if not self.should_process_image(msg):
+                return
+
             t_total = time.perf_counter()
             # Update robot pose from TF
             self.update_pose_from_tf()  # Non-blocking, uses last known if fails
@@ -610,7 +692,13 @@ class YOLODetectorNode(Node):
                 f'YOLO timing | total={t_total_ms:.1f} ms '
                 f'cv={t_cv_ms:.1f} ms '
                 f'infer={t_infer_ms:.1f} ms '
-                f'projection={t_projection_ms:.1f} ms',
+                f'projection={t_projection_ms:.1f} ms | '
+                f'enabled={self.inference_enabled} '
+                f'stride={self.process_every_n_frames} '
+                f'received={self.received_image_count} '
+                f'inferred={self.inference_count} '
+                f'skipped_disabled={self.skipped_disabled_count} '
+                f'skipped_stride={self.skipped_stride_count}',
                 throttle_duration_sec=1.0
             )
             

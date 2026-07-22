@@ -2,8 +2,8 @@
   "schema_version": "0.2",
   "constraints": [],
   "metadata": {
-    "source": "live_command_demo",
-    "timestamp": "2026-07-17T23:18:09.136429",
+    "source": "live_command_demo_external_jetson_orin",
+    "timestamp": "2026-07-17T19:33:56.447536",
     "instruction": "clear"
   }
 }
