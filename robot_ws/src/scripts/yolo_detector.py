@@ -1,127 +1,292 @@
 #!/usr/bin/env python3
 """
-YOLO Detection Node
-Subscribes to ZED camera images, runs YOLO detection, and publishes segmentation masks.
+YOLO semantic-observation node for the Unitree Go2.
+
+Responsibilities
+----------------
+1. Subscribe to a rectified RGB image and its organized registered point cloud.
+2. Run the six-class YOLO segmentation model.
+3. Preserve every semantic class independently.
+4. Project each class mask into a robot-centered 2-D OccupancyGrid.
+5. Publish one raw observation grid per semantic class.
+
+This node deliberately does NOT apply language-rule buffers, temporal semantic
+persistence, homotopy insertion, or semantic-layer union. Those operations
+belong in the semantic map fuser/synthesis stage.
 """
 
-# IMPORTANT: Preload libgomp before importing torch/ultralytics to fix TLS error
-import ctypes
-#ctypes.CDLL('/home/unitree/miniconda3/envs/semantic-safety/lib/libgomp.so.1.0.0', mode=ctypes.RTLD_GLOBAL)
-# ctypes.CDLL('/home/unitree/.local/lib/python3.8/site-packages/torch.libs/libgomp-804f19d4.so.1.0.0', mode=ctypes.RTLD_GLOBAL)
+from __future__ import annotations
+
 import os
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2
-from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import Point, TransformStamped
-from std_msgs.msg import Bool
-# Removed: unitree_go.msg.SportModeState - now using TF for robot pose
-import cv2
-from cv_bridge import CvBridge
-import numpy as np
-from ultralytics import YOLO
-import tf2_ros
-from tf2_ros import TransformException
 import time
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import rclpy
+import tf2_ros
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image, PointCloud2
+from std_msgs.msg import Bool
+from tf2_ros import TransformException
+from ultralytics import YOLO
+
+
+# YOLO model class IDs are part of the perception/control interface.
+# Do not reorder these without updating the dataset and downstream consumers.
+SEMANTIC_CLASSES: Dict[int, str] = {
+    0: "human",
+    1: "traffic_cone",
+    2: "caution_tape",
+    3: "floor_danger_tape",
+    4: "wet_floor_sign",
+    5: "spill",
+}
+
+# Display colors only, in BGR order.
+CLASS_COLORS: Dict[int, Tuple[int, int, int]] = {
+    0: (0, 0, 255),
+    1: (0, 165, 255),
+    2: (255, 255, 0),
+    3: (255, 0, 255),
+    4: (0, 255, 255),
+    5: (255, 0, 0),
+}
 
 
 class YOLODetectorNode(Node):
-    def __init__(self):
-        super().__init__('yolo_detector')
-        
-        # Parameters
-        self.declare_parameter('model_path', 'yolo11n-seg.pt')
-        self.declare_parameter('confidence_threshold', 0.5)
-        self.declare_parameter('use_tensorrt', False)
+    """Publish raw class-specific semantic observations from RGB-D data."""
 
-        # YOLO workload controls
-        self.declare_parameter('enable_rule_based_gating', True)
-        self.declare_parameter('semantic_enable_topic', '/semantic_perception_required')
-        self.declare_parameter('process_every_n_frames', 3)
-        self.declare_parameter('inference_enabled_at_startup', False)
+    def __init__(self) -> None:
+        super().__init__("yolo_detector")
 
-        self.declare_parameter('image_topic', '/camera_front/image_rect_color')
-        self.declare_parameter('pointcloud_topic', '/camera_front/point_cloud/cloud_registered')
-        self.declare_parameter('segmentation_mask_topic', '/yolo/segmentation_mask')
-        self.declare_parameter('annotated_image_topic', '/yolo/annotated_image')
-        self.declare_parameter('publish_annotated_image', False)
-        self.declare_parameter('human_centroid_topic', '/human_tracking/centroid')
-        self.declare_parameter('class_map_topic', '/class_map')
-        self.declare_parameter('visibility_map_topic', '/visibility_map')
+        self._declare_parameters()
+        self._load_parameters()
+        self._initialize_runtime_state()
+        self._load_model()
+        self._initialize_ros_interfaces()
 
-        self.image_topic = self.get_parameter('image_topic').value
-        self.pointcloud_topic = self.get_parameter('pointcloud_topic').value
-        self.segmentation_mask_topic = self.get_parameter('segmentation_mask_topic').value
-        self.annotated_image_topic = self.get_parameter('annotated_image_topic').value
-        self.publish_annotated_image = self.get_parameter('publish_annotated_image').value
-        self.human_centroid_topic = self.get_parameter('human_centroid_topic').value
-        self.class_map_topic = self.get_parameter('class_map_topic').value
-        self.visibility_map_topic = self.get_parameter('visibility_map_topic').value
-        
-        model_path = self.get_parameter('model_path').value
-        self.conf_threshold = self.get_parameter('confidence_threshold').value
-        use_tensorrt = self.get_parameter('use_tensorrt').value
-        
-        # Initialize YOLO model
-        self.get_logger().info(f'Loading YOLO model: {model_path}, using TensorRT: {use_tensorrt}')
-        
-        # Export to TensorRT if requested (one-time)
-        if use_tensorrt:
-            # replace .pt with .engine
-            engine_path = model_path.replace('.pt', '.engine')
-            # check if file exists
-            if os.path.exists(engine_path):
-                self.get_logger().info(f'TensorRT engine already exists: {engine_path}')
-                self.model = YOLO(engine_path)
-                self.get_logger().info(f'TensorRT engine loaded: {engine_path}')
-            else:
-                self.get_logger().info('Exporting to TensorRT engine...')
-                self.model = YOLO(model_path)
-                self.model.export(format='engine', device=0)  #export engine
-                self.model = YOLO(engine_path) # reload model as engine
-                self.get_logger().info(f'TensorRT engine loaded: {engine_path}')
-        else:
-            self.model = YOLO(model_path)
-        
-        self.get_logger().info(f"YOLO classes: {self.model.names}")
-        
-        # CV Bridge for image conversion
+        self.get_logger().info(self._startup_summary())
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def _declare_parameters(self) -> None:
+        # Model and inference.
+        self.declare_parameter("model_path", "yolo11n-seg.pt")
+        self.declare_parameter("use_tensorrt", False)
+        self.declare_parameter("device", "0")
+        self.declare_parameter("image_size", 640)
+        self.declare_parameter("mask_threshold", 0.5)
+
+        # The model must run at the minimum class threshold. Class-specific
+        # filtering is then applied after inference.
+        self.declare_parameter("human_confidence_threshold", 0.15)
+        self.declare_parameter("traffic_cone_confidence_threshold", 0.30)
+        self.declare_parameter("caution_tape_confidence_threshold", 0.25)
+        self.declare_parameter("floor_danger_tape_confidence_threshold", 0.30)
+        self.declare_parameter("wet_floor_sign_confidence_threshold", 0.30)
+        self.declare_parameter("spill_confidence_threshold", 0.25)
+
+        # Workload control.
+        self.declare_parameter("enable_rule_based_gating", True) # Change to True to enable gating based on semantic_enable_topict 
+        self.declare_parameter(
+            "semantic_enable_topic", "/semantic_perception_required"
+        )
+        self.declare_parameter("process_every_n_frames", 3)
+        self.declare_parameter("inference_enabled_at_startup", False) #Change to False to disable inference at startup
+
+
+        # Sensor topics.
+        self.declare_parameter(
+            "image_topic", "/camera_front/image_rect_color"
+        )
+        self.declare_parameter(
+            "pointcloud_topic",
+            "/camera_front/point_cloud/cloud_registered",
+        )
+
+        # Output topics. Use a camera-specific prefix when running front and
+        # rear nodes simultaneously, e.g. /semantic_observations/front.
+        self.declare_parameter(
+            "semantic_observation_prefix", "/semantic_observations/front"
+        )
+        self.declare_parameter(
+            "segmentation_mask_topic", "/yolo/segmentation_mask"
+        )
+        self.declare_parameter("annotated_image_topic", "/yolo/annotated_image")
+        self.declare_parameter("human_centroid_topic", "/human_tracking/centroid")
+        self.declare_parameter("visibility_map_topic", "/visibility_map")
+
+        # Temporary backward-compatibility output. Values are 0 for empty and
+        # YOLO class_id + 1 for occupied semantic cells.
+        self.declare_parameter("publish_legacy_class_map", True)
+        self.declare_parameter("class_map_topic", "/class_map")
+        self.declare_parameter("publish_annotated_image", False)
+
+        # Projection/grid parameters. Must match poisson.h.
+        self.declare_parameter("target_frame", "body_link")
+        self.declare_parameter("grid_imax", 100)
+        self.declare_parameter("grid_jmax", 100)
+        self.declare_parameter("grid_ds", 0.05)
+        self.declare_parameter("grid_size", 5.0)
+
+        # Semantic points are already selected by image masks. In particular,
+        # floor tape and spills must NOT be removed by generic ground filtering.
+        self.declare_parameter("semantic_z_min", -1.0)
+        self.declare_parameter("semantic_z_max", 3.5)
+        self.declare_parameter("pointcloud_max_age_sec", 0.20)
+        self.declare_parameter("tf_timeout_sec", 0.10)
+
+        self.declare_parameter("logging_publish_hz", 10.0)
+
+    def _load_parameters(self) -> None:
+        self.model_path = str(self.get_parameter("model_path").value)
+        self.use_tensorrt = bool(self.get_parameter("use_tensorrt").value)
+        self.device = str(self.get_parameter("device").value)
+        self.image_size = int(self.get_parameter("image_size").value)
+        self.mask_threshold = float(self.get_parameter("mask_threshold").value)
+
+        self.class_confidence_thresholds: Dict[int, float] = {
+            0: float(self.get_parameter("human_confidence_threshold").value),
+            1: float(
+                self.get_parameter("traffic_cone_confidence_threshold").value
+            ),
+            2: float(self.get_parameter("caution_tape_confidence_threshold").value),
+            3: float(
+                self.get_parameter(
+                    "floor_danger_tape_confidence_threshold"
+                ).value
+            ),
+            4: float(
+                self.get_parameter("wet_floor_sign_confidence_threshold").value
+            ),
+            5: float(self.get_parameter("spill_confidence_threshold").value),
+        }
+        self.global_confidence_threshold = min(
+            self.class_confidence_thresholds.values()
+        )
+
+        self.enable_rule_based_gating = bool(
+            self.get_parameter("enable_rule_based_gating").value
+        )
+        self.semantic_enable_topic = str(
+            self.get_parameter("semantic_enable_topic").value
+        )
+        self.process_every_n_frames = max(
+            1, int(self.get_parameter("process_every_n_frames").value)
+        )
+        self.inference_enabled = bool(
+            self.get_parameter("inference_enabled_at_startup").value
+        )
+
+        self.image_topic = str(self.get_parameter("image_topic").value)
+        self.pointcloud_topic = str(self.get_parameter("pointcloud_topic").value)
+        self.semantic_observation_prefix = str(
+            self.get_parameter("semantic_observation_prefix").value
+        ).rstrip("/")
+        self.segmentation_mask_topic = str(
+            self.get_parameter("segmentation_mask_topic").value
+        )
+        self.annotated_image_topic = str(
+            self.get_parameter("annotated_image_topic").value
+        )
+        self.human_centroid_topic = str(
+            self.get_parameter("human_centroid_topic").value
+        )
+        self.visibility_map_topic = str(
+            self.get_parameter("visibility_map_topic").value
+        )
+        self.publish_legacy_class_map = bool(
+            self.get_parameter("publish_legacy_class_map").value
+        )
+        self.class_map_topic = str(self.get_parameter("class_map_topic").value)
+        self.publish_annotated_image = bool(
+            self.get_parameter("publish_annotated_image").value
+        )
+
+        self.target_frame = str(self.get_parameter("target_frame").value)
+        self.grid_imax = int(self.get_parameter("grid_imax").value)
+        self.grid_jmax = int(self.get_parameter("grid_jmax").value)
+        self.grid_ds = float(self.get_parameter("grid_ds").value)
+        self.grid_size = float(self.get_parameter("grid_size").value)
+        self.semantic_z_min = float(self.get_parameter("semantic_z_min").value)
+        self.semantic_z_max = float(self.get_parameter("semantic_z_max").value)
+        self.pointcloud_max_age_sec = float(
+            self.get_parameter("pointcloud_max_age_sec").value
+        )
+        self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
+
+        logging_hz = float(self.get_parameter("logging_publish_hz").value)
+        self.logging_publish_period = 1.0 / logging_hz if logging_hz > 0.0 else 0.0
+
+        if self.grid_imax <= 0 or self.grid_jmax <= 0 or self.grid_ds <= 0.0:
+            raise ValueError("Grid dimensions and resolution must be positive")
+        if self.semantic_z_min >= self.semantic_z_max:
+            raise ValueError("semantic_z_min must be less than semantic_z_max")
+
+    def _initialize_runtime_state(self) -> None:
         self.bridge = CvBridge()
-        
-        # TF2 for coordinate transformations
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-        # Storage for latest pointcloud (synchronized with image)
-        self.latest_pointcloud = None
+
+        self.latest_pointcloud: Optional[np.ndarray] = None
         self.latest_pc_stamp = None
-        self.latest_pc_frame = None
-        
-        # Robot position in odom frame (for robot-relative grid coordinates)
-        self.robot_pos = np.array([0.0, 0.0, 0.0])
-        self.robot_yaw = 0.0  # Robot yaw in odom frame
-        
-        # Point cloud filtering parameters (matching yolo_zed_ros.py)
-        self.declare_parameter('floor_threshold', -1.0)
-        self.declare_parameter('ceiling_threshold', 3.5)
-        self.declare_parameter('height_min', 0.1)
-        self.declare_parameter('height_max', 10.0)
-        self.declare_parameter('forward_min', 0.1)
-        self.declare_parameter('grid_size', 5.0)
-        
-        self.floor_threshold = self.get_parameter('floor_threshold').value
-        self.ceiling_threshold = self.get_parameter('ceiling_threshold').value
-        self.height_min = self.get_parameter('height_min').value
-        self.height_max = self.get_parameter('height_max').value
-        self.forward_min = self.get_parameter('forward_min').value
-        self.grid_size = self.get_parameter('grid_size').value
-        
-        # Subscribers
-        # Use latest-only QoS for high-bandwidth sensor streams.
-        # If YOLO/map projection falls behind, we want to drop stale frames
-        # rather than process old camera data.
+        self.latest_pc_frame: Optional[str] = None
+
+        self.frame_counter = 0
+        self.received_image_count = 0
+        self.inference_count = 0
+        self.skipped_disabled_count = 0
+        self.skipped_stride_count = 0
+        self.skipped_missing_pc_count = 0
+        self.skipped_stale_pc_count = 0
+
+        self.last_image_header = None
+        self.last_image_shape: Optional[Tuple[int, int]] = None
+        self.last_logging_publish_time = self.get_clock().now()
+
+    def _load_model(self) -> None:
+        self.get_logger().info(
+            f"Loading YOLO model: {self.model_path}; TensorRT={self.use_tensorrt}"
+        )
+
+        if self.use_tensorrt:
+            if not self.model_path.endswith(".pt"):
+                raise ValueError(
+                    "TensorRT export expects model_path to reference a .pt checkpoint"
+                )
+            engine_path = os.path.splitext(self.model_path)[0] + ".engine"
+            if not os.path.exists(engine_path):
+                self.get_logger().info(f"Exporting TensorRT engine: {engine_path}")
+                source_model = YOLO(self.model_path)
+                exported_path = source_model.export(
+                    format="engine",
+                    device=self.device,
+                    imgsz=self.image_size,
+                )
+                engine_path = str(exported_path)
+            self.model = YOLO(engine_path)
+        else:
+            self.model = YOLO(self.model_path)
+
+        model_names = {
+            int(class_id): str(name)
+            for class_id, name in dict(self.model.names).items()
+        }
+        if model_names != SEMANTIC_CLASSES:
+            raise RuntimeError(
+                "YOLO class mapping does not match the required semantic interface. "
+                f"Expected {SEMANTIC_CLASSES}, received {model_names}"
+            )
+
+    def _initialize_ros_interfaces(self) -> None:
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -129,89 +294,72 @@ class YOLODetectorNode(Node):
         )
 
         self.image_sub = self.create_subscription(
-            Image,
-            self.image_topic,
-            self.image_callback,
-            sensor_qos
+            Image, self.image_topic, self.image_callback, sensor_qos
         )
-
         self.pointcloud_sub = self.create_subscription(
             PointCloud2,
             self.pointcloud_topic,
             self.pointcloud_callback,
-            sensor_qos
+            sensor_qos,
         )
-        
-        # Robot pose from TF (odom -> body_link), provided by odom_publisher.py
-        # No longer subscribe to sportmodestate directly
-        
-        # Publishers
-        self.seg_mask_pub = self.create_publisher(
-            Image,
-            self.segmentation_mask_topic,
-            10
-        )
-        
-        # Publisher for human centroid (for gimbal tracking)
-        self.human_centroid_pub = self.create_publisher(
-            Point,
-            self.human_centroid_topic,
-            10
-        )
-        
-        # Publisher for class map (for semantic safety field)
-        self.class_map_pub = self.create_publisher(
-            OccupancyGrid,
-            self.class_map_topic,
-            10
-        )
-        
-        # Publisher for camera visibility mask (cells the camera can see)
-        self.visibility_map_pub = self.create_publisher(
-            OccupancyGrid,
-            self.visibility_map_topic,
-            10
-        )
-        
-        # Publisher for annotated RGB image with YOLO bounding boxes
-        self.annotated_image_pub = self.create_publisher(
-            Image,
-            self.annotated_image_topic,
-            10
-        )
-        
-        # Grid parameters (must match poisson.h)
-        self.declare_parameter('grid_imax', 100)
-        self.declare_parameter('grid_jmax', 100)
-        self.declare_parameter('grid_ds', 0.05)
-        self.grid_imax = self.get_parameter('grid_imax').value
-        self.grid_jmax = self.get_parameter('grid_jmax').value
-        self.grid_ds = self.get_parameter('grid_ds').value
-        
-        # Logging publish rate limiting
-        self.declare_parameter('logging_publish_hz', 10.0)
-        self.logging_publish_hz = self.get_parameter('logging_publish_hz').value
-        self.logging_publish_period = 1.0 / self.logging_publish_hz if self.logging_publish_hz > 0 else 0.0
-        self.last_logging_publish_time = self.get_clock().now()
-        
-        self.get_logger().info(
-            f'YOLO Detector initialized\n'
-            f'Image topic: {self.image_topic}\n'
-            f'Pointcloud topic: {self.pointcloud_topic}\n'
-            f'Rule gating: {self.enable_rule_based_gating}\n'
-            f'Enable topic: {self.semantic_enable_topic}\n'
-            f'Inference initially enabled: {self.inference_enabled}\n'
-            f'Process every N frames: {self.process_every_n_frames}\n'
-            f'Logging rate: {self.logging_publish_hz} Hz\n'
-            f'Segmentation topic: {self.segmentation_mask_topic}\n'
-            f'Annotated topic: {self.annotated_image_topic}\n'
-            f'Class map topic: {self.class_map_topic}\n'
-            f'Visibility map topic: {self.visibility_map_topic}\n'
-            f'Human centroid topic: {self.human_centroid_topic}\n'
+        self.semantic_enable_sub = self.create_subscription(
+            Bool,
+            self.semantic_enable_topic,
+            self.semantic_enable_callback,
+            10,
         )
 
-    def semantic_enable_callback(self, msg):
-        """Enable/disable inference from the current semantic-rule state."""
+        self.seg_mask_pub = self.create_publisher(
+            Image, self.segmentation_mask_topic, 10
+        )
+        self.annotated_image_pub = self.create_publisher(
+            Image, self.annotated_image_topic, 10
+        )
+        self.human_centroid_pub = self.create_publisher(
+            Point, self.human_centroid_topic, 10
+        )
+        self.visibility_map_pub = self.create_publisher(
+            OccupancyGrid, self.visibility_map_topic, 10
+        )
+
+        self.class_map_pub = None
+        if self.publish_legacy_class_map:
+            self.class_map_pub = self.create_publisher(
+                OccupancyGrid, self.class_map_topic, 10
+            )
+
+        self.semantic_grid_publishers = {
+            class_id: self.create_publisher(
+                OccupancyGrid,
+                f"{self.semantic_observation_prefix}/{class_name}",
+                10,
+            )
+            for class_id, class_name in SEMANTIC_CLASSES.items()
+        }
+
+    def _startup_summary(self) -> str:
+        class_topics = "\n".join(
+            f"  {name}: {self.semantic_observation_prefix}/{name}"
+            for name in SEMANTIC_CLASSES.values()
+        )
+        return (
+            "YOLO semantic-observation node initialized\n"
+            f"Model: {self.model_path}\n"
+            f"Classes: {SEMANTIC_CLASSES}\n"
+            f"Image: {self.image_topic}\n"
+            f"Point cloud: {self.pointcloud_topic}\n"
+            f"Target frame: {self.target_frame}\n"
+            f"Rule gating: {self.enable_rule_based_gating}\n"
+            f"Inference initially enabled: {self.inference_enabled}\n"
+            f"Process every N frames: {self.process_every_n_frames}\n"
+            f"Semantic observation topics:\n{class_topics}"
+        )
+
+    # ------------------------------------------------------------------
+    # Gating and empty-output handling
+    # ------------------------------------------------------------------
+
+    def semantic_enable_callback(self, msg: Bool) -> None:
         requested_state = bool(msg.data)
         if requested_state == self.inference_enabled:
             return
@@ -221,44 +369,15 @@ class YOLODetectorNode(Node):
 
         if self.inference_enabled:
             self.get_logger().info(
-                'YOLO inference ENABLED; the next camera image will be processed'
+                "YOLO inference ENABLED; next selected camera frame will be processed"
             )
         else:
             self.get_logger().info(
-                'YOLO inference DISABLED; clearing YOLO-derived map outputs'
+                "YOLO inference DISABLED; clearing semantic observation outputs"
             )
             self.publish_empty_semantic_outputs()
 
-    def publish_empty_semantic_outputs(self):
-        """Invalidate cached YOLO-derived outputs after inference is disabled."""
-        if self.last_image_header is None:
-            return
-
-        class_map = OccupancyGrid()
-        class_map.header = self.last_image_header
-        class_map.header.stamp = self.get_clock().now().to_msg()
-        class_map.header.frame_id = 'body_link'
-        class_map.info.resolution = self.grid_ds
-        class_map.info.width = self.grid_jmax
-        class_map.info.height = self.grid_imax
-        class_map.data = [0] * (self.grid_imax * self.grid_jmax)
-        self.class_map_pub.publish(class_map)
-
-        visibility_map = OccupancyGrid()
-        visibility_map.header = class_map.header
-        visibility_map.info = class_map.info
-        visibility_map.data = [0] * (self.grid_imax * self.grid_jmax)
-        self.visibility_map_pub.publish(visibility_map)
-
-        if self.last_image_shape is not None:
-            height, width = self.last_image_shape
-            empty_mask = np.zeros((height, width), dtype=np.uint8)
-            mask_msg = self.bridge.cv2_to_imgmsg(empty_mask, encoding='mono8')
-            mask_msg.header = class_map.header
-            self.seg_mask_pub.publish(mask_msg)
-
-    def should_process_image(self, msg):
-        """Return True only for enabled frames selected by the configured stride."""
+    def should_process_image(self, msg: Image) -> bool:
         self.received_image_count += 1
         self.last_image_header = msg.header
         self.last_image_shape = (msg.height, msg.width)
@@ -267,449 +386,488 @@ class YOLODetectorNode(Node):
             self.skipped_disabled_count += 1
             return False
 
-        current_index = self.frame_counter
+        selected = (self.frame_counter % self.process_every_n_frames) == 0
         self.frame_counter += 1
-
-        if current_index % self.process_every_n_frames != 0:
+        if not selected:
             self.skipped_stride_count += 1
             return False
 
         self.inference_count += 1
         return True
 
-    def pointcloud_callback(self, msg):
-        """Store latest organized pointcloud for synchronization with image."""
+    def publish_empty_semantic_outputs(self) -> None:
+        if self.last_image_header is None:
+            return
+
+        header = self.last_image_header
+        header.stamp = self.get_clock().now().to_msg()
+
+        empty_grid = np.zeros((self.grid_imax, self.grid_jmax), dtype=np.int8)
+        for publisher in self.semantic_grid_publishers.values():
+            publisher.publish(self._make_occupancy_grid(empty_grid, header))
+
+        self.visibility_map_pub.publish(self._make_occupancy_grid(empty_grid, header))
+
+        if self.class_map_pub is not None:
+            self.class_map_pub.publish(self._make_occupancy_grid(empty_grid, header))
+
+        if self.last_image_shape is not None:
+            height, width = self.last_image_shape
+            empty_mask = np.zeros((height, width), dtype=np.uint8)
+            mask_msg = self.bridge.cv2_to_imgmsg(empty_mask, encoding="mono8")
+            mask_msg.header = header
+            self.seg_mask_pub.publish(mask_msg)
+
+    # ------------------------------------------------------------------
+    # Point-cloud parsing and transforms
+    # ------------------------------------------------------------------
+
+    def pointcloud_callback(self, msg: PointCloud2) -> None:
         try:
-            # Parse organized pointcloud (width × height structure)
-            # RealSense publishes organized clouds where each pixel has corresponding 3D point
-            if msg.height > 1:  # Organized pointcloud
-                # Fast zero-copy numpy access from raw PointCloud2 buffer
-                # Find xyz field offsets from message metadata
-                field_offsets = {}
-                for field in msg.fields:
-                    if field.name in ('x', 'y', 'z'):
-                        field_offsets[field.name] = field.offset
-                
-                data = np.frombuffer(msg.data, dtype=np.uint8)
-                
-                # Check if x,y,z are contiguous float32 fields (offset x, x+4, x+8)
-                x_off = field_offsets['x']
-                y_off = field_offsets['y']
-                z_off = field_offsets['z']
-                
-                if y_off == x_off + 4 and z_off == x_off + 8:
-                    # Contiguous xyz — use strided view (fastest path)
-                    points = np.ndarray(
-                        shape=(msg.height, msg.width, 3),
-                        dtype=np.float32,
-                        buffer=data,
-                        strides=(msg.row_step, msg.point_step, 4),
-                        offset=x_off
-                    ).copy()  # copy to own memory so buffer can be freed
-                else:
-                    # Non-contiguous fields — extract each axis separately
-                    x = np.ndarray(shape=(msg.height, msg.width), dtype=np.float32,
-                                   buffer=data, strides=(msg.row_step, msg.point_step),
-                                   offset=x_off).copy()
-                    y = np.ndarray(shape=(msg.height, msg.width), dtype=np.float32,
-                                   buffer=data, strides=(msg.row_step, msg.point_step),
-                                   offset=y_off).copy()
-                    z = np.ndarray(shape=(msg.height, msg.width), dtype=np.float32,
-                                   buffer=data, strides=(msg.row_step, msg.point_step),
-                                   offset=z_off).copy()
-                    points = np.stack([x, y, z], axis=-1)
-                
-                self.latest_pointcloud = points
-                self.latest_pc_stamp = msg.header.stamp
-                self.latest_pc_frame = msg.header.frame_id
-                self.get_logger().debug(
-                    f'Received organized PC: {msg.height}×{msg.width} '
-                    f'in frame {msg.header.frame_id}'
+            if msg.height <= 1:
+                self.get_logger().warn(
+                    "Received unorganized point cloud; semantic projection requires HxW data",
+                    throttle_duration_sec=5.0,
                 )
-            else:
-                self.get_logger().warn('Received unorganized pointcloud!')
                 self.latest_pointcloud = None
-                
-        except Exception as e:
-            self.get_logger().error(f'Error in pointcloud callback: {e}')
-    
-    def update_pose_from_tf(self):
-        """Get robot pose from TF (odom -> body_link) provided by odom_publisher.py"""
-        try:
-            if not self.tf_buffer.can_transform('odom', 'body_link', rclpy.time.Time()):
-                return False
-            
-            transform = self.tf_buffer.lookup_transform(
-                'odom', 'body_link', rclpy.time.Time()
-            )
-            
-            # Extract position
-            self.robot_pos = np.array([
-                transform.transform.translation.x,
-                transform.transform.translation.y,
-                transform.transform.translation.z
-            ])
-            
-            # Extract yaw from quaternion
-            q = transform.transform.rotation
-            sin_yaw = 2.0 * (q.w * q.z + q.x * q.y)
-            cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            self.robot_yaw = np.arctan2(sin_yaw, cos_yaw)
-            
-            return True
-        except Exception:
-            return False
-    
-    def image_callback(self, msg):
-        try:
-            # Gate before image conversion, TF lookup, GPU inference, and projection.
-            if not self.should_process_image(msg):
                 return
 
-            t_total = time.perf_counter()
-            # Update robot pose from TF
-            self.update_pose_from_tf()  # Non-blocking, uses last known if fails
-            
-            # Convert ROS Image to OpenCV
-            t0 = time.perf_counter()
+            field_offsets = {
+                field.name: field.offset
+                for field in msg.fields
+                if field.name in ("x", "y", "z")
+            }
+            if set(field_offsets) != {"x", "y", "z"}:
+                raise ValueError(
+                    f"PointCloud2 lacks x/y/z fields: {sorted(field_offsets)}"
+                )
 
-            cv_image = self.bridge.imgmsg_to_cv2(
-                msg,
-                desired_encoding='bgr8'
+            raw = np.frombuffer(msg.data, dtype=np.uint8)
+            x_off = field_offsets["x"]
+            y_off = field_offsets["y"]
+            z_off = field_offsets["z"]
+
+            if y_off == x_off + 4 and z_off == x_off + 8:
+                points = np.ndarray(
+                    shape=(msg.height, msg.width, 3),
+                    dtype=np.float32,
+                    buffer=raw,
+                    strides=(msg.row_step, msg.point_step, 4),
+                    offset=x_off,
+                ).copy()
+            else:
+                axes: List[np.ndarray] = []
+                for offset in (x_off, y_off, z_off):
+                    axis = np.ndarray(
+                        shape=(msg.height, msg.width),
+                        dtype=np.float32,
+                        buffer=raw,
+                        strides=(msg.row_step, msg.point_step),
+                        offset=offset,
+                    ).copy()
+                    axes.append(axis)
+                points = np.stack(axes, axis=-1)
+
+            self.latest_pointcloud = points
+            self.latest_pc_stamp = msg.header.stamp
+            self.latest_pc_frame = msg.header.frame_id
+
+        except Exception as exc:  # noqa: BLE001 - ROS callback boundary
+            self.get_logger().error(f"Point-cloud callback failed: {exc}")
+            self.latest_pointcloud = None
+
+    @staticmethod
+    def _stamp_to_seconds(stamp) -> float:
+        return float(stamp.sec) + 1.0e-9 * float(stamp.nanosec)
+
+    def _pointcloud_is_usable(self, image_msg: Image) -> bool:
+        if (
+            self.latest_pointcloud is None
+            or self.latest_pc_stamp is None
+            or not self.latest_pc_frame
+        ):
+            self.skipped_missing_pc_count += 1
+            return False
+
+        age_sec = abs(
+            self._stamp_to_seconds(image_msg.header.stamp)
+            - self._stamp_to_seconds(self.latest_pc_stamp)
+        )
+        if age_sec > self.pointcloud_max_age_sec:
+            self.skipped_stale_pc_count += 1
+            self.get_logger().warn(
+                f"Skipping semantic projection: RGB/point-cloud age={age_sec:.3f}s",
+                throttle_duration_sec=2.0,
             )
+            return False
 
-            t_cv_ms = (time.perf_counter() - t0) * 1000.0
-            
-            # Run YOLO detection
-            t0 = time.perf_counter()
+        return True
+
+    def _lookup_camera_to_body_transform(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                self.latest_pc_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+        except TransformException as exc:
+            self.get_logger().warn(
+                f"TF lookup failed ({self.latest_pc_frame} -> {self.target_frame}): {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return None
+
+        trans = transform.transform.translation
+        rot = transform.transform.rotation
+        qx, qy, qz, qw = rot.x, rot.y, rot.z, rot.w
+
+        rotation = np.array(
+            [
+                [
+                    1.0 - 2.0 * (qy * qy + qz * qz),
+                    2.0 * (qx * qy - qw * qz),
+                    2.0 * (qx * qz + qw * qy),
+                ],
+                [
+                    2.0 * (qx * qy + qw * qz),
+                    1.0 - 2.0 * (qx * qx + qz * qz),
+                    2.0 * (qy * qz - qw * qx),
+                ],
+                [
+                    2.0 * (qx * qz - qw * qy),
+                    2.0 * (qy * qz + qw * qx),
+                    1.0 - 2.0 * (qx * qx + qy * qy),
+                ],
+            ],
+            dtype=np.float32,
+        )
+        translation = np.array([trans.x, trans.y, trans.z], dtype=np.float32)
+        return rotation, translation
+
+    # ------------------------------------------------------------------
+    # Inference and projection
+    # ------------------------------------------------------------------
+
+    def image_callback(self, msg: Image) -> None:
+        if not self.should_process_image(msg):
+            return
+
+        total_start = time.perf_counter()
+        try:
+            cv_start = time.perf_counter()
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv_ms = (time.perf_counter() - cv_start) * 1000.0
+
+            infer_start = time.perf_counter()
             results = self.model.predict(
                 cv_image,
-                conf=self.conf_threshold,
+                conf=self.global_confidence_threshold,
+                imgsz=self.image_size,
                 verbose=False,
-                show=False, 
-                device=0  # Use GPU
+                show=False,
+                device=self.device,
+            )
+            infer_ms = (time.perf_counter() - infer_start) * 1000.0
+
+            class_masks, detections = self._extract_class_masks(
+                results, cv_image.shape[:2]
             )
 
-            t_infer_ms = (time.perf_counter() - t0) * 1000.0
-            
-            # Create segmentation mask
-            seg_mask = np.zeros((cv_image.shape[0], cv_image.shape[1]), dtype=np.uint8)
-            
-            if results and results[0].masks is not None:
-                for i, (mask, cls) in enumerate(zip(results[0].masks.data, results[0].boxes.cls)):
-                    class_id = int(cls.item())
-                    
-                    # Resize mask to image size
-                    mask_np = mask.cpu().numpy()
-                    mask_resized = cv2.resize(
-                        mask_np, 
-                        (cv_image.shape[1], cv_image.shape[0]),
-                        interpolation=cv2.INTER_LINEAR
-                    )
-                    
-                    # Map COCO classes to our classes:
-                    # 0 (person) -> 1 (human)
-                    # Everything else -> 3 (object)
-                    if class_id == 0:  # person
-                        seg_mask[mask_resized > 0.5] = 1
-                    else:
-                        # Only set to 3 if not already human
-                        seg_mask[(mask_resized > 0.5) & (seg_mask != 1)] = 3
-            
-            # Publish segmentation mask
-            mask_msg = self.bridge.cv2_to_imgmsg(seg_mask, encoding='mono8')
-            mask_msg.header = msg.header  # Preserve timestamp
+            encoded_mask = self._make_encoded_debug_mask(class_masks)
+            mask_msg = self.bridge.cv2_to_imgmsg(encoded_mask, encoding="mono8")
+            mask_msg.header = msg.header
             self.seg_mask_pub.publish(mask_msg)
-            
-            # Draw bounding boxes on the RGB image and publish annotated image
-            if self.publish_annotated_image:
-                annotated_image = cv_image.copy()
-                if results and results[0].boxes is not None:
-                    boxes = results[0].boxes
-                    for i, box in enumerate(boxes):
-                        # Get bounding box coordinates (xyxy format)
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                        class_id = int(box.cls.item())
-                        confidence = float(box.conf.item())
-                        
-                        # Get class name from YOLO model
-                        class_name = self.model.names[class_id] if hasattr(self.model, 'names') else f'class_{class_id}'
-                        
-                        # Color: red for person (human), blue for other objects
-                        if class_id == 0:  # person
-                            color = (0, 0, 255)  # Red (BGR)
-                            label = f'HUMAN: {confidence:.2f}'
-                        else:
-                            color = (255, 0, 0)  # Blue (BGR)
-                            label = f'{class_name}: {confidence:.2f}'
-                        
-                        # Draw bounding box
-                        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
-                        
-                        # Draw label background
-                        (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        cv2.rectangle(annotated_image, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
-                        
-                        # Draw label text
-                        cv2.putText(annotated_image, label, (x1, y1 - 5), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            # Rate-limited publishing and display of annotated image
-            current_time = self.get_clock().now()
-            time_since_last = (current_time - self.last_logging_publish_time).nanoseconds / 1e9
-            if time_since_last >= self.logging_publish_period:
-                self.last_logging_publish_time = current_time
-                if self.publish_annotated_image:
-                    # Publish annotated image
-                    annotated_msg = self.bridge.cv2_to_imgmsg(annotated_image, encoding='bgr8')
-                    annotated_msg.header = msg.header
-                    self.annotated_image_pub.publish(annotated_msg)
-                    
-                    # Display annotated RGB image with YOLO bounding boxes
-                    #cv2.imshow('YOLO Bounding Boxes', annotated_image)
-                    #cv2.waitKey(1)
-            
-            # Calculate and publish human centroid for gimbal tracking
-            centroid_msg = Point()
-            human_mask = (seg_mask == 1)
-            
-            if human_mask.any():
-                # Calculate centroid of all detected humans
-                y_coords, x_coords = np.where(human_mask)
-                if len(x_coords) > 0:
-                    centroid_x = float(np.mean(x_coords))
-                    centroid_y = float(np.mean(y_coords))
-                    
-                    # Publish centroid (x, y in pixels, z = image width for reference)
-                    centroid_msg.x = centroid_x
-                    centroid_msg.y = centroid_y
-                    centroid_msg.z = float(cv_image.shape[1])  # Image width
-                    self.human_centroid_pub.publish(centroid_msg)
-            else:
-                # No human detected - send center position (straight forward)
-                img_width = float(cv_image.shape[1])
-                img_height = float(cv_image.shape[0])
-                centroid_msg.x = img_width / 2.0  # Center X
-                centroid_msg.y = img_height / 2.0  # Center Y
-                centroid_msg.z = img_width  # Image width
-                self.human_centroid_pub.publish(centroid_msg)
-            
-            t0 = time.perf_counter()
-            # Project human detections to class_map grid using organized 3D pointcloud
-            # Pipeline: Map detections to pointcloud in camera frame -> Transform to odom -> Create grid
-            # This sparse map will be expanded by brushfire in C++
-            class_map_grid = np.zeros((self.grid_imax, self.grid_jmax), dtype=np.int8)
-            visibility_grid = np.zeros((self.grid_imax, self.grid_jmax), dtype=np.int8)  # Camera visibility
-            
-            # Check if we have synchronized organized pointcloud
-            if (self.latest_pointcloud is not None and 
-                len(self.latest_pointcloud.shape) == 3 and
-                results and results[0].masks is not None):
-                
-                # Get organized pointcloud (H×W×3) - still in camera frame
-                xyz = self.latest_pointcloud
-                pc_h, pc_w = xyz.shape[:2]
-                
-                # Resize segmentation mask to match pointcloud dimensions if needed
-                if seg_mask.shape != (pc_h, pc_w):
-                    seg_mask_pc = cv2.resize(seg_mask, (pc_w, pc_h), 
-                                             interpolation=cv2.INTER_NEAREST)
-                else:
-                    seg_mask_pc = seg_mask
-                
-                # Flatten both for vectorized processing
-                xyz_flat = xyz.reshape(-1, 3)
-                seg_mask_flat = seg_mask_pc.reshape(-1)
-                
-                # STEP 1: Only transform YOLO-labeled points for class_map.
-                # This avoids transforming the full organized pointcloud every frame.
-                labeled_mask = seg_mask_flat > 0
-                valid_mask = labeled_mask & np.isfinite(xyz_flat).all(axis=1)
 
-                xyz_valid = xyz_flat[valid_mask]
-                seg_mask_valid = seg_mask_flat[valid_mask]
-                
-                # Runtime optimization:
-                # Only labeled YOLO pixels are projected into the class_map.
-                # Full visibility projection is skipped here because transforming all valid
-                # pointcloud points is expensive and causes perception lag.
-                
-                # STEP 2: Transform ALL valid points from camera frame to odom frame
-                try:
-                    # Lookup transform from camera frame to body_link (robot-centered)
-                    transform = self.tf_buffer.lookup_transform(
-                        'body_link',
-                        self.latest_pc_frame,
-                        rclpy.time.Time(),
-                        timeout=rclpy.duration.Duration(seconds=0.1)
-                    )
-                    
-                    # Extract rotation and translation
-                    trans = transform.transform.translation
-                    rot = transform.transform.rotation
-                    
-                    # Convert quaternion to rotation matrix
-                    qx, qy, qz, qw = rot.x, rot.y, rot.z, rot.w
-                    R = np.array([
-                        [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
-                        [2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)],
-                        [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
-                    ])
-                    
-                    # Apply transformation: xyz_odom = R @ xyz_camera + t
-                    xyz_odom = (R @ xyz_valid.T).T + np.array([trans.x, trans.y, trans.z])
-                    
-                except (TransformException, tf2_ros.LookupException, 
-                        tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-                    self.get_logger().warn(
-                        f'TF lookup failed ({self.latest_pc_frame} -> body_link): {e}',
-                        throttle_duration_sec=5.0
-                    )
-                    # Skip this frame if transform not available
-                    xyz_odom = np.array([]).reshape(0, 3)
-                    seg_mask_valid = np.array([])
-                
-                # Points are now in body_link frame (robot-centered)
-                # X is forward, Y is left, Z is up
-                if xyz_odom.shape[0] > 0:
-                    xyz_body = xyz_odom  # Already in body frame
-                    
-                    # Coordinate system: Z is up, X is forward, Y is left (body frame)
-                    # Filter out ground points using Z (height) thresholding
-                    height_mask = ((xyz_body[:, 2] > self.floor_threshold) & 
-                                  (xyz_body[:, 2] < self.ceiling_threshold))
-                    xyz_body_filtered = xyz_body[height_mask]
-                    seg_mask_filtered = seg_mask_valid[height_mask]
-                    
-                    # Filter by forward, lateral, and height bounds (in BODY frame)
-                    if xyz_body_filtered.shape[0] > 0:
-                        # if xyz_body_filtered.shape[0] > 0:
-                            # self.get_logger().info(
-                            #     f"X range: [{np.min(xyz_body_filtered[:,0]):.2f}, "
-                            #     f"{np.max(xyz_body_filtered[:,0]):.2f}]",
-                            #     throttle_duration_sec=1.0
-                            # )
-                        x_range_mask = ((xyz_body_filtered[:, 0] > -self.grid_size / 2.0) &
-                            (xyz_body_filtered[:, 0] <  self.grid_size / 2.0))
-                        lateral_mask = ((xyz_body_filtered[:, 1] > -self.grid_size / 2.0) & 
-                                       (xyz_body_filtered[:, 1] < self.grid_size / 2.0))
-                        height_mask2 = ((xyz_body_filtered[:, 2] > self.height_min) & 
-                                       (xyz_body_filtered[:, 2] < self.height_max))
-                        
-                        combined_mask = x_range_mask & lateral_mask & height_mask2
-                        xyz_final = xyz_body_filtered[combined_mask]  # Use body coords for grid
-                        seg_mask_final = seg_mask_filtered[combined_mask]
-                        
-                        # Convert 3D points to grid coordinates
-                        # Match LiDAR convention (cloud_merger.h) in body_link frame:
-                        # ic = pt.y / DS + IMAX/2  -> row from Y, add for positive
-                        # jc = pt.x / DS + JMAX/2  -> col from X, add for positive
-                        # Body frame: X is forward, Y is left
-                        if xyz_final.shape[0] > 0:
-                            grid_row = (self.grid_imax // 2 + 
-                                       np.floor(xyz_final[:, 1] / self.grid_ds).astype(int))
-                            grid_col = (self.grid_jmax // 2 + 
-                                       np.floor(xyz_final[:, 0] / self.grid_ds).astype(int))
-                            
-                            # Filter points within grid bounds
-                            in_bounds = ((grid_col >= 0) & (grid_col < self.grid_jmax) & 
-                                        (grid_row >= 0) & (grid_row < self.grid_imax))
-                            grid_col = grid_col[in_bounds]
-                            grid_row = grid_row[in_bounds]
-                            seg_mask_in_bounds = seg_mask_final[in_bounds]
-                            
-                            # Populate visibility_grid for ALL camera-visible cells
-                            # and class_map for cells with YOLO detections
-                            for i in range(len(grid_row)):
-                                row = grid_row[i]
-                                col = grid_col[i]
-                                # Mark as visible (camera can see this cell)
-                                visibility_grid[row, col] = 1
-                                # Also populate class_map if labeled
-                                class_idx = seg_mask_in_bounds[i]
-                                if class_idx > 0:  # Human (1) or object (3)
-                                    # Keep human class (1) as higher priority
-                                    if class_map_grid[row, col] == 0 or class_idx == 1:
-                                        class_map_grid[row, col] = class_idx
-            
-            # Publish class_map as OccupancyGrid
-            class_map_msg = OccupancyGrid()
-            class_map_msg.header = msg.header
-            class_map_msg.header.frame_id = 'body_link'
-            class_map_msg.info.resolution = self.grid_ds
-            class_map_msg.info.width = self.grid_jmax
-            class_map_msg.info.height = self.grid_imax
-            class_map_msg.data = class_map_grid.flatten().tolist()
-            self.class_map_pub.publish(class_map_msg)
-            
-            # Publish visibility_map as OccupancyGrid (1 = camera can see, 0 = not visible)
-            visibility_map_msg = OccupancyGrid()
-            visibility_map_msg.header = msg.header
-            visibility_map_msg.header.frame_id = 'body_link'
-            visibility_map_msg.info.resolution = self.grid_ds
-            visibility_map_msg.info.width = self.grid_jmax
-            visibility_map_msg.info.height = self.grid_imax
-            visibility_map_msg.data = visibility_grid.flatten().tolist()
-            self.visibility_map_pub.publish(visibility_map_msg)
+            self._publish_human_centroid(class_masks[0], cv_image.shape[:2])
 
-            t_projection_ms = (time.perf_counter() - t0) * 1000.0
-
-            
-            # Visualize class_map with OpenCV for debugging
-            # Create color image: human=red, object=blue, empty=black
-            class_map_vis = np.zeros((self.grid_imax, self.grid_jmax, 3), dtype=np.uint8)
-            class_map_vis[class_map_grid == 1] = [0, 0, 255]  # Human = red (BGR)
-            class_map_vis[class_map_grid == 3] = [255, 0, 0]  # Object = blue (BGR)
-            
-            # Mark robot position at center with green circle
-            center = (self.grid_jmax // 2, self.grid_imax // 2)
-            cv2.circle(class_map_vis, center, 3, (0, 255, 0), -1)
-            
-            # Upscale for visibility
-            upscale = 6
-            class_map_vis = cv2.resize(class_map_vis, None, fx=upscale, fy=upscale, 
-                                        interpolation=cv2.INTER_NEAREST)
-            
-            # Flip vertically to match display convention
-            class_map_vis = cv2.flip(class_map_vis, 0)
-            
-            # cv2.imshow('YOLO Class Map', class_map_vis)
-            #cv2.waitKey(1)
-            
-            # Log detection statistics
-            pc_status = "synced" if self.latest_pointcloud is not None else "waiting"
-            # self.get_logger().info(
-            #     f'Detected: {int((seg_mask == 1).sum())} human pixels, '
-            #     f'{int((seg_mask == 3).sum())} object pixels, '
-            #     f'{int(np.sum(class_map_grid == 1))} grid cells, '
-            #     f'PC: {pc_status}',
-            #     throttle_duration_sec=2.0
-            # )
-
-            t_total_ms = (time.perf_counter() - t_total) * 1000.0
-
-            self.get_logger().info(
-                f'YOLO timing | total={t_total_ms:.1f} ms '
-                f'cv={t_cv_ms:.1f} ms '
-                f'infer={t_infer_ms:.1f} ms '
-                f'projection={t_projection_ms:.1f} ms | '
-                f'enabled={self.inference_enabled} '
-                f'stride={self.process_every_n_frames} '
-                f'received={self.received_image_count} '
-                f'inferred={self.inference_count} '
-                f'skipped_disabled={self.skipped_disabled_count} '
-                f'skipped_stride={self.skipped_stride_count}',
-                throttle_duration_sec=1.0
+            projection_start = time.perf_counter()
+            semantic_grids, visibility_grid = self._project_masks_to_grids(
+                class_masks, msg
             )
-            
-        except Exception as e:
-            self.get_logger().error(f'Error in image callback: {e}')
+            projection_ms = (time.perf_counter() - projection_start) * 1000.0
+
+            for class_id, publisher in self.semantic_grid_publishers.items():
+                publisher.publish(
+                    self._make_occupancy_grid(semantic_grids[class_id], msg.header)
+                )
+
+            self.visibility_map_pub.publish(
+                self._make_occupancy_grid(visibility_grid, msg.header)
+            )
+
+            if self.class_map_pub is not None:
+                legacy_grid = self._compose_legacy_class_map(semantic_grids)
+                self.class_map_pub.publish(
+                    self._make_occupancy_grid(legacy_grid, msg.header)
+                )
+
+            if self.publish_annotated_image and self._logging_publish_due():
+                annotated = self._draw_annotations(cv_image, detections)
+                annotated_msg = self.bridge.cv2_to_imgmsg(
+                    annotated, encoding="bgr8"
+                )
+                annotated_msg.header = msg.header
+                self.annotated_image_pub.publish(annotated_msg)
+
+            total_ms = (time.perf_counter() - total_start) * 1000.0
+            occupied_counts = ", ".join(
+                f"{SEMANTIC_CLASSES[class_id]}={int(np.count_nonzero(grid))}"
+                for class_id, grid in semantic_grids.items()
+            )
+            self.get_logger().info(
+                "YOLO timing | "
+                f"total={total_ms:.1f} ms cv={cv_ms:.1f} ms "
+                f"infer={infer_ms:.1f} ms projection={projection_ms:.1f} ms | "
+                f"detections={len(detections)} cells[{occupied_counts}] | "
+                f"received={self.received_image_count} inferred={self.inference_count} "
+                f"disabled={self.skipped_disabled_count} stride={self.skipped_stride_count} "
+                f"missing_pc={self.skipped_missing_pc_count} stale_pc={self.skipped_stale_pc_count}",
+                throttle_duration_sec=1.0,
+            )
+
+        except Exception as exc:  # noqa: BLE001 - ROS callback boundary
+            self.get_logger().error(f"Image callback failed: {exc}")
+
+    def _extract_class_masks(
+        self, results, image_shape: Tuple[int, int]
+    ) -> Tuple[Dict[int, np.ndarray], List[Tuple[int, float, np.ndarray]]]:
+        height, width = image_shape
+        class_masks = {
+            class_id: np.zeros((height, width), dtype=bool)
+            for class_id in SEMANTIC_CLASSES
+        }
+        detections: List[Tuple[int, float, np.ndarray]] = []
+
+        if not results:
+            return class_masks, detections
+
+        result = results[0]
+        if result.masks is None or result.boxes is None:
+            return class_masks, detections
+
+        masks = result.masks.data
+        boxes = result.boxes
+
+        for mask, cls, conf, xyxy in zip(
+            masks, boxes.cls, boxes.conf, boxes.xyxy
+        ):
+            class_id = int(cls.item())
+            confidence = float(conf.item())
+            if class_id not in SEMANTIC_CLASSES:
+                continue
+            if confidence < self.class_confidence_thresholds[class_id]:
+                continue
+
+            mask_np = mask.detach().cpu().numpy()
+            mask_resized = cv2.resize(
+                mask_np,
+                (width, height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            binary_mask = mask_resized > self.mask_threshold
+            class_masks[class_id] |= binary_mask
+
+            box = xyxy.detach().cpu().numpy().astype(int)
+            detections.append((class_id, confidence, box))
+
+        return class_masks, detections
+
+    def _project_masks_to_grids(
+        self,
+        class_masks: Dict[int, np.ndarray],
+        image_msg: Image,
+    ) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+        semantic_grids = {
+            class_id: np.zeros((self.grid_imax, self.grid_jmax), dtype=np.int8)
+            for class_id in SEMANTIC_CLASSES
+        }
+        visibility_grid = np.zeros(
+            (self.grid_imax, self.grid_jmax), dtype=np.int8
+        )
+
+        if not any(mask.any() for mask in class_masks.values()):
+            return semantic_grids, visibility_grid
+        if not self._pointcloud_is_usable(image_msg):
+            return semantic_grids, visibility_grid
+
+        transform = self._lookup_camera_to_body_transform()
+        if transform is None:
+            return semantic_grids, visibility_grid
+        rotation, translation = transform
+
+        xyz = self.latest_pointcloud
+        assert xyz is not None
+        pc_h, pc_w = xyz.shape[:2]
+
+        for class_id, image_mask in class_masks.items():
+            if not image_mask.any():
+                continue
+
+            if image_mask.shape != (pc_h, pc_w):
+                mask_pc = cv2.resize(
+                    image_mask.astype(np.uint8),
+                    (pc_w, pc_h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            else:
+                mask_pc = image_mask
+
+            points_camera = xyz[mask_pc]
+            if points_camera.size == 0:
+                continue
+
+            valid = np.isfinite(points_camera).all(axis=1)
+            points_camera = points_camera[valid]
+            if points_camera.size == 0:
+                continue
+
+            points_body = (rotation @ points_camera.T).T + translation
+
+            # These are semantic points selected by the segmentation mask.
+            # Keep floor-level detections such as tape and spills.
+            valid_bounds = (
+                (points_body[:, 2] > self.semantic_z_min)
+                & (points_body[:, 2] < self.semantic_z_max)
+                & (points_body[:, 0] > -self.grid_size / 2.0)
+                & (points_body[:, 0] < self.grid_size / 2.0)
+                & (points_body[:, 1] > -self.grid_size / 2.0)
+                & (points_body[:, 1] < self.grid_size / 2.0)
+            )
+            points_body = points_body[valid_bounds]
+            if points_body.size == 0:
+                continue
+
+            grid_rows = (
+                self.grid_imax // 2
+                + np.floor(points_body[:, 1] / self.grid_ds).astype(np.int32)
+            )
+            grid_cols = (
+                self.grid_jmax // 2
+                + np.floor(points_body[:, 0] / self.grid_ds).astype(np.int32)
+            )
+
+            in_bounds = (
+                (grid_rows >= 0)
+                & (grid_rows < self.grid_imax)
+                & (grid_cols >= 0)
+                & (grid_cols < self.grid_jmax)
+            )
+            grid_rows = grid_rows[in_bounds]
+            grid_cols = grid_cols[in_bounds]
+            if grid_rows.size == 0:
+                continue
+
+            semantic_grids[class_id][grid_rows, grid_cols] = 100
+            visibility_grid[grid_rows, grid_cols] = 100
+
+        return semantic_grids, visibility_grid
+
+    # ------------------------------------------------------------------
+    # Message construction and debug outputs
+    # ------------------------------------------------------------------
+
+    def _make_occupancy_grid(self, grid: np.ndarray, header) -> OccupancyGrid:
+        msg = OccupancyGrid()
+        msg.header = header
+        msg.header.frame_id = self.target_frame
+        msg.info.resolution = self.grid_ds
+        msg.info.width = self.grid_jmax
+        msg.info.height = self.grid_imax
+        msg.info.origin.position.x = -0.5 * self.grid_jmax * self.grid_ds
+        msg.info.origin.position.y = -0.5 * self.grid_imax * self.grid_ds
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.x = 0.0
+        msg.info.origin.orientation.y = 0.0
+        msg.info.origin.orientation.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.astype(np.int8, copy=False).reshape(-1).tolist()
+        return msg
+
+    def _make_encoded_debug_mask(
+        self, class_masks: Dict[int, np.ndarray]
+    ) -> np.ndarray:
+        shape = next(iter(class_masks.values())).shape
+        encoded = np.zeros(shape, dtype=np.uint8)
+
+        # Lower-priority classes are written first; human is written last.
+        priority = [5, 3, 2, 4, 1, 0]
+        for class_id in priority:
+            encoded[class_masks[class_id]] = class_id + 1
+        return encoded
+
+    def _compose_legacy_class_map(
+        self, semantic_grids: Dict[int, np.ndarray]
+    ) -> np.ndarray:
+        combined = np.zeros((self.grid_imax, self.grid_jmax), dtype=np.int8)
+        priority = [5, 3, 2, 4, 1, 0]
+        for class_id in priority:
+            combined[semantic_grids[class_id] > 0] = class_id + 1
+        return combined
+
+    def _publish_human_centroid(
+        self, human_mask: np.ndarray, image_shape: Tuple[int, int]
+    ) -> None:
+        height, width = image_shape
+        centroid = Point()
+        if human_mask.any():
+            ys, xs = np.where(human_mask)
+            centroid.x = float(np.mean(xs))
+            centroid.y = float(np.mean(ys))
+        else:
+            centroid.x = 0.5 * float(width)
+            centroid.y = 0.5 * float(height)
+        centroid.z = float(width)
+        self.human_centroid_pub.publish(centroid)
+
+    def _draw_annotations(
+        self,
+        image: np.ndarray,
+        detections: List[Tuple[int, float, np.ndarray]],
+    ) -> np.ndarray:
+        annotated = image.copy()
+        for class_id, confidence, box in detections:
+            x1, y1, x2, y2 = box.tolist()
+            color = CLASS_COLORS[class_id]
+            label = f"{SEMANTIC_CLASSES[class_id]}: {confidence:.2f}"
+
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            (label_w, label_h), _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            label_top = max(0, y1 - label_h - 6)
+            cv2.rectangle(
+                annotated,
+                (x1, label_top),
+                (x1 + label_w, y1),
+                color,
+                -1,
+            )
+            cv2.putText(
+                annotated,
+                label,
+                (x1, max(label_h, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+            )
+        return annotated
+
+    def _logging_publish_due(self) -> bool:
+        if self.logging_publish_period <= 0.0:
+            return True
+        now = self.get_clock().now()
+        elapsed = (now - self.last_logging_publish_time).nanoseconds * 1.0e-9
+        if elapsed < self.logging_publish_period:
+            return False
+        self.last_logging_publish_time = now
+        return True
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = YOLODetectorNode()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -719,5 +877,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

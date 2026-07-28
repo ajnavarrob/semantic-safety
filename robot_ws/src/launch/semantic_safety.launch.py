@@ -38,15 +38,26 @@ def generate_launch_description():
         description='Camera FPS (RealSense: 6, 15, 30, or 60)'
     )
     
+    # yolo_model_arg = DeclareLaunchArgument(
+    #     'yolo_model',
+    #     default_value='/home/unitree/semantic-safety-master/yolo11n-seg.engine',
+    #     description='Path to YOLO model file'
+    # )
     yolo_model_arg = DeclareLaunchArgument(
         'yolo_model',
-        default_value='/home/unitree/semantic-safety-master/yolo11n-seg.engine',
-        description='Path to YOLO model file'
+        default_value='/home/unitree/models/go2_semantic_v2/best.pt',
+        description='Path to six-class YOLO11 segmentation model'
     )
     
+    # use_tensorrt_arg = DeclareLaunchArgument(
+    #     'use_tensorrt',
+    #     default_value='true' if IS_JETSON else 'false',
+    #     description='Use TensorRT for YOLO inference (auto-enabled on Jetson)'
+    # )
+
     use_tensorrt_arg = DeclareLaunchArgument(
         'use_tensorrt',
-        default_value='true' if IS_JETSON else 'false',
+        default_value='false',
         description='Use TensorRT for YOLO inference (auto-enabled on Jetson)'
     )
 
@@ -333,65 +344,143 @@ def generate_launch_description():
         output='screen',
     )
     
-    # YOLO Detector Node
+    # YOLO Detector Node - Front Camera
     yolo_front_node = Node(
         package='unitree_ros2_poisson_simple',
         executable='yolo_detector.py',
         name='yolo_front',
         output='screen',
         parameters=[{
+            # New six-class YOLO11 segmentation model
             'model_path': LaunchConfiguration('yolo_model'),
-            'confidence_threshold': 0.5,
             'use_tensorrt': LaunchConfiguration('use_tensorrt'),
-            'grid_imax': 100,  # Must match poisson.h IMAX
-            'grid_jmax': 100,  # Must match poisson.h JMAX
-            'grid_ds': 0.05,   # Must match poisson.h DS
+            'device': '0',
+            'image_size': 640,
+            'mask_threshold': 0.5,
+
+            # Per-class confidence thresholds
+            'human_confidence_threshold': 0.15,
+            'traffic_cone_confidence_threshold': 0.30,
+            'caution_tape_confidence_threshold': 0.25,
+            'floor_danger_tape_confidence_threshold': 0.30,
+            'wet_floor_sign_confidence_threshold': 0.30,
+            'spill_confidence_threshold': 0.25,
+
+            # Grid must match poisson.h
+            'grid_imax': 100,
+            'grid_jmax': 100,
+            'grid_ds': 0.05,
+            'grid_size': 5.0,
+            'target_frame': 'body_link',
+
+            # Retain floor-level semantic objects
+            'semantic_z_min': -1.0,
+            'semantic_z_max': 3.5,
+            'pointcloud_max_age_sec': 0.35,
+            'tf_timeout_sec': 0.10,
+
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
+
+            # Front RealSense inputs
             'image_topic': '/camera_front/image_rect_color',
             'pointcloud_topic': '/camera_front/point_cloud/cloud_registered',
 
-            'class_map_topic': '/class_map_front',
-            'visibility_map_topic': '/visibility_map_front',
+            # New independent semantic observation grids
+            'semantic_observation_prefix': '/semantic_observations/front',
 
+            # Existing debug and compatibility outputs
             'segmentation_mask_topic': '/yolo_front/segmentation_mask',
             'annotated_image_topic': '/yolo_front/annotated_image',
             'human_centroid_topic': '/human_tracking/front_centroid',
+            'visibility_map_topic': '/semantic_observations/front/visibility',
 
-            'enable_rule_based_gating': LaunchConfiguration('enable_rule_based_yolo_gating'),
-            'semantic_enable_topic': LaunchConfiguration('semantic_perception_enable_topic'),
-            'process_every_n_frames': LaunchConfiguration('yolo_process_every_n_frames'),
-            'inference_enabled_at_startup': False,
+            # Temporary compatibility with current semantic_poisson
+            'publish_legacy_class_map': True,
+            'class_map_topic': '/class_map_front',
+
+            'publish_annotated_image': True,
+
+            # Rule-based inference gating
+            # 'enable_rule_based_gating':
+            #     LaunchConfiguration('enable_rule_based_yolo_gating'),
+            'enable_rule_based_gating': False,
+            'semantic_enable_topic':
+                LaunchConfiguration('semantic_perception_enable_topic'),
+            'process_every_n_frames':
+                LaunchConfiguration('yolo_process_every_n_frames'),
+            # 'inference_enabled_at_startup': False,
+            'inference_enabled_at_startup': True, 
         }],
     )
 
+
+    # YOLO Detector Node - Rear Camera
     yolo_rear_node = Node(
         package='unitree_ros2_poisson_simple',
         executable='yolo_detector.py',
         name='yolo_rear',
         output='screen',
         parameters=[{
+            # New six-class YOLO11 segmentation model
             'model_path': LaunchConfiguration('yolo_model'),
-            'confidence_threshold': 0.5,
             'use_tensorrt': LaunchConfiguration('use_tensorrt'),
+            'device': '0',
+            'image_size': 640,
+            'mask_threshold': 0.5,
+
+            # Per-class confidence thresholds
+            'human_confidence_threshold': 0.15,
+            'traffic_cone_confidence_threshold': 0.30,
+            'caution_tape_confidence_threshold': 0.25,
+            'floor_danger_tape_confidence_threshold': 0.30,
+            'wet_floor_sign_confidence_threshold': 0.30,
+            'spill_confidence_threshold': 0.25,
+
+            # Grid must match poisson.h
             'grid_imax': 100,
             'grid_jmax': 100,
             'grid_ds': 0.05,
+            'grid_size': 5.0,
+            'target_frame': 'body_link',
+
+            # Retain floor-level semantic objects
+            'semantic_z_min': -1.0,
+            'semantic_z_max': 3.5,
+            'pointcloud_max_age_sec': 0.35,
+            'tf_timeout_sec': 0.10,
+
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
 
+            # Rear RealSense inputs
             'image_topic': '/camera_rear/image_rect_color',
             'pointcloud_topic': '/camera_rear/point_cloud/cloud_registered',
 
-            'class_map_topic': '/class_map_rear',
-            'visibility_map_topic': '/visibility_map_rear',
+            # New independent semantic observation grids
+            'semantic_observation_prefix': '/semantic_observations/rear',
 
+            # Existing debug and compatibility outputs
             'segmentation_mask_topic': '/yolo_rear/segmentation_mask',
             'annotated_image_topic': '/yolo_rear/annotated_image',
             'human_centroid_topic': '/human_tracking/rear_centroid',
+            'visibility_map_topic': '/semantic_observations/rear/visibility',
 
-            'enable_rule_based_gating': LaunchConfiguration('enable_rule_based_yolo_gating'),
-            'semantic_enable_topic': LaunchConfiguration('semantic_perception_enable_topic'),
-            'process_every_n_frames': LaunchConfiguration('yolo_process_every_n_frames'),
-            'inference_enabled_at_startup': False,
+            # Temporary compatibility with current semantic_poisson
+            'publish_legacy_class_map': True,
+            'class_map_topic': '/class_map_rear',
+
+            'publish_annotated_image': True,
+
+            # Rule-based inference gating
+            # 'enable_rule_based_gating':
+            #     LaunchConfiguration('enable_rule_based_yolo_gating'),
+            'enable_rule_based_gating': False, 
+            'semantic_enable_topic':
+                LaunchConfiguration('semantic_perception_enable_topic'),
+            'process_every_n_frames':
+                LaunchConfiguration('yolo_process_every_n_frames'),
+            # 'inference_enabled_at_startup': False,
+            'inference_enabled_at_startup': True, 
+
         }],
     )
     
