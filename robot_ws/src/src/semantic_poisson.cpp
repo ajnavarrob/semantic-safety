@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <cfloat>
+#include <limits>
+#include <cstdint>
 #include <set>
 #include <shared_mutex>
 
@@ -184,6 +186,7 @@ public:
         if (boundary_temp_) std::free(boundary_temp_);
         if (inflate_bound_temp_) std::free(inflate_bound_temp_);
         if (inflate_class_temp_) std::free(inflate_class_temp_);
+        if (semantic_class_slices_) std::free(semantic_class_slices_);
 
         if (robot_kernel_human) std::free(robot_kernel_human);
         if (robot_kernel_obstacle) std::free(robot_kernel_obstacle);
@@ -212,6 +215,82 @@ private:
 
     void occ_grid_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
         handle_occupancy_update(*msg);
+    }
+
+    void semantic_safety_target_callback(
+        nav_msgs::msg::OccupancyGrid::UniquePtr msg
+    ) {
+        if (!msg) {
+            return;
+        }
+
+        if (msg->data.size() != static_cast<std::size_t>(IMAX * JMAX)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "semantic_safety_target size mismatch: got %zu expected %d",
+                msg->data.size(),
+                IMAX * JMAX
+            );
+            return;
+        }
+
+        if (std::abs(msg->info.resolution - DS) > 1.0e-5f) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "semantic_safety_target resolution mismatch: got %.6f expected %.6f",
+                msg->info.resolution,
+                static_cast<double>(DS)
+            );
+            return;
+        }
+
+        if (msg->info.width != static_cast<std::uint32_t>(JMAX) ||
+            msg->info.height != static_cast<std::uint32_t>(IMAX)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "semantic_safety_target geometry mismatch: got %ux%u expected %dx%d",
+                msg->info.width,
+                msg->info.height,
+                JMAX,
+                IMAX
+            );
+            return;
+        }
+
+        const double expected_origin_x = -0.5 * static_cast<double>(JMAX) * DS;
+        const double expected_origin_y = -0.5 * static_cast<double>(IMAX) * DS;
+
+        if (std::abs(msg->info.origin.position.x - expected_origin_x) > 1.0e-3 ||
+            std::abs(msg->info.origin.position.y - expected_origin_y) > 1.0e-3) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "semantic_safety_target origin mismatch: got (%.3f, %.3f) expected (%.3f, %.3f)",
+                msg->info.origin.position.x,
+                msg->info.origin.position.y,
+                expected_origin_x,
+                expected_origin_y
+            );
+            return;
+        }
+
+        int occupied_cells = 0;
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            const bool occupied =
+                static_cast<int>(msg->data[n]) >= semantic_safety_occupied_threshold_;
+            external_semantic_safety_grid_[n] = occupied ? 1 : 0;
+            occupied_cells += occupied ? 1 : 0;
+        }
+
+        external_semantic_safety_received_ = true;
+        external_semantic_safety_timestamp_ = std::chrono::steady_clock::now();
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "Received combined semantic safety target with %d occupied cells",
+            occupied_cells
+        );
     }
 
     void class_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
@@ -321,6 +400,10 @@ private:
         build_inflated_boundaries(semantic_output.tight_area);
 
         auto guidance_output = build_guidance_field(semantic_output.active_tracks);
+
+        // Publish the exact orientation slice of the boundary array that is
+        // about to be passed to the Poisson safety-field solve.
+        publish_poisson_solver_boundary(guidance_output.bound_guidance);
 
         bool solved = solve_safety_field(guidance_output);
 
@@ -458,7 +541,8 @@ private:
             IMAX * JMAX * QMAX * sizeof(float)
         );
     
-        find_boundary(hgrid_temp_, occ1, false, false, nullptr);
+        // Serial path; slice 0's scratch is free at this point.
+        find_boundary(hgrid_temp_, occ1, false, false, nullptr, boundary_temp_);
     }
 
     SemanticStageOutput run_semantic_fusion() {
@@ -467,10 +551,39 @@ private:
 
         std::fill(semantic_target_grid_.begin(), semantic_target_grid_.end(), 0);
 
+        // Keep the legacy class-map/human-tracker path active for relational
+        // constraints and as a fallback when the external fuser is absent.
         label_human_clusters(occ1);
 
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            semantic_target_grid_[n] = class_map_expanded[n];
+        const auto now = std::chrono::steady_clock::now();
+        const double semantic_age_sec = external_semantic_safety_received_
+            ? std::chrono::duration<double>(
+                  now - external_semantic_safety_timestamp_
+              ).count()
+            : std::numeric_limits<double>::infinity();
+
+        const bool external_target_is_fresh =
+            external_semantic_safety_received_ &&
+            (semantic_safety_max_age_sec_ <= 0.0 ||
+             semantic_age_sec <= semantic_safety_max_age_sec_);
+
+        if (external_target_is_fresh) {
+            semantic_target_grid_ = external_semantic_safety_grid_;
+        } else {
+            for (int n = 0; n < IMAX * JMAX; ++n) {
+                semantic_target_grid_[n] = class_map_expanded[n] > 0 ? 1 : 0;
+            }
+
+            if (external_semantic_safety_received_) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    2000,
+                    "Combined semantic safety target is stale (age=%.3f s, limit=%.3f s); using legacy class_map_expanded fallback",
+                    semantic_age_sec,
+                    semantic_safety_max_age_sec_
+                );
+            }
         }
 
         out.active_tracks = human_tracker_->get_active_tracks();
@@ -742,22 +855,53 @@ private:
         }
     }
 
+    // The semantic layer carries forbidden regions that have no physical LiDAR
+    // return (e.g. the exclusion zones published on /semantic_safety_target), so
+    // they have to be stamped into the boundary array with the same sign
+    // convention as occ1 (-1 = occupied) before inflation. Otherwise
+    // inflate_occupancy_grid() skips them, since it only expands cells that are
+    // already occupied and uses the class map purely to select the kernel.
+    void stamp_semantic_cells_as_occupied(float* bound_slice) {
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (semantic_current_grid_[n] > 0) {
+                bound_slice[n] = -1.0f;
+            }
+        }
+    }
+
     void build_inflated_boundaries(bool tight_area) {
         ScopedTimer timer(timing_.geometry_shaping_ms);
 
-        float* bound_q0 = bound;
-        std::memcpy(bound_q0, occ1, IMAX * JMAX * sizeof(float));
-        inflate_occupancy_grid(bound_q0, semantic_current_grid_.data());
+        // Seed every yaw slice with its own copy of the semantic class map.
+        // inflate_occupancy_grid() dilates these labels using that slice's
+        // orientation-specific kernel, so each slice must start from the same
+        // clean input and dilate into private storage. Sharing one map made the
+        // result depend on OpenMP scheduling.
+        for (int q = 0; q < QMAX; ++q) {
+            std::memcpy(semantic_class_slices_ + q * IMAX * JMAX,
+                        semantic_current_grid_.data(),
+                        IMAX * JMAX * sizeof(int8_t));
+        }
 
         #pragma omp parallel for num_threads(4)
         for (int q = 0; q < QMAX; ++q) {
-            float* bound_slice = bound + q * IMAX * JMAX;
-            float* hgrid_slice = hgrid_temp_ + q * IMAX * JMAX;
-            if (q != 0) {
-                std::memcpy(bound_slice, occ1, IMAX * JMAX * sizeof(float));
-                inflate_occupancy_grid(bound_slice, semantic_current_grid_.data());
-            }
-            find_boundary(hgrid_slice, bound_slice, true, tight_area, semantic_current_grid_.data());
+            const int offset = q * IMAX * JMAX;
+
+            float* bound_slice = bound + offset;
+            float* hgrid_slice = hgrid_temp_ + offset;
+            int8_t* class_slice = semantic_class_slices_ + offset;
+
+            float* bound_scratch = inflate_bound_temp_ + offset;
+            int8_t* class_scratch = inflate_class_temp_ + offset;
+            float* boundary_scratch = boundary_temp_ + offset;
+
+            std::memcpy(bound_slice, occ1, IMAX * JMAX * sizeof(float));
+            stamp_semantic_cells_as_occupied(bound_slice);
+            inflate_occupancy_grid(bound_slice, class_slice,
+                                   bound_scratch, class_scratch);
+
+            find_boundary(hgrid_slice, bound_slice, true, tight_area,
+                          class_slice, boundary_scratch);
         }
     }
 
@@ -782,15 +926,19 @@ private:
         {
             ScopedTimer timer(timing_.guidance_boundary_setup_ms);
         
-            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound, semantic_current_grid_.data(),
+            // Each slice reads the class map that was dilated alongside its own
+            // boundary in build_inflated_boundaries().
+            compute_boundary_gradients(guidance_x_temp_, guidance_y_temp_, bound,
+                                       semantic_class_slices_,
                                        x[0], x[1], vn_body_x, vn_body_y, true);
-        
+
             #pragma omp parallel for num_threads(4)
             for (int q = 1; q < QMAX; ++q) {
                 float* bound_slice = bound + q * IMAX * JMAX;
                 float* gx = guidance_x_temp_ + q * IMAX * JMAX;
                 float* gy = guidance_y_temp_ + q * IMAX * JMAX;
-                compute_boundary_gradients(gx, gy, bound_slice, semantic_current_grid_.data(),
+                compute_boundary_gradients(gx, gy, bound_slice,
+                                           semantic_class_slices_ + q * IMAX * JMAX,
                                            x[0], x[1], vn_body_x, vn_body_y, false);
             }
         }
@@ -1059,6 +1207,59 @@ private:
     // ============================================================
     // 6. VISUALIZATION / LOGGING / EXPERIMENT SUPPORT
     // ============================================================
+
+    void publish_poisson_solver_boundary(const float* solver_bound) {
+        if (!poisson_solver_boundary_pub_ || !solver_bound) {
+            return;
+        }
+
+        nav_msgs::msg::OccupancyGrid msg;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = "body_link";
+
+        msg.info.resolution = DS;
+        msg.info.width = JMAX;
+        msg.info.height = IMAX;
+        msg.info.origin.position.x =
+            -0.5 * static_cast<double>(JMAX) * static_cast<double>(DS);
+        msg.info.origin.position.y =
+            -0.5 * static_cast<double>(IMAX) * static_cast<double>(DS);
+        msg.info.origin.position.z = 0.0;
+        msg.info.origin.orientation.x = 0.0;
+        msg.info.origin.orientation.y = 0.0;
+        msg.info.origin.orientation.z = 0.0;
+        msg.info.origin.orientation.w = 1.0;
+
+        msg.data.resize(IMAX * JMAX);
+
+        // The Poisson domain has one 2-D boundary slice per discretized yaw.
+        // Visualize the slice corresponding to the robot's current yaw.
+        const float q_float = yaw_to_q(x[2], xc[2]);
+        const int q_vis = static_cast<int>(q_wrap(std::round(q_float)));
+        const float* bound_slice =
+            solver_bound + q_vis * IMAX * JMAX;
+
+        int occupied_cells = 0;
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            // Preserve the same sign convention used by render_visualization():
+            // bound <= 0 is a forbidden/boundary cell for the Poisson solver.
+            const bool forbidden = bound_slice[n] <= 0.0f;
+            msg.data[n] = forbidden ? 100 : 0;
+            occupied_cells += forbidden ? 1 : 0;
+        }
+
+        poisson_solver_boundary_pub_->publish(msg);
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "Published Poisson solver boundary: q=%d, forbidden=%d, free=%d",
+            q_vis,
+            occupied_cells,
+            IMAX * JMAX - occupied_cells
+        );
+    }
 
     void render_visualization() {
         if (!poisson_image_pub_) {
@@ -1919,6 +2120,9 @@ private:
         semantic_previous_grid_.assign(IMAX * JMAX, 0);
         semantic_target_grid_.assign(IMAX * JMAX, 0);
         semantic_current_grid_.assign(IMAX * JMAX, 0);
+        external_semantic_safety_grid_.assign(IMAX * JMAX, 0);
+        external_semantic_safety_received_ = false;
+        external_semantic_safety_timestamp_ = std::chrono::steady_clock::now();
         
         for (int n = 0; n < IMAX * JMAX; ++n) {
             occ1[n] = 1.0f;
@@ -2030,6 +2234,12 @@ private:
         this->declare_parameter("human_persistence_threshold", 0.25);
         this->declare_parameter("human_persistence_observation_value", 1.0);
         this->declare_parameter("constraints_reload_hz", 0.1);
+        this->declare_parameter(
+            "semantic_safety_target_topic",
+            "/semantic_safety_target"
+        );
+        this->declare_parameter("semantic_safety_occupied_threshold", 50);
+        this->declare_parameter("semantic_safety_max_age_sec", 1.0);
     
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
@@ -2041,6 +2251,13 @@ private:
         human_persistence_decay_ = static_cast<float>(this->get_parameter("human_persistence_decay").as_double());
         human_persistence_threshold_ = static_cast<float>(this->get_parameter("human_persistence_threshold").as_double());
         human_persistence_observation_value_ = static_cast<float>(this->get_parameter("human_persistence_observation_value").as_double());
+        semantic_safety_target_topic_ =
+            this->get_parameter("semantic_safety_target_topic").as_string();
+        semantic_safety_occupied_threshold_ = static_cast<int>(
+            this->get_parameter("semantic_safety_occupied_threshold").as_int()
+        );
+        semantic_safety_max_age_sec_ =
+            this->get_parameter("semantic_safety_max_age_sec").as_double();
     
         initialize_logging_outputs();
     
@@ -2187,6 +2404,13 @@ private:
         // );
     
         RCLCPP_INFO(this->get_logger(), "Logging publish rate: %.1f Hz", logging_publish_hz_);
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Semantic safety input: topic=%s threshold=%d max_age=%.2f s",
+            semantic_safety_target_topic_.c_str(),
+            semantic_safety_occupied_threshold_,
+            semantic_safety_max_age_sec_
+        );
     }
     
     void allocate_persistent_buffers() {
@@ -2263,14 +2487,25 @@ private:
         forcing_zero_temp_ = static_cast<float*>(std::calloc(IMAX * JMAX * QMAX, sizeof(float)));
         bound_guidance_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
         class_map_temp_expanded_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
-        boundary_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
-        inflate_bound_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * sizeof(float)));
-        inflate_class_temp_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * sizeof(int8_t)));
-    
+
+        // One scratch slice per yaw layer. build_inflated_boundaries() runs its
+        // q loop under OpenMP, so every buffer touched inside find_boundary()
+        // and inflate_occupancy_grid() must be private to the slice being
+        // processed; a single shared scratch buffer would be a data race.
+        boundary_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        inflate_bound_temp_ = static_cast<float*>(std::malloc(IMAX * JMAX * QMAX * sizeof(float)));
+        inflate_class_temp_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * QMAX * sizeof(int8_t)));
+
+        // Per-slice copy of the semantic class map. inflate_occupancy_grid()
+        // dilates the class labels along with the boundary, so each yaw layer
+        // needs its own copy to dilate independently from the same input.
+        semantic_class_slices_ = static_cast<int8_t*>(std::malloc(IMAX * JMAX * QMAX * sizeof(int8_t)));
+
         if (!hgrid_temp_ || !guidance_x_temp_ || !guidance_y_temp_ ||
             !forcing_zero_temp_ || !bound_guidance_temp_ ||
             !class_map_temp_expanded_ || !boundary_temp_ ||
-            !inflate_bound_temp_ || !inflate_class_temp_) {
+            !inflate_bound_temp_ || !inflate_class_temp_ ||
+            !semantic_class_slices_) {
             RCLCPP_ERROR(this->get_logger(), "Memory allocation failed for persistent temporary buffers");
             throw std::runtime_error("Temporary buffer allocation failed");
         }
@@ -2333,6 +2568,22 @@ private:
             std::bind(&PoissonControllerNode::occ_grid_callback, this, std::placeholders::_1),
             options_occ
         );
+
+        // The semantic_map_fuser publishes the union of all already-expanded
+        // class-specific safety targets on this topic. It shares the occupancy
+        // callback group so the external semantic grid cannot be modified while
+        // an occupancy update is constructing a new Poisson field.
+        semantic_safety_target_suber_ =
+            this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+                semantic_safety_target_topic_,
+                rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+                std::bind(
+                    &PoissonControllerNode::semantic_safety_target_callback,
+                    this,
+                    std::placeholders::_1
+                ),
+                options_occ
+            );
     
         class_map_suber_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
             "class_map", 1,
@@ -2365,6 +2616,11 @@ private:
         );
     
         poisson_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/poisson/visualization", 10);
+        poisson_solver_boundary_pub_ =
+            this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+                "/poisson/solver_boundary",
+                rclcpp::QoS(rclcpp::KeepLast(1)).reliable()
+            );
         logging_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/logging_data", 10);
         profiling_data_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/poisson/profiling_data", 10);
         relational_debug_grid_.resize(IMAX * JMAX, 0);
@@ -2482,7 +2738,10 @@ private:
         }
     }
 
-    void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area, const int8_t* class_map) {
+    // scratch must be an IMAX * JMAX buffer private to the caller; this runs
+    // concurrently across yaw slices.
+    void find_boundary(float* grid, float* bound, bool fix_flag, bool tight_area,
+                       const int8_t* class_map, float* scratch) {
         for (int i = 0; i < IMAX; ++i) {
             for (int j = 0; j < JMAX; ++j) {
                 if (i == 0 || i == IMAX - 1 || j == 0 || j == JMAX - 1) {
@@ -2490,9 +2749,9 @@ private:
                 }
             }
         }
-    
-        std::memcpy(boundary_temp_, bound, IMAX * JMAX * sizeof(float));
-        float* b0 = boundary_temp_;
+
+        std::memcpy(scratch, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = scratch;
     
         for (int i = 1; i < IMAX - 1; ++i) {
             for (int j = 1; j < JMAX - 1; ++j) {
@@ -2528,8 +2787,8 @@ private:
     }
 
     int initialize_robot_kernel(float*& kernel, float mos) {
-        robot_length = 0.7f;
-        robot_width = 0.3f;
+        robot_length = 0.9f;
+        robot_width = 0.5f;
     
         const float ar = robot_length / 2.0f + mos;
         const float br = robot_width / 2.0f + mos;
@@ -2582,11 +2841,16 @@ private:
     }
 
 
-    void inflate_occupancy_grid(float* bound, int8_t* class_map) {
-        std::memcpy(inflate_bound_temp_, bound, IMAX * JMAX * sizeof(float));
-        float* b0 = inflate_bound_temp_;
-        
-        int8_t* c0 = inflate_class_temp_;
+    // bound_scratch (float) and class_scratch (int8_t) must be IMAX * JMAX
+    // buffers private to the caller; this runs concurrently across yaw slices.
+    // class_map is read and written (labels dilate with the boundary), so it
+    // must be per-slice as well.
+    void inflate_occupancy_grid(float* bound, int8_t* class_map,
+                                float* bound_scratch, int8_t* class_scratch) {
+        std::memcpy(bound_scratch, bound, IMAX * JMAX * sizeof(float));
+        float* b0 = bound_scratch;
+
+        int8_t* c0 = class_scratch;
         if (class_map) {
             std::memcpy(c0, class_map, IMAX * JMAX * sizeof(int8_t));
         }
@@ -3260,7 +3524,7 @@ private:
     bool dhdt_flag = false;
     bool save_flag = false;
     bool start_flag = false;
-    bool enable_display = false;
+    bool enable_display = true;
     bool sit_flag = false;
     bool stop_flag = false;
     bool predictive_sf_flag = false;
@@ -3315,6 +3579,7 @@ private:
     float* boundary_temp_{};
     float* inflate_bound_temp_{};
     int8_t* inflate_class_temp_{};
+    int8_t* semantic_class_slices_{};
 
     bool new_constraint_event_flag_{false};
     int constraint_event_counter_{0};
@@ -3350,6 +3615,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr key_suber_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr occ_grid_suber_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr semantic_safety_target_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr class_map_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr visibility_map_suber_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_suber_;
@@ -3365,6 +3631,15 @@ private:
     std::vector<int8_t> semantic_previous_grid_;
     std::vector<int8_t> semantic_target_grid_;
     std::vector<int8_t> semantic_current_grid_;
+
+    // Combined expanded target produced by semantic_map_fuser.
+    std::vector<int8_t> external_semantic_safety_grid_;
+    bool external_semantic_safety_received_{false};
+    std::chrono::steady_clock::time_point external_semantic_safety_timestamp_;
+    std::string semantic_safety_target_topic_{"/semantic_safety_target"};
+    int semantic_safety_occupied_threshold_{50};
+    double semantic_safety_max_age_sec_{1.0};
+
     std::vector<float> persistent_human_confidence_;
     std::vector<uint8_t> persistent_human_mask_;
     
@@ -3407,6 +3682,8 @@ private:
     std::ofstream outFileBIN;
     std::ofstream outFileMPCVel;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr poisson_image_pub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
+        poisson_solver_boundary_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_data_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr profiling_data_pub_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr semantic_occupancy_pub_;

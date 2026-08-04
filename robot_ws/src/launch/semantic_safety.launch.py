@@ -376,7 +376,7 @@ def generate_launch_description():
             # Retain floor-level semantic objects
             'semantic_z_min': -1.0,
             'semantic_z_max': 3.5,
-            'pointcloud_max_age_sec': 0.35,
+            'pointcloud_max_age_sec': 0.5,
             'tf_timeout_sec': 0.10,
 
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
@@ -446,7 +446,7 @@ def generate_launch_description():
             # Retain floor-level semantic objects
             'semantic_z_min': -1.0,
             'semantic_z_max': 3.5,
-            'pointcloud_max_age_sec': 0.35,
+            'pointcloud_max_age_sec': 0.5,
             'tf_timeout_sec': 0.10,
 
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
@@ -528,7 +528,10 @@ def generate_launch_description():
             'logging_publish_hz': LaunchConfiguration('logging_publish_hz'),
             'enable_data_logging_to_file': LaunchConfiguration('enable_data_logging_to_file'),
             "constraints_path": "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json",
-            "constraints_reload_hz": 0.1
+            "constraints_reload_hz": 0.1,
+            'semantic_safety_target_topic': '/semantic_safety_target',
+        'semantic_safety_occupied_threshold': 50,
+        'semantic_safety_max_age_sec': 1.0,
         }],
     )
     
@@ -537,6 +540,45 @@ def generate_launch_description():
         executable='semantic_map_fuser.py',
         name='semantic_map_fuser',
         output='screen',
+        parameters=[{
+            'semantic_observation_prefix': '/semantic_observations',
+            'semantic_layer_prefix': '/semantic_layers',
+            'semantic_safety_target_prefix': '/semantic_safety_targets',
+
+            'publish_rate_hz': 10.0,
+            'log_rate_hz': 1.0,
+            'occupied_threshold': 50,
+            'output_frame': 'body_link',
+
+            'human_timeout_sec': 0.75,
+            'traffic_cone_timeout_sec': 1.0,
+            'caution_tape_timeout_sec': 1.0,
+            'floor_danger_tape_timeout_sec': 2.0,
+            'wet_floor_sign_timeout_sec': 2.0,
+            'spill_timeout_sec': 2.0,
+
+            # Use exactly the same JSON path as semantic_poisson.
+            'constraints_path': '/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json',
+            'constraints_reload_hz': 0.1,
+
+            'max_buffer_distance_m': 5.0,
+
+            # Detection alone does not make an object forbidden.
+            'empty_target_without_rule': True,
+
+            # Must match visibility_map_topic on the two yolo_detector nodes
+            # above, which publish under the per-camera observation prefix.
+            'front_visibility_topic': '/semantic_observations/front/visibility',
+            'rear_visibility_topic': '/semantic_observations/rear/visibility',
+            'fused_visibility_topic': '/visibility_map',
+
+            # Preserve current semantic_poisson compatibility.
+            'publish_legacy_outputs': True,
+            'legacy_class_map_topic': '/class_map',
+
+            'publish_combined_safety_target': True,
+            'combined_safety_target_topic': '/semantic_safety_target',
+        }],
     )
 
     # Human Tracking Node (Gimbal Control)

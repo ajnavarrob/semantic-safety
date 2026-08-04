@@ -13,13 +13,12 @@ from constraint_set_lifecycle import apply_runtime_lifecycle
 RUNTIME_JSON_PATH = "/home/unitree/semantic-safety-master/robot_ws/src/src/constraints_lab_demo.json"
 
 OBSERVABLE_CLASSES = [
-    "person",
-    "chair",
-    "table",
-    "wall",
-    "door",
-    "sign",
-    "cup",
+    "human",
+    "traffic_cone",
+    "caution_tape",
+    "floor_danger_tape",
+    "wet_floor_sign",
+    "spill",
 ]
 
 def load_runtime_json_or_default(path: str) -> dict:
