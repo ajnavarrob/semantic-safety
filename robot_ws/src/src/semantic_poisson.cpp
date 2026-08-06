@@ -2889,8 +2889,7 @@ private:
         }
 
         const float safe_dt = std::clamp(dt, 1.0e-4f, 0.2f);
-        const float step =
-            static_cast<float>(admission_v_admissible_mps_) * safe_dt;
+        const float step = static_cast<float>(0.1) * safe_dt;
 
         for (std::size_t n = 0; n < semantic_sdf_active_.size(); ++n) {
             float delta = b_target[n] - semantic_sdf_active_[n];
