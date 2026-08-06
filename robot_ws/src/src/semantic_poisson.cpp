@@ -2863,7 +2863,55 @@ private:
         return grid;
     }
 
+    // Applied only to the path that currently has *no* rate limiting 
+    // at all: when semantic_update_ is not
+    // running an active INSERTING/REMOVING/TRANSITIONING homotopy,
+    // build_semantic_grid_for_lambda() returns semantic_target_grid_
+    // unmodified every tick
+    //slew-rate limiter :
+    //     b_active += clamp(b_target - b_active, -v*dt, +v*dt)
+    // run on the semantic-only occupancy's SDF.
+    //
+    // v is reused as the growth speed since it
+    // already represents "how fast can the robot plausibly react,"
+    void advance_semantic_boundary_sdf(float dt) {
+        
+        //this is the target boundary which can flip every tick
+        const auto b_target =
+            compute_signed_distance_field(semantic_target_grid_);
+
+        if (semantic_sdf_active_.size() != b_target.size()) {
+            // First tick this is enabled (or grid just got (re)sized):
+            // seed from whatever is currently active so turning the flag
+            // on doesn't itself introduce a jump.
+            semantic_sdf_active_ =
+                compute_signed_distance_field(semantic_current_grid_);
+        }
+
+        const float safe_dt = std::clamp(dt, 1.0e-4f, 0.2f);
+        const float step =
+            static_cast<float>(admission_v_admissible_mps_) * safe_dt;
+
+        for (std::size_t n = 0; n < semantic_sdf_active_.size(); ++n) {
+            float delta = b_target[n] - semantic_sdf_active_[n];
+            delta = std::clamp(delta, -step, step);
+            semantic_sdf_active_[n] += delta;
+        }
+
+        semantic_current_grid_.assign(IMAX * JMAX, 0);
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            semantic_current_grid_[n] =
+                (semantic_sdf_active_[n] <= 0.0f) ? 1 : 0;
+        }
+    }
+
     void update_interpolated_semantic_grid() {
+        if (enable_sdf_rate_limited_semantic_growth_ &&
+            !semantic_update_.active) {
+            advance_semantic_boundary_sdf(dt_grid);
+            return;
+        }
+
         semantic_current_grid_ =
             build_semantic_grid_for_lambda(semantic_update_.lambda);
     }
@@ -3480,6 +3528,7 @@ private:
         semantic_previous_grid_.assign(IMAX * JMAX, 0);
         semantic_target_grid_.assign(IMAX * JMAX, 0);
         semantic_current_grid_.assign(IMAX * JMAX, 0);
+        semantic_sdf_active_.clear(); // lazily (re)seeded on first use
         external_semantic_safety_grid_.assign(IMAX * JMAX, 0);
         admitted_external_semantic_grid_snapshot_.assign(IMAX * JMAX, 0);
         rejected_candidate_external_grid_.assign(IMAX * JMAX, 0);
@@ -3602,7 +3651,13 @@ private:
         );
         this->declare_parameter("semantic_safety_occupied_threshold", 50);
         this->declare_parameter("semantic_safety_max_age_sec", 1.0);
-    
+
+        // Stage B PoC: rate-limits the semantic layer's SDF (instead of
+        // snapping semantic_current_grid_ straight to semantic_target_grid_)
+        // whenever there is no active INSERTING/REMOVING/TRANSITIONING
+        // homotopy running. Off by default -- one-line revert.
+        this->declare_parameter("enable_sdf_rate_limited_semantic_growth", false);
+
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
         logging_publish_hz_ = this->get_parameter("logging_publish_hz").as_double();
@@ -3620,6 +3675,8 @@ private:
         );
         semantic_safety_max_age_sec_ =
             this->get_parameter("semantic_safety_max_age_sec").as_double();
+        enable_sdf_rate_limited_semantic_growth_ =
+            this->get_parameter("enable_sdf_rate_limited_semantic_growth").as_bool();
     
         initialize_logging_outputs();
     
@@ -5032,6 +5089,10 @@ private:
     std::vector<int8_t> semantic_previous_grid_;
     std::vector<int8_t> semantic_target_grid_;
     std::vector<int8_t> semantic_current_grid_;
+
+    // Rate Limiting semantic boundary growth (see enable_sdf_rate_limited_semantic_growth_).
+    bool enable_sdf_rate_limited_semantic_growth_{false};
+    std::vector<float> semantic_sdf_active_;
 
     std::vector<float> physical_occ_previous_;
     std::vector<float> physical_occ_current_;
