@@ -41,6 +41,7 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/u_int64.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "unitree_api/msg/request.hpp"
@@ -172,11 +173,12 @@ struct SemanticUpdateState {
     float lambda_dot{0.0f};
 
     float lambda_dot_min{0.05f};
-    float lambda_dot_max{0.5f};
+    float lambda_dot_max{1.0f};
     float max_update_time_sec{20.0f};
 
-    // Temporary until the admission/MPC layer controls semantic update speed.
-    float commanded_lambda_dot{0.5f};
+    // Faster nominal semantic-boundary command. Admission still limits each
+    // executed metric shell against admission_v_admissible_mps.
+    float commanded_lambda_dot{1.0f};
 
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_update_time;
@@ -207,6 +209,13 @@ public:
     
         initialize_clocks_and_flags();
         initialize_static_grids();
+
+        // initialize_static_grids() zero-initializes the radius/activity arrays.
+        // Reapply the already-loaded admitted constraint configuration here so
+        // startup with an existing semantic rule does not silently lose its
+        // buffer state.
+        refresh_semantic_buffer_state_from_admitted_config();
+
         allocate_persistent_buffers();
         initialize_robot_kernels();
         initialize_mpc();
@@ -307,8 +316,10 @@ private:
             return;
         }
 
-        const double expected_origin_x = -0.5 * static_cast<double>(JMAX) * DS;
-        const double expected_origin_y = -0.5 * static_cast<double>(IMAX) * DS;
+        const double expected_origin_x =
+            -0.5 * static_cast<double>(JMAX) * DS;
+        const double expected_origin_y =
+            -0.5 * static_cast<double>(IMAX) * DS;
 
         if (std::abs(msg->info.origin.position.x - expected_origin_x) > 1.0e-3 ||
             std::abs(msg->info.origin.position.y - expected_origin_y) > 1.0e-3) {
@@ -335,52 +346,210 @@ private:
             occupied_cells += occupied ? 1 : 0;
         }
 
-        // After an admission rejection the external fuser may publish one or
-        // more frames generated from the rejected JSON before it notices the
-        // file rollback.  Do not allow those stale candidate frames to leak
-        // into NORMAL operation.
-        if (rollback_waiting_for_external_refresh_ &&
-            !rejected_candidate_external_grid_.empty() &&
-            incoming_semantic_grid == rejected_candidate_external_grid_) {
+        const auto now = std::chrono::steady_clock::now();
+
+        // Candidate rule geometry is synthesized in shadow mode.  It can be
+        // observed and admitted without replacing the currently enforced map.
+        if (semantic_update_.mode == SemanticUpdateMode::EVALUATING &&
+            candidate_constraint_pending_) {
+
+            if (!candidate_revision_acknowledged_ ||
+                !latest_fuser_revision_received_ ||
+                latest_fuser_constraint_revision_ !=
+                    static_cast<std::uint64_t>(
+                        candidate_constraints_file_signature_
+                    )) {
+
+                RCLCPP_INFO_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    1000,
+                    "Ignoring semantic target while waiting for candidate revision acknowledgement (expected=%llu, latest=%llu)",
+                    static_cast<unsigned long long>(
+                        candidate_constraints_file_signature_
+                    ),
+                    static_cast<unsigned long long>(
+                        latest_fuser_constraint_revision_
+                    )
+                );
+                return;
+            }
+
+            candidate_external_semantic_grid_ =
+                std::move(incoming_semantic_grid);
+
+            candidate_external_semantic_received_ = true;
+            candidate_external_semantic_timestamp_ = now;
+
+            // For a live-world radius homotopy we must not require the
+            // candidate geometry to become spatially static. A revision-
+            // matched target publication is sufficient evidence that the
+            // fuser has loaded the candidate configuration and produced at
+            // least one observation under it. The actual structural admission
+            // test is performed from the current live /class_map.
+            semantic_candidate_target_ready_ =
+                candidate_revision_acknowledged_ &&
+                candidate_external_semantic_received_;
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                500,
+                "Shadow candidate target: occupied=%d revision_matched=%d ready=%d",
+                occupied_cells,
+                candidate_revision_acknowledged_ ? 1 : 0,
+                semantic_candidate_target_ready_ ? 1 : 0
+            );
+
+            return;
+        }
+
+        // Determine which constraint revision is allowed to own incoming
+        // semantic target maps in the current state.
+        //
+        // NORMAL:
+        //   only the admitted revision is valid.
+        //
+        // EVALUATING / active homotopy:
+        //   the candidate revision remains authoritative for the target
+        //   geometry until the transaction either commits or rolls back.
+        const bool candidate_transaction_active =
+            candidate_constraint_pending_ &&
+            (
+                semantic_update_.mode ==
+                    SemanticUpdateMode::EVALUATING ||
+                semantic_update_.mode ==
+                    SemanticUpdateMode::INSERTING_CONSTRAINT ||
+                semantic_update_.mode ==
+                    SemanticUpdateMode::REMOVING_CONSTRAINT ||
+                semantic_update_.mode ==
+                    SemanticUpdateMode::TRANSITIONING_CONSTRAINT
+            );
+
+        const std::uint64_t expected_revision =
+            candidate_transaction_active
+                ? static_cast<std::uint64_t>(
+                      candidate_constraints_file_signature_
+                  )
+                : static_cast<std::uint64_t>(
+                      admitted_constraints_file_signature_
+                  );
+
+        if (!latest_fuser_revision_received_ ||
+            latest_fuser_constraint_revision_ !=
+                expected_revision) {
 
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 1000,
-                "Ignoring stale semantic_safety_target generated from the rejected candidate while waiting for the fuser to reload the admitted constraints"
+                "Ignoring semantic target with unexpected revision (mode=%d, expected=%llu, latest=%llu)",
+                static_cast<int>(semantic_update_.mode),
+                static_cast<unsigned long long>(
+                    expected_revision
+                ),
+                static_cast<unsigned long long>(
+                    latest_fuser_constraint_revision_
+                )
             );
             return;
         }
 
-        if (rollback_waiting_for_external_refresh_) {
-            rollback_waiting_for_external_refresh_ = false;
-
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Received refreshed semantic target after constraint rollback"
-            );
-        }
-
+        // Expanded fuser output is now diagnostic/reference only.
+        // Runtime geometry is built from live /class_map + current radii.
         external_semantic_safety_grid_ =
             std::move(incoming_semantic_grid);
 
         external_semantic_safety_received_ = true;
-        external_semantic_safety_timestamp_ =
-            std::chrono::steady_clock::now();
+        external_semantic_safety_timestamp_ = now;
 
-        if (semantic_update_.mode == SemanticUpdateMode::EVALUATING &&
-            external_semantic_safety_timestamp_ >=
-                semantic_update_.evaluation_start_time) {
-            semantic_candidate_target_ready_ = true;
+        if (candidate_transaction_active) {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Accepted candidate semantic target during active transaction: revision=%llu mode=%d",
+                static_cast<unsigned long long>(
+                    latest_fuser_constraint_revision_
+                ),
+                static_cast<int>(
+                    semantic_update_.mode
+                )
+            );
+        } else {
+            admitted_external_semantic_grid_snapshot_ =
+                external_semantic_safety_grid_;
         }
 
         RCLCPP_INFO_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
             1000,
-            "Received combined semantic safety target with %d occupied cells",
+            "Received semantic safety target with %d occupied cells",
             occupied_cells
         );
+    }
+
+    void semantic_safety_target_revision_callback(
+        std_msgs::msg::UInt64::UniquePtr msg
+    ) {
+        if (!msg) {
+            return;
+        }
+
+        latest_fuser_constraint_revision_ =
+            static_cast<std::uint64_t>(msg->data);
+
+        latest_fuser_revision_received_ = true;
+
+        if (candidate_constraint_pending_ &&
+            semantic_update_.mode == SemanticUpdateMode::EVALUATING &&
+            latest_fuser_constraint_revision_ ==
+                static_cast<std::uint64_t>(
+                    candidate_constraints_file_signature_
+                )) {
+
+            // Acknowledge only once for this candidate.  Repeated revision
+            // publications must not keep resetting the candidate-map
+            // stability counter.
+            if (!candidate_revision_acknowledged_) {
+                candidate_revision_acknowledged_ = true;
+                candidate_revision_ack_time_ =
+                    std::chrono::steady_clock::now();
+
+                candidate_external_semantic_received_ = false;
+                candidate_external_semantic_stable_frames_ = 0;
+                candidate_external_semantic_last_signature_ = 0;
+                semantic_candidate_target_ready_ = false;
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Semantic fuser acknowledged candidate revision=%llu",
+                    static_cast<unsigned long long>(
+                        latest_fuser_constraint_revision_
+                    )
+                );
+            }
+
+            return;
+        }
+
+        if (!candidate_constraint_pending_ &&
+            latest_fuser_constraint_revision_ ==
+                static_cast<std::uint64_t>(
+                    admitted_constraints_file_signature_
+                )) {
+
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                2000,
+                "Semantic fuser revision matches admitted configuration: %llu",
+                static_cast<unsigned long long>(
+                    latest_fuser_constraint_revision_
+                )
+            );
+        }
     }
 
     void class_map_callback(nav_msgs::msg::OccupancyGrid::UniquePtr msg) {
@@ -393,9 +562,85 @@ private:
             );
             return;
         }
-    
+
+        if (semantic_base_previous_.size() !=
+            static_cast<std::size_t>(IMAX * JMAX)) {
+            semantic_base_previous_.assign(IMAX * JMAX, 0);
+            semantic_base_change_mask_.assign(IMAX * JMAX, 0);
+        }
+
+        std::vector<uint8_t> raw_change(IMAX * JMAX, 0);
+
         for (int n = 0; n < IMAX * JMAX; ++n) {
-            class_map[n] = msg->data[n];
+            const int8_t previous = class_map[n];
+            const int8_t current =
+                static_cast<int8_t>(msg->data[n]);
+
+            semantic_base_previous_[n] = previous;
+            class_map[n] = current;
+
+            if (previous != current) {
+                raw_change[n] = 1;
+            }
+        }
+
+        float max_live_buffer_m = 0.0f;
+        for (std::size_t k = 1;
+             k < semantic_buffer_current_m_.size();
+             ++k) {
+            max_live_buffer_m =
+                std::max(
+                    max_live_buffer_m,
+                    semantic_buffer_current_m_[k]
+                );
+        }
+
+        const int radius_cells =
+            std::max(
+                1,
+                static_cast<int>(
+                    std::ceil(
+                        max_live_buffer_m /
+                        static_cast<float>(DS)
+                    )
+                )
+            );
+
+        cv::Mat raw_mask(
+            IMAX,
+            JMAX,
+            CV_8UC1,
+            raw_change.data()
+        );
+
+        const int kernel_size =
+            2 * radius_cells + 1;
+
+        const cv::Mat kernel =
+            cv::getStructuringElement(
+                cv::MORPH_ELLIPSE,
+                cv::Size(kernel_size, kernel_size)
+            );
+
+        cv::Mat dilated_mask;
+
+        cv::dilate(
+            raw_mask,
+            dilated_mask,
+            kernel,
+            cv::Point(-1, -1),
+            1
+        );
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                semantic_base_change_mask_[n] =
+                    dilated_mask.at<uint8_t>(i, j) > 0
+                        ? 1
+                        : 0;
+            }
         }
     }
 
@@ -483,8 +728,8 @@ private:
             return;
         }
 
-        update_semantic_update_state();
         preprocess_occupancy();
+        update_semantic_update_state();
         auto semantic_output = run_semantic_fusion();
 
         build_inflated_boundaries(semantic_output.tight_area);
@@ -660,58 +905,67 @@ private:
         ScopedTimer timer(timing_.semantic_fusion_ms);
         SemanticStageOutput out;
 
-        std::fill(semantic_target_grid_.begin(), semantic_target_grid_.end(), 0);
-
-        // Keep the legacy class-map/human-tracker path active for relational
-        // constraints and as a fallback when the external fuser is absent.
         label_human_clusters(occ1);
 
-        const auto now = std::chrono::steady_clock::now();
-        const double semantic_age_sec = external_semantic_safety_received_
-            ? std::chrono::duration<double>(
-                  now - external_semantic_safety_timestamp_
-              ).count()
-            : std::numeric_limits<double>::infinity();
+        out.active_tracks =
+            human_tracker_->get_active_tracks();
 
-        const bool external_target_is_fresh =
-            external_semantic_safety_received_ &&
-            (semantic_safety_max_age_sec_ <= 0.0 ||
-             semantic_age_sec <= semantic_safety_max_age_sec_);
+        // Always rebuild the active semantic safety region from the CURRENT
+        // raw semantic geometry and CURRENT admitted/interpolated radii.
+        semantic_current_grid_ =
+            build_live_semantic_buffer_grid(
+                semantic_buffer_current_m_,
+                semantic_buffer_current_active_
+            );
 
-        if (external_target_is_fresh) {
-            semantic_target_grid_ = external_semantic_safety_grid_;
-        } else {
-            for (int n = 0; n < IMAX * JMAX; ++n) {
-                semantic_target_grid_[n] = class_map_expanded[n] > 0 ? 1 : 0;
-            }
+        semantic_occupancy_grid_ =
+            semantic_current_grid_;
 
-            if (external_semantic_safety_received_) {
-                RCLCPP_WARN_THROTTLE(
-                    this->get_logger(),
-                    *this->get_clock(),
-                    2000,
-                    "Combined semantic safety target is stale (age=%.3f s, limit=%.3f s); using legacy class_map_expanded fallback",
-                    semantic_age_sec,
-                    semantic_safety_max_age_sec_
+        apply_relational_constraints_to_semantic_map(
+            out.active_tracks
+        );
+
+        semantic_current_grid_ =
+            semantic_occupancy_grid_;
+
+        if (semantic_update_.mode ==
+                SemanticUpdateMode::EVALUATING &&
+            candidate_constraint_pending_ &&
+            candidate_revision_acknowledged_) {
+
+            // SAME live base geometry, two parameter settings.
+            semantic_previous_grid_ =
+                build_live_semantic_buffer_grid(
+                    semantic_buffer_current_m_,
+                    semantic_buffer_current_active_
                 );
+
+            semantic_candidate_grid_ =
+                build_live_semantic_buffer_grid(
+                    semantic_buffer_target_m_,
+                    semantic_buffer_target_active_
+                );
+
+            apply_relational_constraints_to_candidate_grid(
+                semantic_candidate_grid_,
+                out.active_tracks
+            );
+
+            semantic_target_grid_ =
+                semantic_candidate_grid_;
+
+            // Readiness is set only by receipt of a revision-matched candidate
+            // target. Do not override it merely because a local live map can be
+            // synthesized.
+            if (semantic_candidate_target_ready_) {
+                evaluate_and_begin_semantic_transition();
             }
         }
 
-        out.active_tracks = human_tracker_->get_active_tracks();
-
-        semantic_occupancy_grid_.swap(semantic_target_grid_);
-        apply_relational_constraints_to_semantic_map(out.active_tracks);
-        semantic_target_grid_.swap(semantic_occupancy_grid_);
-
-        if (semantic_update_.mode == SemanticUpdateMode::EVALUATING &&
-            semantic_candidate_target_ready_) {
-            evaluate_and_begin_semantic_transition();
-        }
-
-        update_interpolated_semantic_grid();
         publish_semantic_occupancy_grid();
 
         out.tight_area = is_tight_area();
+
         return out;
     }
 
@@ -726,9 +980,7 @@ private:
         int added_cells_total = 0;
 
         const ConstraintRuntimeConfig& geometry_config =
-            candidate_constraint_pending_
-                ? candidate_constraint_config_
-                : admitted_constraint_config_;
+            admitted_constraint_config_;
 
         for (const auto& rc : geometry_config.constraints) {
             if (!rc.enabled || !rc.enforce) {
@@ -976,6 +1228,167 @@ private:
         }
     }
 
+    void apply_relational_constraints_to_candidate_grid(
+        std::vector<int8_t>& candidate_grid,
+        const std::vector<HumanTrack>& tracks
+    ) {
+        if (tracks.empty()) {
+            return;
+        }
+
+        for (const auto& rc : candidate_constraint_config_.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+
+            if (rc.type != ConstraintType::Relational) {
+                continue;
+            }
+
+            bool target_is_robot = false;
+            for (const auto& target : rc.target_classes) {
+                if (target == "robot") {
+                    target_is_robot = true;
+                    break;
+                }
+            }
+
+            bool reference_is_person = false;
+            for (const auto& ref : rc.reference_classes) {
+                if (ref == "person" || ref == "human") {
+                    reference_is_person = true;
+                    break;
+                }
+            }
+
+            if (!target_is_robot || !reference_is_person) {
+                continue;
+            }
+
+            const float min_radius_m =
+                rc.min_radius_m > 0.0f ? rc.min_radius_m : 0.0f;
+
+            const float max_radius_m =
+                rc.max_radius_m > 0.0f
+                    ? rc.max_radius_m
+                    : (rc.radius_m > 0.0f ? rc.radius_m : 2.0f);
+
+            const float cone_half_angle_deg =
+                rc.cone_half_angle_deg > 0.0f
+                    ? rc.cone_half_angle_deg
+                    : 60.0f;
+
+            const float cos_cone =
+                std::cos(
+                    cone_half_angle_deg *
+                    static_cast<float>(M_PI) /
+                    180.0f
+                );
+
+            const float heading_timeout_sec =
+                rc.heading_timeout_sec > 0.0f
+                    ? rc.heading_timeout_sec
+                    : 5.0f;
+
+            const float now_sec =
+                human_tracker_->get_current_time();
+
+            for (const auto& track : tracks) {
+                if (!track.heading_valid) continue;
+                if (!track.yolo_confirmed &&
+                    !track.yolo_ever_confirmed) continue;
+                if (track.confidence < 0.15f) continue;
+
+                if ((now_sec - track.last_update_time) >
+                    heading_timeout_sec) continue;
+
+                float hx = track.heading_x;
+                float hy = track.heading_y;
+
+                const float hnorm =
+                    std::sqrt(hx * hx + hy * hy);
+
+                if (hnorm < 1.0e-3f) continue;
+
+                hx /= hnorm;
+                hy /= hnorm;
+
+                float cone_x = hx;
+                float cone_y = hy;
+
+                if (rc.relation == "behind") {
+                    cone_x = -hx;
+                    cone_y = -hy;
+                } else if (rc.relation == "in_front_of") {
+                    cone_x = hx;
+                    cone_y = hy;
+                } else if (rc.relation == "left_of") {
+                    cone_x = -hy;
+                    cone_y = hx;
+                } else if (rc.relation == "right_of") {
+                    cone_x = hy;
+                    cone_y = -hx;
+                } else {
+                    continue;
+                }
+
+                const std::string mode =
+                    rc.mode.empty()
+                        ? "forbid_region"
+                        : rc.mode;
+
+                for (int i = 0; i < IMAX; ++i) {
+                    for (int j = 0; j < JMAX; ++j) {
+                        const int n = i * JMAX + j;
+
+                        const float cell_x =
+                            (static_cast<float>(j) -
+                             0.5f * static_cast<float>(JMAX)) * DS;
+
+                        const float cell_y =
+                            (static_cast<float>(i) -
+                             0.5f * static_cast<float>(IMAX)) * DS;
+
+                        const float rx = cell_x - track.x;
+                        const float ry = cell_y - track.y;
+
+                        const float dist =
+                            std::sqrt(rx * rx + ry * ry);
+
+                        if (dist < min_radius_m ||
+                            dist > max_radius_m) {
+                            continue;
+                        }
+
+                        const float dot =
+                            rx * cone_x + ry * cone_y;
+
+                        const float cos_angle =
+                            dot / std::max(dist, 1.0e-6f);
+
+                        const bool inside_selected_region =
+                            dot > 0.0f &&
+                            cos_angle >= cos_cone;
+
+                        bool mark_forbidden = false;
+
+                        if (mode == "forbid_region") {
+                            mark_forbidden =
+                                inside_selected_region;
+                        } else if (mode == "allow_region") {
+                            mark_forbidden =
+                                !inside_selected_region;
+                        }
+
+                        if (mark_forbidden) {
+                            candidate_grid[n] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // The semantic layer carries forbidden regions that have no physical LiDAR
     // return (e.g. the exclusion zones published on /semantic_safety_target), so
     // they have to be stamped into the boundary array with the same sign
@@ -1160,7 +1573,7 @@ private:
 
         const float semantic_boundary_speed =
             semantic_transition_active
-                ? std::max(0.0f, semantic_transition_extent_m_) *
+                ? std::max(0.0f, semantic_metric_extent_m_) *
                   std::abs(semantic_update_.lambda_dot)
                 : 0.0f;
 
@@ -1170,6 +1583,10 @@ private:
                 const bool physical_motion_nearby =
                     !physical_change_mask_.empty() &&
                     physical_change_mask_[n2] != 0;
+
+                const bool semantic_base_motion_nearby =
+                    !semantic_base_change_mask_.empty() &&
+                    semantic_base_change_mask_[n2] != 0;
 
                 for (int q = 0; q < QMAX; ++q) {
                     const int n3 = q * IMAX * JMAX + n2;
@@ -1194,7 +1611,8 @@ private:
                         dhdt_ij = (h1v - h0v) / safe_dt;
 
                         if (semantic_transition_active &&
-                            !physical_motion_nearby) {
+                            !physical_motion_nearby &&
+                            !semantic_base_motion_nearby) {
 
                             const int im = std::max(i - 1, 0);
                             const int ip = std::min(i + 1, IMAX - 1);
@@ -2007,6 +2425,24 @@ private:
         return max_difference;
     }
 
+    std::size_t semantic_grid_signature(
+        const std::vector<int8_t>& grid
+    ) const {
+        std::size_t hash =
+            static_cast<std::size_t>(1469598103934665603ull);
+
+        for (const int8_t value : grid) {
+            hash ^=
+                static_cast<std::size_t>(
+                    static_cast<uint8_t>(value)
+                );
+            hash *=
+                static_cast<std::size_t>(1099511628211ull);
+        }
+
+        return hash;
+    }
+
     ConnectedComponentsData compute_free_space_components(
         const std::vector<int8_t>& forbidden_grid
     ) const {
@@ -2255,6 +2691,280 @@ private:
         }
     }
 
+    double compute_boundary_shell_displacement(
+        const std::vector<int8_t>& current_occupancy,
+        const std::vector<int8_t>& candidate_occupancy
+    ) const {
+        if (current_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX) ||
+            candidate_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX)) {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        // For insertion, measure each newly forbidden cell's distance to the
+        // CURRENT forbidden set.  The maximum is the actual outward boundary
+        // advance represented by this rasterized homotopy step.
+        cv::Mat distance_input_current(
+            IMAX,
+            JMAX,
+            CV_8UC1,
+            cv::Scalar(255)
+        );
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+                if (current_occupancy[n] > 0) {
+                    distance_input_current.at<uint8_t>(i, j) = 0;
+                }
+            }
+        }
+
+        cv::Mat distance_to_current;
+        cv::distanceTransform(
+            distance_input_current,
+            distance_to_current,
+            cv::DIST_L2,
+            cv::DIST_MASK_PRECISE
+        );
+
+        double max_boundary_displacement_m = 0.0;
+
+        for (int i = 0; i < IMAX; ++i) {
+            for (int j = 0; j < JMAX; ++j) {
+                const int n = i * JMAX + j;
+
+                if (current_occupancy[n] == 0 &&
+                    candidate_occupancy[n] > 0) {
+
+                    const double d_m =
+                        static_cast<double>(
+                            distance_to_current.at<float>(i, j)
+                        ) *
+                        static_cast<double>(DS);
+
+                    max_boundary_displacement_m =
+                        std::max(
+                            max_boundary_displacement_m,
+                            d_m
+                        );
+                }
+            }
+        }
+
+        // For removals, use the symmetric construction: measure cells removed
+        // from the current forbidden set against the remaining candidate set.
+        bool has_removal = false;
+
+        for (int n = 0; n < IMAX * JMAX; ++n) {
+            if (current_occupancy[n] > 0 &&
+                candidate_occupancy[n] == 0) {
+                has_removal = true;
+                break;
+            }
+        }
+
+        if (has_removal) {
+            cv::Mat distance_input_candidate(
+                IMAX,
+                JMAX,
+                CV_8UC1,
+                cv::Scalar(255)
+            );
+
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    const int n = i * JMAX + j;
+                    if (candidate_occupancy[n] > 0) {
+                        distance_input_candidate.at<uint8_t>(i, j) = 0;
+                    }
+                }
+            }
+
+            cv::Mat distance_to_candidate;
+            cv::distanceTransform(
+                distance_input_candidate,
+                distance_to_candidate,
+                cv::DIST_L2,
+                cv::DIST_MASK_PRECISE
+            );
+
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    const int n = i * JMAX + j;
+
+                    if (current_occupancy[n] > 0 &&
+                        candidate_occupancy[n] == 0) {
+
+                        const double d_m =
+                            static_cast<double>(
+                                distance_to_candidate.at<float>(i, j)
+                            ) *
+                            static_cast<double>(DS);
+
+                        max_boundary_displacement_m =
+                            std::max(
+                                max_boundary_displacement_m,
+                                d_m
+                            );
+                    }
+                }
+            }
+        }
+
+        return max_boundary_displacement_m;
+    }
+
+    AdmissionResult evaluate_candidate_structure(
+        const std::vector<int8_t>& current_semantic_occupancy,
+        const std::vector<int8_t>& candidate_semantic_occupancy
+    ) const {
+        AdmissionResult result;
+
+        if (current_semantic_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX) ||
+            candidate_semantic_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX)) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::NO_ADMISSIBLE_INSERTION;
+            return result;
+        }
+
+        const auto current_occupancy =
+            build_admission_occupancy(
+                current_semantic_occupancy
+            );
+
+        const auto candidate_occupancy =
+            build_admission_occupancy(
+                candidate_semantic_occupancy
+            );
+
+        if (!has_free_space(candidate_occupancy)) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::SAFE_SET_EMPTY;
+            return result;
+        }
+
+        const TopologyCheckResult topology =
+            check_free_space_topology(
+                current_occupancy,
+                candidate_occupancy
+            );
+
+        if (!topology.preserved) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::TOPOLOGY_CHANGE;
+            return result;
+        }
+
+        result.decision = AdmissionDecision::ACCEPT;
+        result.reason = AdmissionReason::NONE;
+        result.insertion_scale = 1.0;
+        result.max_sdf_change = 0.0;
+        result.allowed_sdf_change = 0.0;
+
+        return result;
+    }
+
+    AdmissionResult evaluate_candidate_radius_step(
+        const std::vector<int8_t>& current_semantic_occupancy,
+        const std::vector<int8_t>& candidate_semantic_occupancy,
+        double commanded_radius_delta_m,
+        double dt,
+        double v_admissible
+    ) const {
+        AdmissionResult result;
+
+        if (current_semantic_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX) ||
+            candidate_semantic_occupancy.size() !=
+                static_cast<std::size_t>(IMAX * JMAX)) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::NO_ADMISSIBLE_INSERTION;
+            return result;
+        }
+
+        // Keep the exact same admission geometry convention as the existing
+        // theorem-based evaluator: union current physical occupancy with the
+        // current/trial semantic forbidden regions before checking Omega.
+        const auto current_occupancy =
+            build_admission_occupancy(
+                current_semantic_occupancy
+            );
+
+        const auto candidate_occupancy =
+            build_admission_occupancy(
+                candidate_semantic_occupancy
+            );
+
+        if (!has_free_space(candidate_occupancy)) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::SAFE_SET_EMPTY;
+            return result;
+        }
+
+        const TopologyCheckResult topology =
+            check_free_space_topology(
+                current_occupancy,
+                candidate_occupancy
+            );
+
+        if (!topology.preserved) {
+            result.decision = AdmissionDecision::REJECT;
+            result.reason = AdmissionReason::TOPOLOGY_CHANGE;
+            return result;
+        }
+
+        const double safe_dt =
+            std::max(dt, 1.0e-4);
+
+        const double safe_v =
+            std::max(v_admissible, 0.0);
+
+        // The artificial boundary motion is parameterized explicitly by the
+        // buffer radius, so the exact commanded displacement is known. Do not
+        // add a rasterization tolerance here: that would allow the executed
+        // radius rate to exceed v_admissible.
+        result.max_sdf_change =
+            std::max(
+                0.0,
+                commanded_radius_delta_m
+            );
+
+        result.allowed_sdf_change =
+            safe_v * safe_dt;
+
+        if (result.max_sdf_change <=
+            result.allowed_sdf_change + 1.0e-9) {
+
+            result.decision = AdmissionDecision::ACCEPT;
+            result.reason = AdmissionReason::NONE;
+            result.insertion_scale = 1.0;
+            return result;
+        }
+
+        result.decision =
+            AdmissionDecision::SLOW_INSERTION;
+
+        result.reason =
+            AdmissionReason::BOUNDARY_TOO_FAST;
+
+        result.insertion_scale =
+            std::clamp(
+                result.allowed_sdf_change /
+                    std::max(
+                        result.max_sdf_change,
+                        1.0e-9
+                    ),
+                0.0,
+                1.0
+            );
+
+        return result;
+    }
+
     AdmissionResult evaluate_candidate_constraint(
         const std::vector<int8_t>& current_semantic_occupancy,
         const std::vector<int8_t>& candidate_semantic_occupancy,
@@ -2317,20 +3027,26 @@ private:
             return result;
         }
 
-        const auto b_current =
-            compute_signed_distance_field(current_occupancy);
-
-        const auto b_candidate =
-            compute_signed_distance_field(candidate_occupancy);
-
+        // Check the actual displacement of the changing forbidden boundary,
+        // not the global infinity-norm difference between two SDFs.  A global
+        // SDF can change far away simply because the nearest component changes,
+        // even when the boundary itself moved only one grid shell.
         result.max_sdf_change =
-            max_abs_sdf_difference(b_current, b_candidate);
+            compute_boundary_shell_displacement(
+                current_occupancy,
+                candidate_occupancy
+            );
 
         const double safe_dt = std::max(dt, 1.0e-4);
         const double safe_v_admissible = std::max(v_admissible, 0.0);
 
+        // Rasterization allowance only: one diagonal grid-cell step.
+        const double grid_discretization_allowance =
+            std::sqrt(2.0) * static_cast<double>(DS);
+
         result.allowed_sdf_change =
-            safe_v_admissible * safe_dt;
+            safe_v_admissible * safe_dt +
+            grid_discretization_allowance;
 
         if (!std::isfinite(result.max_sdf_change)) {
             result.decision = AdmissionDecision::REJECT;
@@ -2347,8 +3063,9 @@ private:
         }
 
         // The full candidate cannot be committed in one update.  This does
-        // not relax the requested constraint; it only slows the homotopy used
-        // to reach the same target geometry.
+        // not relax the requested constraint; it only slows the metric
+        // homotopy used to reach the same target geometry.  The allowed SDF
+        // change already includes the explicit grid discretization allowance.
         result.decision = AdmissionDecision::SLOW_INSERTION;
         result.reason = AdmissionReason::BOUNDARY_TOO_FAST;
 
@@ -2394,7 +3111,15 @@ private:
     std::size_t constraints_text_signature(
         const std::string& text_value
     ) const {
-        return std::hash<std::string>{}(text_value);
+        // 64-bit FNV-1a; semantic_map_fuser.py uses the same function.
+        std::uint64_t value = 1469598103934665603ull;
+
+        for (const unsigned char byte : text_value) {
+            value ^= static_cast<std::uint64_t>(byte);
+            value *= 1099511628211ull;
+        }
+
+        return static_cast<std::size_t>(value);
     }
 
     bool write_constraints_file_atomically(
@@ -2461,12 +3186,44 @@ private:
             true
         );
 
+        admitted_semantic_buffer_m_ =
+            compile_semantic_buffer_radii(
+                admitted_constraint_config_
+            );
+
+        admitted_semantic_buffer_active_ =
+            compile_semantic_buffer_activity(
+                admitted_constraint_config_
+            );
+
+        semantic_buffer_current_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_current_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_start_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_start_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_target_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_target_active_ =
+            admitted_semantic_buffer_active_;
+
         candidate_constraint_pending_ = false;
         candidate_constraints_json_.clear();
         candidate_constraints_file_signature_ = 0;
 
         admitted_external_semantic_grid_snapshot_ =
             external_semantic_safety_grid_;
+
+        candidate_revision_acknowledged_ = false;
+        candidate_external_semantic_received_ = false;
+        candidate_external_semantic_stable_frames_ = 0;
+        semantic_candidate_target_ready_ = false;
+        candidate_external_semantic_grid_.assign(IMAX * JMAX, 0);
+        semantic_candidate_grid_.assign(IMAX * JMAX, 0);
 
         publish_semantic_perception_required();
 
@@ -2483,12 +3240,6 @@ private:
             return;
         }
 
-        // Keep a fingerprint of the rejected fuser output so stale messages
-        // produced before the external node reloads the restored JSON cannot
-        // leak into the active semantic map.
-        rejected_candidate_external_grid_ =
-            external_semantic_safety_grid_;
-
         constraint_runtime_config_ =
             admitted_constraint_config_;
 
@@ -2496,6 +3247,24 @@ private:
             admitted_constraint_config_,
             true
         );
+
+        semantic_buffer_current_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_current_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_start_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_start_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_target_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_target_active_ =
+            admitted_semantic_buffer_active_;
+
+        candidate_semantic_buffer_m_.fill(0.0f);
+        candidate_semantic_buffer_active_.fill(false);
 
         bool restored_file = true;
 
@@ -2515,21 +3284,12 @@ private:
         candidate_constraints_json_.clear();
         candidate_constraints_file_signature_ = 0;
 
-        // Bridge the short interval before semantic_map_fuser reloads the
-        // restored JSON using the last target it produced under the admitted
-        // configuration.  Once a different external target arrives, normal
-        // live perception resumes.
-        if (!admitted_external_semantic_grid_snapshot_.empty()) {
-            external_semantic_safety_grid_ =
-                admitted_external_semantic_grid_snapshot_;
-
-            external_semantic_safety_received_ = true;
-            external_semantic_safety_timestamp_ =
-                std::chrono::steady_clock::now();
-        }
-
-        rollback_waiting_for_external_refresh_ =
-            restored_file;
+        candidate_revision_acknowledged_ = false;
+        candidate_external_semantic_received_ = false;
+        candidate_external_semantic_stable_frames_ = 0;
+        semantic_candidate_target_ready_ = false;
+        candidate_external_semantic_grid_.assign(IMAX * JMAX, 0);
+        semantic_candidate_grid_.assign(IMAX * JMAX, 0);
 
         publish_semantic_perception_required();
 
@@ -2548,36 +3308,364 @@ private:
         }
     }
 
+    static constexpr int kSemanticClassCount = 7;
+
+    int semantic_class_id_from_name(
+        const std::string& raw_name
+    ) const {
+        const std::string name =
+            normalized_semantic_class(raw_name);
+
+        if (name == "person" ||
+            name == "human" ||
+            name == "people") {
+            return 1;
+        }
+
+        if (name == "traffic_cone" ||
+            name == "traffic_cones" ||
+            name == "cone") {
+            return 2;
+        }
+
+        if (name == "caution_tape" ||
+            name == "tape") {
+            return 3;
+        }
+
+        if (name == "floor_danger_tape" ||
+            name == "floor_tape" ||
+            name == "danger_tape") {
+            return 4;
+        }
+
+        if (name == "wet_floor_sign" ||
+            name == "wet_floor" ||
+            name == "sign") {
+            return 5;
+        }
+
+        if (name == "spill" ||
+            name == "spills") {
+            return 6;
+        }
+
+        return 0;
+    }
+
+    std::array<float, kSemanticClassCount>
+    compile_semantic_buffer_radii(
+        const ConstraintRuntimeConfig& cfg
+    ) const {
+        std::array<float, kSemanticClassCount> radii{};
+        radii.fill(0.0f);
+
+        for (const auto& rc : cfg.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+
+            if (rc.type != ConstraintType::Exclusion) {
+                continue;
+            }
+
+            if (!(rc.buffer_distance_m > 0.0f) ||
+                !std::isfinite(rc.buffer_distance_m)) {
+                continue;
+            }
+
+            for (const auto& target : rc.target_classes) {
+                const int class_id =
+                    semantic_class_id_from_name(target);
+
+                if (class_id <= 0 ||
+                    class_id >= kSemanticClassCount) {
+                    continue;
+                }
+
+                radii[class_id] =
+                    std::max(
+                        radii[class_id],
+                        rc.buffer_distance_m
+                    );
+            }
+        }
+
+        return radii;
+    }
+
+    std::array<bool, kSemanticClassCount>
+    compile_semantic_buffer_activity(
+        const ConstraintRuntimeConfig& cfg
+    ) const {
+        std::array<bool, kSemanticClassCount> active{};
+        active.fill(false);
+
+        for (const auto& rc : cfg.constraints) {
+            if (!rc.enabled || !rc.enforce) {
+                continue;
+            }
+
+            if (rc.type != ConstraintType::Exclusion) {
+                continue;
+            }
+
+            // -1 denotes "not specified" in the runtime schema. A buffer of
+            // exactly 0 is meaningful: forbid the raw semantic footprint.
+            if (!std::isfinite(rc.buffer_distance_m) ||
+                rc.buffer_distance_m < 0.0f) {
+                continue;
+            }
+
+            for (const auto& target : rc.target_classes) {
+                const int class_id =
+                    semantic_class_id_from_name(target);
+
+                if (class_id > 0 &&
+                    class_id < kSemanticClassCount) {
+                    active[class_id] = true;
+                }
+            }
+        }
+
+        return active;
+    }
+
+    std::array<bool, kSemanticClassCount>
+    interpolate_semantic_buffer_activity() const {
+        std::array<bool, kSemanticClassCount> active{};
+        active.fill(false);
+
+        for (int class_id = 1;
+             class_id < kSemanticClassCount;
+             ++class_id) {
+            active[class_id] =
+                semantic_buffer_start_active_[class_id] ||
+                semantic_buffer_target_active_[class_id];
+        }
+
+        return active;
+    }
+
+    std::array<float, kSemanticClassCount>
+    interpolate_semantic_buffer_radii(
+        float lambda
+    ) const {
+        const float lam =
+            std::clamp(lambda, 0.0f, 1.0f);
+
+        std::array<float, kSemanticClassCount> radii{};
+        radii.fill(0.0f);
+
+        for (int class_id = 1;
+             class_id < kSemanticClassCount;
+             ++class_id) {
+
+            const float r0 =
+                semantic_buffer_start_m_[class_id];
+
+            const float r1 =
+                semantic_buffer_target_m_[class_id];
+
+            radii[class_id] =
+                r0 + lam * (r1 - r0);
+        }
+
+        return radii;
+    }
+
+    float max_semantic_buffer_delta(
+        const std::array<float, kSemanticClassCount>& a,
+        const std::array<float, kSemanticClassCount>& b
+    ) const {
+        float max_delta = 0.0f;
+
+        for (int class_id = 1;
+             class_id < kSemanticClassCount;
+             ++class_id) {
+
+            max_delta =
+                std::max(
+                    max_delta,
+                    std::abs(
+                        b[class_id] -
+                        a[class_id]
+                    )
+                );
+        }
+
+        return max_delta;
+    }
+
+    std::vector<int8_t> build_live_semantic_buffer_grid(
+        const std::array<float, kSemanticClassCount>& radii,
+        const std::array<bool, kSemanticClassCount>& active_classes
+    ) const {
+        std::vector<int8_t> output(
+            IMAX * JMAX,
+            0
+        );
+
+        // For every active semantic buffer rule:
+        //
+        //   S_r(t) = { x : dist(x, O_class(t)) <= r }
+        //
+        // O_class(t) is always the CURRENT raw semantic footprint. Thus an
+        // active rule with r=0 produces exactly O_class(t); a class with no
+        // active rule contributes no semantic exclusion at all.
+        for (int class_id = 1;
+             class_id < kSemanticClassCount;
+             ++class_id) {
+
+            if (!active_classes[class_id]) {
+                continue;
+            }
+
+            const float radius_m =
+                std::max(
+                    0.0f,
+                    radii[class_id]
+                );
+
+            cv::Mat distance_input(
+                IMAX,
+                JMAX,
+                CV_8UC1,
+                cv::Scalar(255)
+            );
+
+            bool has_source = false;
+
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    const int n = i * JMAX + j;
+
+                    if (class_map[n] == class_id) {
+                        distance_input.at<uint8_t>(i, j) = 0;
+                        output[n] = 1;
+                        has_source = true;
+                    }
+                }
+            }
+
+            if (!has_source ||
+                radius_m <= 1.0e-6f) {
+                continue;
+            }
+
+            cv::Mat distance_cells;
+
+            cv::distanceTransform(
+                distance_input,
+                distance_cells,
+                cv::DIST_L2,
+                cv::DIST_MASK_PRECISE
+            );
+
+            for (int i = 0; i < IMAX; ++i) {
+                for (int j = 0; j < JMAX; ++j) {
+                    const float distance_m =
+                        distance_cells.at<float>(i, j) *
+                        static_cast<float>(DS);
+
+                    if (distance_m <=
+                        radius_m + 1.0e-6f) {
+                        output[i * JMAX + j] = 1;
+                    }
+                }
+            }
+        }
+
+        return output;
+    }
+
+    void refresh_semantic_buffer_state_from_admitted_config() {
+        admitted_semantic_buffer_m_ =
+            compile_semantic_buffer_radii(
+                admitted_constraint_config_
+            );
+        admitted_semantic_buffer_active_ =
+            compile_semantic_buffer_activity(
+                admitted_constraint_config_
+            );
+
+        semantic_buffer_current_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_current_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_start_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_start_active_ =
+            admitted_semantic_buffer_active_;
+
+        semantic_buffer_target_m_ =
+            admitted_semantic_buffer_m_;
+        semantic_buffer_target_active_ =
+            admitted_semantic_buffer_active_;
+
+        candidate_semantic_buffer_m_.fill(0.0f);
+        candidate_semantic_buffer_active_.fill(false);
+    }
+
     void begin_semantic_evaluation() {
-        new_constraint_event_flag_ = true;
-        constraint_event_counter_++;
+        semantic_buffer_start_m_ =
+            semantic_buffer_current_m_;
+        semantic_buffer_start_active_ =
+            semantic_buffer_current_active_;
 
-        semantic_previous_grid_ = semantic_current_grid_;
+        semantic_buffer_target_m_ =
+            compile_semantic_buffer_radii(
+                candidate_constraint_config_
+            );
+        semantic_buffer_target_active_ =
+            compile_semantic_buffer_activity(
+                candidate_constraint_config_
+            );
 
-        // Preserve the last target generated under the admitted rule set.
-        // This is only a short rollback bridge; the external fuser will
-        // regenerate the admitted geometry from live perception after the
-        // JSON file is restored.
-        admitted_external_semantic_grid_snapshot_ =
-            external_semantic_safety_grid_;
+        candidate_semantic_buffer_m_ =
+            semantic_buffer_target_m_;
+        candidate_semantic_buffer_active_ =
+            semantic_buffer_target_active_;
 
-        semantic_update_.mode = SemanticUpdateMode::EVALUATING;
+        semantic_update_.mode =
+            SemanticUpdateMode::EVALUATING;
+
         semantic_update_.active = true;
         semantic_update_.lambda = 0.0f;
         semantic_update_.lambda_dot = 0.0f;
+        semantic_update_.commanded_lambda_dot = 0.0f;
 
         semantic_update_.evaluation_start_time =
             std::chrono::steady_clock::now();
+
         semantic_update_.start_time =
             semantic_update_.evaluation_start_time;
+
         semantic_update_.last_update_time =
+            semantic_update_.evaluation_start_time;
+
+        candidate_revision_acknowledged_ = false;
+        candidate_revision_ack_time_ =
             semantic_update_.evaluation_start_time;
 
         semantic_candidate_target_ready_ = false;
 
+        semantic_metric_progress_m_ = 0.0f;
+
+        semantic_metric_extent_m_ =
+            std::max(
+                max_semantic_buffer_delta(
+                    semantic_buffer_start_m_,
+                    semantic_buffer_target_m_
+                ),
+                DS
+            );
+
         RCLCPP_INFO(
             this->get_logger(),
-            "Constraint set changed; entered semantic EVALUATING mode"
+            "Constraint set changed; entered semantic EVALUATING mode with live radius-homotopy extent=%.3f m",
+            semantic_metric_extent_m_
         );
     }
 
@@ -2617,80 +3705,117 @@ private:
             );
 
         const float safe_insertion_scale =
-            std::clamp(insertion_scale, 0.0f, 1.0f);
+            std::clamp(
+                insertion_scale,
+                0.0f,
+                1.0f
+            );
+
+        semantic_metric_extent_m_ =
+            std::max(
+                max_semantic_buffer_delta(
+                    semantic_buffer_start_m_,
+                    semantic_buffer_target_m_
+                ),
+                DS
+            );
+
+        // Command the fastest radius rate permitted by the explicit admission
+        // parameter. Per-step admission still verifies Δr <= v_adm Δt, but
+        // starting from an already admissible nominal rate avoids pointless
+        // SLOW_INSERTION refinements every cycle.
+        const float radius_limited_lambda_dot =
+            static_cast<float>(
+                admission_v_admissible_mps_
+            ) /
+            std::max(
+                semantic_metric_extent_m_,
+                1.0e-6f
+            );
 
         semantic_update_.commanded_lambda_dot =
-            semantic_update_.lambda_dot_max * safe_insertion_scale;
+            std::clamp(
+                std::min(
+                    semantic_update_.lambda_dot_max *
+                        safe_insertion_scale,
+                    radius_limited_lambda_dot
+                ),
+                0.0f,
+                semantic_update_.lambda_dot_max
+            );
+
         semantic_update_.lambda_dot =
             semantic_update_.commanded_lambda_dot;
 
         semantic_update_.start_time =
             std::chrono::steady_clock::now();
+
         semantic_update_.last_update_time =
             semantic_update_.start_time;
 
-        semantic_old_max_depth_m_ =
-            std::max(
-                max_interior_depth(semantic_previous_grid_),
-                DS
-            );
-
-        semantic_target_max_depth_m_ =
-            std::max(
-                max_interior_depth(semantic_target_grid_),
-                DS
-            );
-
-        semantic_transition_extent_m_ =
-            std::max(
-                semantic_old_max_depth_m_,
-                semantic_target_max_depth_m_
-            );
+        semantic_metric_progress_m_ = 0.0f;
 
         const char* mode_name = "transition";
-        if (mode == SemanticUpdateMode::INSERTING_CONSTRAINT) {
+
+        if (mode ==
+            SemanticUpdateMode::INSERTING_CONSTRAINT) {
             mode_name = "insertion";
-        } else if (mode == SemanticUpdateMode::REMOVING_CONSTRAINT) {
+        } else if (
+            mode ==
+            SemanticUpdateMode::REMOVING_CONSTRAINT) {
             mode_name = "removal";
         }
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Started semantic %s: extent=%.3f m, lambda_dot=%.3f 1/s, commanded boundary speed=%.3f m/s",
+            "Started live semantic-radius %s: radius_extent=%.3f m, lambda_dot=%.3f 1/s, commanded radius speed=%.3f m/s",
             mode_name,
-            semantic_transition_extent_m_,
+            semantic_metric_extent_m_,
             semantic_update_.lambda_dot,
-            semantic_transition_extent_m_ *
-                std::abs(semantic_update_.lambda_dot)
+            semantic_metric_extent_m_ *
+                std::abs(
+                    semantic_update_.lambda_dot
+                )
         );
     }
 
     void evaluate_and_begin_semantic_transition() {
-        if (semantic_update_.mode != SemanticUpdateMode::EVALUATING) {
+        if (semantic_update_.mode !=
+            SemanticUpdateMode::EVALUATING) {
             return;
         }
 
-        const double admission_dt =
-            std::max(static_cast<double>(dt_grid), 1.0e-4);
+        if (!candidate_constraint_pending_ ||
+            !candidate_revision_acknowledged_ ||
+            !semantic_candidate_target_ready_) {
+            return;
+        }
 
+        // Initial admission asks only whether the FINAL requested constraint
+        // is structurally admissible. Speed is not tested on the full radius
+        // jump because the radius homotopy is specifically what realizes that
+        // change over time.
         const AdmissionResult admission =
-            evaluate_candidate_constraint(
+            evaluate_candidate_structure(
                 semantic_previous_grid_,
-                semantic_target_grid_,
-                admission_dt,
-                admission_v_admissible_mps_
+                semantic_candidate_grid_
             );
 
-        if (admission.decision == AdmissionDecision::REJECT) {
-            semantic_target_grid_ = semantic_previous_grid_;
-            semantic_current_grid_ = semantic_previous_grid_;
+        if (admission.decision ==
+            AdmissionDecision::REJECT) {
 
-            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            semantic_update_.mode =
+                SemanticUpdateMode::NORMAL;
+
             semantic_update_.active = false;
             semantic_update_.lambda = 1.0f;
             semantic_update_.lambda_dot = 0.0f;
             semantic_update_.commanded_lambda_dot = 0.0f;
+
             semantic_candidate_target_ready_ = false;
+
+            semantic_buffer_target_m_ =
+                semantic_buffer_current_m_;
 
             rollback_candidate_constraint_config(
                 admission.reason
@@ -2698,174 +3823,201 @@ private:
 
             RCLCPP_WARN(
                 this->get_logger(),
-                "Candidate semantic constraint rejected: reason=%s, max_sdf_change=%.4f m, allowed=%.4f m",
-                admission_reason_string(admission.reason),
-                admission.max_sdf_change,
-                admission.allowed_sdf_change
+                "Candidate semantic constraint rejected during structural admission: reason=%s",
+                admission_reason_string(
+                    admission.reason
+                )
             );
+
             return;
         }
 
-        bool has_additions = false;
-        bool has_removals = false;
-        classify_semantic_geometry_change(
-            has_additions,
-            has_removals
-        );
+        const float radius_extent_m =
+            max_semantic_buffer_delta(
+                semantic_buffer_start_m_,
+                semantic_buffer_target_m_
+            );
 
-        if (!has_additions && !has_removals) {
-            semantic_current_grid_ = semantic_target_grid_;
+        if (radius_extent_m <= 1.0e-6f) {
+            semantic_buffer_current_m_ =
+                semantic_buffer_target_m_;
+            semantic_buffer_current_active_ =
+                semantic_buffer_target_active_;
 
-            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            admitted_semantic_buffer_m_ =
+                semantic_buffer_target_m_;
+            admitted_semantic_buffer_active_ =
+                semantic_buffer_target_active_;
+
+            semantic_update_.mode =
+                SemanticUpdateMode::NORMAL;
+
             semantic_update_.active = false;
             semantic_update_.lambda = 1.0f;
             semantic_update_.lambda_dot = 0.0f;
             semantic_update_.commanded_lambda_dot = 0.0f;
+
             semantic_candidate_target_ready_ = false;
 
-            // Nothing needs a geometric homotopy, so the candidate rule set
-            // can be committed immediately (e.g. a pure velocity-limit edit).
             commit_candidate_constraint_config();
 
             RCLCPP_INFO(
                 this->get_logger(),
-                "Candidate constraint accepted; semantic geometry unchanged"
+                "Candidate constraint accepted; no buffer-radius homotopy required"
             );
+
             return;
         }
 
-        const float insertion_scale =
-            admission.decision == AdmissionDecision::SLOW_INSERTION
-                ? static_cast<float>(admission.insertion_scale)
-                : 1.0f;
-
-        if (admission.decision == AdmissionDecision::SLOW_INSERTION) {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "Candidate constraint requires slow insertion: max_sdf_change=%.4f m, allowed=%.4f m, insertion_scale=%.4f",
-                admission.max_sdf_change,
-                admission.allowed_sdf_change,
-                admission.insertion_scale
+        semantic_metric_extent_m_ =
+            std::max(
+                radius_extent_m,
+                DS
             );
+
+        semantic_metric_progress_m_ = 0.0f;
+
+        bool has_increase = false;
+        bool has_decrease = false;
+
+        for (int class_id = 1;
+             class_id < kSemanticClassCount;
+             ++class_id) {
+
+            const float delta =
+                semantic_buffer_target_m_[class_id] -
+                semantic_buffer_start_m_[class_id];
+
+            has_increase =
+                has_increase ||
+                delta > 1.0e-6f;
+
+            has_decrease =
+                has_decrease ||
+                delta < -1.0e-6f;
         }
 
-        if (has_additions && !has_removals) {
-            initialize_semantic_homotopy(
-                SemanticUpdateMode::INSERTING_CONSTRAINT,
-                insertion_scale
-            );
-        } else if (!has_additions && has_removals) {
-            initialize_semantic_homotopy(
-                SemanticUpdateMode::REMOVING_CONSTRAINT,
-                insertion_scale
-            );
-        } else {
-            initialize_semantic_homotopy(
-                SemanticUpdateMode::TRANSITIONING_CONSTRAINT,
-                insertion_scale
-            );
+        SemanticUpdateMode mode =
+            SemanticUpdateMode::TRANSITIONING_CONSTRAINT;
+
+        if (has_increase && !has_decrease) {
+            mode =
+                SemanticUpdateMode::INSERTING_CONSTRAINT;
+        } else if (!has_increase && has_decrease) {
+            mode =
+                SemanticUpdateMode::REMOVING_CONSTRAINT;
         }
+
+        // Start at the nominal rate. Each individual radius increment is
+        // checked and reduced by evaluate_candidate_radius_step() as needed.
+        initialize_semantic_homotopy(
+            mode,
+            1.0f
+        );
 
         semantic_candidate_target_ready_ = false;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Candidate buffer rule admitted for live radius homotopy: extent=%.3f m",
+            semantic_metric_extent_m_
+        );
     }
 
-    std::vector<int8_t> build_semantic_grid_for_lambda(float lambda) const {
-        const float lam = std::clamp(lambda, 0.0f, 1.0f);
+    std::vector<int8_t> build_semantic_grid_for_metric_progress(
+        float progress_m
+    ) const {
+        const float extent_m =
+            std::max(
+                semantic_metric_extent_m_,
+                DS
+            );
 
-        // Outside an active homotopy, the target is the intended semantic map.
-        if (!semantic_update_.active) {
-            return semantic_target_grid_;
-        }
+        const float progress =
+            std::clamp(
+                progress_m,
+                0.0f,
+                extent_m
+            );
 
-        if (semantic_update_.mode == SemanticUpdateMode::EVALUATING) {
-            return semantic_previous_grid_;
-        }
+        const float lambda =
+            std::clamp(
+                progress /
+                    std::max(
+                        extent_m,
+                        1.0e-6f
+                    ),
+                0.0f,
+                1.0f
+            );
 
-        std::vector<int8_t> grid(IMAX * JMAX, 0);
+        const auto radii =
+            interpolate_semantic_buffer_radii(
+                lambda
+            );
 
-        const float old_max_depth =
-            std::max(semantic_old_max_depth_m_, DS);
+        const auto active =
+            interpolate_semantic_buffer_activity();
 
-        const float target_max_depth =
-            std::max(semantic_target_max_depth_m_, DS);
+        return build_live_semantic_buffer_grid(
+            radii,
+            active
+        );
+    }
 
-        for (int i = 0; i < IMAX; ++i) {
-            for (int j = 0; j < JMAX; ++j) {
-                const int n = i * JMAX + j;
+    std::vector<int8_t> build_semantic_grid_for_lambda(
+        float lambda
+    ) const {
+        const float lam =
+            std::clamp(lambda, 0.0f, 1.0f);
 
-                const bool old_occ =
-                    semantic_previous_grid_[n] > 0;
-                const bool new_occ =
-                    semantic_target_grid_[n] > 0;
+        const float extent_m =
+            std::max(semantic_metric_extent_m_, DS);
 
-                if (old_occ && new_occ) {
-                    grid[n] = 1;
-                    continue;
-                }
-
-                if (!old_occ && new_occ &&
-                    (semantic_update_.mode ==
-                         SemanticUpdateMode::INSERTING_CONSTRAINT ||
-                     semantic_update_.mode ==
-                         SemanticUpdateMode::TRANSITIONING_CONSTRAINT)) {
-
-                    const float depth =
-                        distance_to_nearest_free_cell(
-                            semantic_target_grid_, i, j
-                        );
-
-                    const float activation =
-                        1.0f -
-                        std::clamp(
-                            depth / target_max_depth,
-                            0.0f,
-                            1.0f
-                        );
-
-                    if (lam + 1.0e-6f >= activation) {
-                        grid[n] = 1;
-                    }
-
-                    continue;
-                }
-
-                if (old_occ && !new_occ &&
-                    (semantic_update_.mode ==
-                         SemanticUpdateMode::REMOVING_CONSTRAINT ||
-                     semantic_update_.mode ==
-                         SemanticUpdateMode::TRANSITIONING_CONSTRAINT)) {
-
-                    const float depth =
-                        distance_to_nearest_free_cell(
-                            semantic_previous_grid_, i, j
-                        );
-
-                    const float removal_threshold =
-                        std::clamp(
-                            depth / old_max_depth,
-                            0.0f,
-                            1.0f
-                        );
-
-                    if (lam < removal_threshold) {
-                        grid[n] = 1;
-                    }
-
-                    continue;
-                }
-            }
-        }
-
-        if (lam >= 0.999f) {
-            grid = semantic_target_grid_;
-        }
-
-        return grid;
+        return build_semantic_grid_for_metric_progress(
+            lam * extent_m
+        );
     }
 
     void update_interpolated_semantic_grid() {
+        const float extent_m =
+            std::max(
+                semantic_metric_extent_m_,
+                DS
+            );
+
+        const float lambda =
+            semantic_update_.active &&
+            semantic_update_.mode !=
+                SemanticUpdateMode::EVALUATING
+                ? std::clamp(
+                      semantic_metric_progress_m_ /
+                          std::max(
+                              extent_m,
+                              1.0e-6f
+                          ),
+                      0.0f,
+                      1.0f
+                  )
+                : 1.0f;
+
+        if (semantic_update_.active &&
+            semantic_update_.mode !=
+                SemanticUpdateMode::EVALUATING) {
+            semantic_buffer_current_m_ =
+                interpolate_semantic_buffer_radii(
+                    lambda
+                );
+
+            semantic_buffer_current_active_ =
+                interpolate_semantic_buffer_activity();
+        }
+
         semantic_current_grid_ =
-            build_semantic_grid_for_lambda(semantic_update_.lambda);
+            build_live_semantic_buffer_grid(
+                semantic_buffer_current_m_,
+                semantic_buffer_current_active_
+            );
     }
 
     void copy_current_globals_into_pending_field() {
@@ -3094,6 +4246,8 @@ private:
                 true
             );
 
+            refresh_semantic_buffer_state_from_admitted_config();
+
             publish_semantic_perception_required();
             return;
         }
@@ -3127,44 +4281,71 @@ private:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Staged new constraint file revision as CANDIDATE; admitted constraints remain active until admission completes"
+            "Staged new constraint file revision as CANDIDATE revision=%llu; waiting for matching semantic-fuser acknowledgement before admission",
+            static_cast<unsigned long long>(
+                candidate_constraints_file_signature_
+            )
         );
     }
 
 
     void update_semantic_update_state() {
         if (!semantic_update_.active) {
-            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            semantic_update_.mode =
+                SemanticUpdateMode::NORMAL;
+
             semantic_update_.lambda = 1.0f;
             semantic_update_.lambda_dot = 0.0f;
             semantic_update_.commanded_lambda_dot = 0.0f;
+
+            semantic_metric_progress_m_ = 0.0f;
+            semantic_metric_extent_m_ = 0.0f;
             return;
         }
 
-        if (semantic_update_.mode == SemanticUpdateMode::EVALUATING) {
+        if (semantic_update_.mode ==
+            SemanticUpdateMode::EVALUATING) {
             semantic_update_.lambda = 0.0f;
             semantic_update_.lambda_dot = 0.0f;
             return;
         }
 
-        const auto now = std::chrono::steady_clock::now();
+        const auto now =
+            std::chrono::steady_clock::now();
 
         float dt =
             std::chrono::duration<float>(
-                now - semantic_update_.last_update_time
+                now -
+                semantic_update_.last_update_time
             ).count();
 
         semantic_update_.last_update_time = now;
-        dt = std::clamp(dt, 0.0f, 0.2f);
+
+        dt =
+            std::clamp(
+                dt,
+                0.0f,
+                0.2f
+            );
 
         if (dt <= 1.0e-6f) {
             semantic_update_.lambda_dot = 0.0f;
             return;
         }
 
-        // Admission safety takes precedence over the nominal minimum update
-        // rate. Never raise a theorem-limited command merely to satisfy the
-        // preferred completion time.
+        const float extent_m =
+            std::max(
+                semantic_metric_extent_m_,
+                DS
+            );
+
+        const float current_progress_m =
+            std::clamp(
+                semantic_metric_progress_m_,
+                0.0f,
+                extent_m
+            );
+
         const float requested_lambda_dot =
             std::clamp(
                 semantic_update_.commanded_lambda_dot,
@@ -3172,68 +4353,87 @@ private:
                 semantic_update_.lambda_dot_max
             );
 
-        const float current_lambda =
-            std::clamp(semantic_update_.lambda, 0.0f, 1.0f);
+        const float requested_radius_speed_mps =
+            requested_lambda_dot *
+            extent_m;
 
-        float proposed_delta_lambda =
-            dt * requested_lambda_dot;
-
-        proposed_delta_lambda =
+        float trial_delta_m =
             std::min(
-                proposed_delta_lambda,
-                1.0f - current_lambda
+                requested_radius_speed_mps * dt,
+                extent_m -
+                    current_progress_m
             );
 
-        float accepted_delta_lambda = 0.0f;
+        float accepted_delta_m = 0.0f;
         AdmissionResult step_admission;
 
-        // The initial admission result gives a useful global rate estimate,
-        // but the corollary must hold between each executed geometry update.
-        // Re-evaluate each proposed lambda step and shrink it if needed.
-        constexpr int kMaxAdmissionRefinements = 10;
-        float trial_delta_lambda = proposed_delta_lambda;
+        const auto current_runtime_map =
+            build_semantic_grid_for_metric_progress(
+                current_progress_m
+            );
+
+        constexpr int kMaxAdmissionRefinements = 12;
 
         for (int attempt = 0;
              attempt < kMaxAdmissionRefinements &&
-             trial_delta_lambda > 1.0e-7f;
+             trial_delta_m > 1.0e-6f;
              ++attempt) {
 
-            const float trial_lambda =
+            const float trial_progress_m =
                 std::clamp(
-                    current_lambda + trial_delta_lambda,
+                    current_progress_m +
+                        trial_delta_m,
                     0.0f,
-                    1.0f
+                    extent_m
                 );
 
-            const auto proposed_semantic_grid =
-                build_semantic_grid_for_lambda(trial_lambda);
+            const auto trial_runtime_map =
+                build_semantic_grid_for_metric_progress(
+                    trial_progress_m
+                );
 
             step_admission =
-                evaluate_candidate_constraint(
-                    semantic_current_grid_,
-                    proposed_semantic_grid,
+                evaluate_candidate_radius_step(
+                    current_runtime_map,
+                    trial_runtime_map,
+                    static_cast<double>(
+                        trial_delta_m
+                    ),
                     static_cast<double>(dt),
                     admission_v_admissible_mps_
                 );
 
-            if (step_admission.decision == AdmissionDecision::ACCEPT) {
-                accepted_delta_lambda = trial_delta_lambda;
+            if (step_admission.decision ==
+                AdmissionDecision::ACCEPT) {
+
+                accepted_delta_m =
+                    trial_delta_m;
                 break;
             }
 
-            if (step_admission.decision == AdmissionDecision::REJECT) {
-                semantic_target_grid_ = semantic_current_grid_;
-                semantic_previous_grid_ = semantic_current_grid_;
+            if (step_admission.decision ==
+                AdmissionDecision::REJECT) {
 
                 semantic_update_.active = false;
-                semantic_update_.mode = SemanticUpdateMode::NORMAL;
+                semantic_update_.mode =
+                    SemanticUpdateMode::NORMAL;
+
                 semantic_update_.lambda = 1.0f;
                 semantic_update_.lambda_dot = 0.0f;
                 semantic_update_.commanded_lambda_dot = 0.0f;
 
-                semantic_transition_extent_m_ = 0.0f;
-                semantic_old_max_depth_m_ = 0.0f;
-                semantic_target_max_depth_m_ = 0.0f;
+                semantic_metric_progress_m_ = 0.0f;
+                semantic_metric_extent_m_ = 0.0f;
+
+                semantic_buffer_current_m_ =
+                    semantic_buffer_start_m_;
+                semantic_buffer_current_active_ =
+                    semantic_buffer_start_active_;
+
+                semantic_buffer_target_m_ =
+                    semantic_buffer_start_m_;
+                semantic_buffer_target_active_ =
+                    semantic_buffer_start_active_;
 
                 rollback_candidate_constraint_config(
                     step_admission.reason
@@ -3241,74 +4441,112 @@ private:
 
                 RCLCPP_WARN(
                     this->get_logger(),
-                    "Semantic transition aborted during admission check: reason=%s. The previously admitted constraint set remains active.",
-                    admission_reason_string(step_admission.reason)
+                    "Live semantic-radius transition aborted: reason=%s. Previously admitted radii remain active.",
+                    admission_reason_string(
+                        step_admission.reason
+                    )
                 );
+
                 return;
             }
 
-            // SLOW_INSERTION: shrink the proposed homotopy increment according
-            // to the measured SDF violation and test again before committing.
             const float scale =
-                static_cast<float>(std::clamp(
-                    step_admission.insertion_scale,
-                    0.0,
-                    1.0
-                ));
+                static_cast<float>(
+                    std::clamp(
+                        step_admission.insertion_scale,
+                        0.0,
+                        1.0
+                    )
+                );
 
-            trial_delta_lambda *= scale;
+            trial_delta_m *= scale;
         }
 
-        if (accepted_delta_lambda <= 1.0e-7f) {
-            // No geometry change is committed this cycle. Keep the transition
-            // active; a later cycle has a new dt budget and can try again.
+        if (accepted_delta_m <= 1.0e-6f) {
             semantic_update_.lambda_dot = 0.0f;
 
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 2000,
-                "Semantic insertion step held by admission check: max_sdf_change=%.4f m, allowed=%.4f m",
+                "Live semantic-radius step held: progress=%.3f/%.3f m, radius_step=%.4f m, allowed=%.4f m",
+                current_progress_m,
+                extent_m,
                 step_admission.max_sdf_change,
                 step_admission.allowed_sdf_change
             );
+
             return;
         }
 
+        semantic_metric_progress_m_ =
+            std::clamp(
+                current_progress_m +
+                    accepted_delta_m,
+                0.0f,
+                extent_m
+            );
+
         semantic_update_.lambda =
             std::clamp(
-                current_lambda + accepted_delta_lambda,
+                semantic_metric_progress_m_ /
+                    std::max(
+                        extent_m,
+                        1.0e-6f
+                    ),
                 0.0f,
                 1.0f
             );
 
         semantic_update_.lambda_dot =
-            accepted_delta_lambda / dt;
+            (accepted_delta_m / dt) /
+            std::max(
+                extent_m,
+                1.0e-6f
+            );
 
-        // Commit exactly the geometry that was admitted for this lambda.
-        semantic_current_grid_ =
-            build_semantic_grid_for_lambda(semantic_update_.lambda);
+        semantic_buffer_current_m_ =
+            interpolate_semantic_buffer_radii(
+                semantic_update_.lambda
+            );
+
+        semantic_buffer_current_active_ =
+            interpolate_semantic_buffer_activity();
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            1000,
+            "Live semantic-radius progress: %.3f/%.3f m (lambda=%.3f, radius_rate=%.3f m/s)",
+            semantic_metric_progress_m_,
+            extent_m,
+            semantic_update_.lambda,
+            semantic_update_.lambda_dot *
+                extent_m
+        );
 
         if (semantic_update_.lambda >= 0.999f) {
-            semantic_current_grid_ = semantic_target_grid_;
+            semantic_buffer_current_m_ =
+                semantic_buffer_target_m_;
+
+            admitted_semantic_buffer_m_ =
+                semantic_buffer_target_m_;
 
             semantic_update_.active = false;
             semantic_update_.lambda = 1.0f;
             semantic_update_.lambda_dot = 0.0f;
             semantic_update_.commanded_lambda_dot = 0.0f;
-            semantic_update_.mode = SemanticUpdateMode::NORMAL;
+            semantic_update_.mode =
+                SemanticUpdateMode::NORMAL;
 
-            semantic_transition_extent_m_ = 0.0f;
-            semantic_old_max_depth_m_ = 0.0f;
-            semantic_target_max_depth_m_ = 0.0f;
+            semantic_metric_progress_m_ = 0.0f;
+            semantic_metric_extent_m_ = 0.0f;
 
-            // The complete candidate geometry has now passed every admission
-            // step, so promote its rule configuration atomically.
             commit_candidate_constraint_config();
 
             RCLCPP_INFO(
                 this->get_logger(),
-                "Completed semantic update"
+                "Completed live semantic buffer-radius homotopy"
             );
         }
     }
@@ -3370,6 +4608,8 @@ private:
 
             constraints_signature_initialized_ = true;
             candidate_constraint_pending_ = false;
+
+            refresh_semantic_buffer_state_from_admitted_config();
         } else {
             RCLCPP_WARN(
                 this->get_logger(),
@@ -3482,7 +4722,34 @@ private:
         semantic_current_grid_.assign(IMAX * JMAX, 0);
         external_semantic_safety_grid_.assign(IMAX * JMAX, 0);
         admitted_external_semantic_grid_snapshot_.assign(IMAX * JMAX, 0);
-        rejected_candidate_external_grid_.assign(IMAX * JMAX, 0);
+        candidate_external_semantic_grid_.assign(IMAX * JMAX, 0);
+        semantic_candidate_grid_.assign(IMAX * JMAX, 0);
+        semantic_homotopy_target_snapshot_.assign(IMAX * JMAX, 0);
+        semantic_homotopy_target_valid_ = false;
+
+        admitted_semantic_buffer_m_.fill(0.0f);
+        candidate_semantic_buffer_m_.fill(0.0f);
+        semantic_buffer_start_m_.fill(0.0f);
+        semantic_buffer_target_m_.fill(0.0f);
+        semantic_buffer_current_m_.fill(0.0f);
+
+        admitted_semantic_buffer_active_.fill(false);
+        candidate_semantic_buffer_active_.fill(false);
+        semantic_buffer_start_active_.fill(false);
+        semantic_buffer_target_active_.fill(false);
+        semantic_buffer_current_active_.fill(false);
+
+        semantic_base_previous_.assign(IMAX * JMAX, 0);
+        semantic_base_change_mask_.assign(IMAX * JMAX, 0);
+
+        candidate_external_semantic_timestamp_ =
+            std::chrono::steady_clock::now();
+
+        candidate_revision_ack_time_ =
+            candidate_external_semantic_timestamp_;
+
+        candidate_external_semantic_last_change_time_ =
+            candidate_external_semantic_timestamp_;
         external_semantic_safety_received_ = false;
         external_semantic_safety_timestamp_ = std::chrono::steady_clock::now();
         
@@ -3600,6 +4867,10 @@ private:
             "semantic_safety_target_topic",
             "/semantic_safety_target"
         );
+        this->declare_parameter(
+            "semantic_safety_target_revision_topic",
+            "/semantic_safety_target_revision"
+        );
         this->declare_parameter("semantic_safety_occupied_threshold", 50);
         this->declare_parameter("semantic_safety_max_age_sec", 1.0);
     
@@ -3615,6 +4886,10 @@ private:
         human_persistence_observation_value_ = static_cast<float>(this->get_parameter("human_persistence_observation_value").as_double());
         semantic_safety_target_topic_ =
             this->get_parameter("semantic_safety_target_topic").as_string();
+        semantic_safety_target_revision_topic_ =
+            this->get_parameter(
+                "semantic_safety_target_revision_topic"
+            ).as_string();
         semantic_safety_occupied_threshold_ = static_cast<int>(
             this->get_parameter("semantic_safety_occupied_threshold").as_int()
         );
@@ -3675,9 +4950,10 @@ private:
         // ------------------------------------------------------------
         // Admission-check parameters
         // ------------------------------------------------------------
-        // Negative means derive a conservative translational bound from the
-        // robot velocity limits above.
-        this->declare_parameter("admission_v_admissible_mps", -1.0);
+        // Maximum artificial semantic-boundary speed admitted during
+        // insertion/removal.  This is intentionally independent of the
+        // physical-obstacle dh/dt estimate.
+        this->declare_parameter("admission_v_admissible_mps", 1.0);
         admission_v_admissible_mps_ =
             this->get_parameter("admission_v_admissible_mps").as_double();
 
@@ -3958,6 +5234,23 @@ private:
                 rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
                 std::bind(
                     &PoissonControllerNode::semantic_safety_target_callback,
+                    this,
+                    std::placeholders::_1
+                ),
+                options_occ
+            );
+
+        const auto semantic_revision_qos =
+            rclcpp::QoS(rclcpp::KeepLast(1))
+                .reliable()
+                .transient_local();
+
+        semantic_safety_target_revision_suber_ =
+            this->create_subscription<std_msgs::msg::UInt64>(
+                semantic_safety_target_revision_topic_,
+                semantic_revision_qos,
+                std::bind(
+                    &PoissonControllerNode::semantic_safety_target_revision_callback,
                     this,
                     std::placeholders::_1
                 ),
@@ -5001,7 +6294,13 @@ private:
     float semantic_transition_extent_m_{0.0f};
     float semantic_old_max_depth_m_{0.0f};
     float semantic_target_max_depth_m_{0.0f};
-    double admission_v_admissible_mps_{0.5};
+
+    // Metric progress of the semantic homotopy.  lambda is retained as a
+    // normalized reporting/control variable:
+    //     lambda = semantic_metric_progress_m_ / semantic_metric_extent_m_
+    float semantic_metric_progress_m_{0.0f};
+    float semantic_metric_extent_m_{0.0f};
+    double admission_v_admissible_mps_{1.0};
 
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr semantic_perception_required_pub_;
     bool semantic_perception_required_{false};
@@ -5017,6 +6316,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr occ_grid_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr semantic_safety_target_suber_;
+    rclcpp::Subscription<std_msgs::msg::UInt64>::SharedPtr semantic_safety_target_revision_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr class_map_suber_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr visibility_map_suber_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_suber_;
@@ -5033,6 +6333,26 @@ private:
     std::vector<int8_t> semantic_target_grid_;
     std::vector<int8_t> semantic_current_grid_;
 
+    // Radius-homotopy state indexed by legacy /class_map ID:
+    // 1 human, 2 traffic_cone, 3 caution_tape, 4 floor_danger_tape,
+    // 5 wet_floor_sign, 6 spill.
+    std::array<float, 7> admitted_semantic_buffer_m_{};
+    std::array<float, 7> candidate_semantic_buffer_m_{};
+    std::array<float, 7> semantic_buffer_start_m_{};
+    std::array<float, 7> semantic_buffer_target_m_{};
+    std::array<float, 7> semantic_buffer_current_m_{};
+
+    std::array<bool, 7> admitted_semantic_buffer_active_{};
+    std::array<bool, 7> candidate_semantic_buffer_active_{};
+    std::array<bool, 7> semantic_buffer_start_active_{};
+    std::array<bool, 7> semantic_buffer_target_active_{};
+    std::array<bool, 7> semantic_buffer_current_active_{};
+
+    // Live raw-semantic motion used to keep actual object/robot-relative
+    // motion separate from artificial buffer-radius growth in dh/dt.
+    std::vector<int8_t> semantic_base_previous_;
+    std::vector<uint8_t> semantic_base_change_mask_;
+
     std::vector<float> physical_occ_previous_;
     std::vector<float> physical_occ_current_;
     std::vector<uint8_t> physical_change_mask_;
@@ -5040,15 +6360,40 @@ private:
     // Combined expanded target produced by semantic_map_fuser.
     std::vector<int8_t> external_semantic_safety_grid_;
 
-    // Transaction bridge for rejected rule sets.  The admitted snapshot is
-    // used only until semantic_map_fuser reloads the restored admitted JSON.
+    // Admitted semantic output and shadow candidate output are separate.
     std::vector<int8_t> admitted_external_semantic_grid_snapshot_;
-    std::vector<int8_t> rejected_candidate_external_grid_;
-    bool rollback_waiting_for_external_refresh_{false};
+    std::vector<int8_t> candidate_external_semantic_grid_;
+    std::vector<int8_t> semantic_candidate_grid_;
+
+    // Fixed semantic endpoint for the currently admitted homotopy.
+    // Only this semantic endpoint is frozen. Physical occupancy, robot state,
+    // Poisson solves, dh/dt, MPC, and realtime filtering remain live.
+    std::vector<int8_t> semantic_homotopy_target_snapshot_;
+    bool semantic_homotopy_target_valid_{false};
+
+    bool candidate_external_semantic_received_{false};
+
+    std::uint64_t latest_fuser_constraint_revision_{0};
+    bool latest_fuser_revision_received_{false};
+    bool candidate_revision_acknowledged_{false};
+
+    std::chrono::steady_clock::time_point
+        candidate_revision_ack_time_;
+
+    std::chrono::steady_clock::time_point
+        candidate_external_semantic_timestamp_;
+
+    std::chrono::steady_clock::time_point
+        candidate_external_semantic_last_change_time_;
+
+    std::size_t candidate_external_semantic_last_signature_{0};
+    int candidate_external_semantic_stable_frames_{0};
+
 
     bool external_semantic_safety_received_{false};
     std::chrono::steady_clock::time_point external_semantic_safety_timestamp_;
     std::string semantic_safety_target_topic_{"/semantic_safety_target"};
+    std::string semantic_safety_target_revision_topic_{"/semantic_safety_target_revision"};
     int semantic_safety_occupied_threshold_{50};
     double semantic_safety_max_age_sec_{1.0};
 

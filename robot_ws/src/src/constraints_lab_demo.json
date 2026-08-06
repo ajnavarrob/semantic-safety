@@ -1,9 +1,26 @@
 {
   "schema_version": "0.2",
-  "constraints": [],
+  "constraints": [
+    {
+      "id": "avoid_traffic_cone_buffer",
+      "type": "exclusion",
+      "enabled": true,
+      "enforce": true,
+      "target": {
+        "semantic_class": [
+          "traffic_cone"
+        ]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 1.0
+      }
+    }
+  ],
   "metadata": {
     "source": "live_command_demo",
-    "timestamp": "2026-08-05T10:41:19.700524",
-    "instruction": "clear"
+    "timestamp": "2026-08-06T09:48:27.401248",
+    "instruction": "stay away from traffic cones",
+    "flat_status": "ok",
+    "action": "add"
   }
 }
