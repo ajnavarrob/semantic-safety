@@ -2874,34 +2874,283 @@ private:
     //
     // v is reused as the growth speed since it
     // already represents "how fast can the robot plausibly react,"
-    void advance_semantic_boundary_sdf(float dt) {
-        
-        //this is the target boundary which can flip every tick
-        const auto b_target =
-            compute_signed_distance_field(semantic_target_grid_);
+    void advance_semantic_boundary_sdf(float dt)
+    {
+        const std::size_t N =
+            static_cast<std::size_t>(IMAX * JMAX);
 
-        if (semantic_sdf_active_.size() != b_target.size()) {
-            // First tick this is enabled (or grid just got (re)sized):
-            // seed from whatever is currently active so turning the flag
-            // on doesn't itself introduce a jump.
-            semantic_sdf_active_ =
-                compute_signed_distance_field(semantic_current_grid_);
+        if (semantic_target_grid_.size() != N ||
+            semantic_current_grid_.size() != N) {
+            return;
         }
 
+        // 0.01 m/s means with DS = 0.05 m it takes approximately
+        // 5 seconds for the boundary to advance one grid-cell layer.
+        constexpr float kGrowthSpeedMps = 0.01f;
+
+        // Ignore tiny changes in the incoming target(maybe noise)
+        constexpr int kMinChangedCells = 3;
         const float safe_dt = std::clamp(dt, 1.0e-4f, 0.2f);
-        const float step = static_cast<float>(0.1) * safe_dt;
+        const float growth_step = kGrowthSpeedMps * safe_dt;
 
-        for (std::size_t n = 0; n < semantic_sdf_active_.size(); ++n) {
-            float delta = b_target[n] - semantic_sdf_active_[n];
-            delta = std::clamp(delta, -step, step);
-            semantic_sdf_active_[n] += delta;
+
+        // ============================================================
+        // Local persistent state
+        //
+        // These are static ONLY so you can test the idea without
+        // modifying the rest of the class.
+        // ============================================================
+        static bool initialized = false;
+
+        // Last target received from the semantic fuser.
+        static std::vector<int8_t> previous_target;
+
+        // Frozen target for the current growth transition.
+        static std::vector<int8_t> target_snapshot;
+
+        // SDF of that frozen target.
+        static std::vector<float> target_sdf;
+
+        // Semantic grid that existed at the start of the transition.
+        //
+        // These cells remain occupied while the newly detected
+        // semantic region grows.
+        static std::vector<int8_t> base_grid;
+
+        // Remaining inward offset of the target SDF.
+        //
+        // Large offset:
+        //     only deep interior target cells are active.
+        //
+        // offset -> 0:
+        //     complete target becomes active.
+        static float offset_m = 0.0f;
+        static bool transition_active = false;
+
+
+        // ============================================================
+        // 1. First invocation
+        // ============================================================
+
+        if (!initialized) {
+
+            previous_target = semantic_target_grid_;
+            target_snapshot = semantic_target_grid_;
+
+            target_sdf = compute_signed_distance_field(target_snapshot);
+            base_grid = semantic_current_grid_;
+
+            initialized = true;
+
+            // IMPORTANT:
+            // Do not immediately replace semantic_current_grid_ here.
+            // We want the current geometry to remain exactly as it was
+            // before this mechanism was enabled.
         }
 
-        semantic_current_grid_.assign(IMAX * JMAX, 0);
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            semantic_current_grid_[n] =
-                (semantic_sdf_active_[n] <= 0.0f) ? 1 : 0;
+
+        // ============================================================
+        // 2. Detect a meaningful change in the target semantic map
+        // ============================================================
+
+        int changed_cells = 0;
+        int added_cells = 0;
+        int removed_cells = 0;
+
+        for (std::size_t n = 0; n < N; ++n) {
+
+            const bool old_occ = previous_target[n] > 0;
+
+            const bool new_occ = semantic_target_grid_[n] > 0;
+
+            if (old_occ == new_occ) {
+                continue;
+            }
+
+            ++changed_cells;
+
+            if (!old_occ && new_occ) {
+                ++added_cells;
+            }
+            else if (old_occ && !new_occ) {
+                ++removed_cells;
+            }
         }
+
+
+        const bool meaningful_change = changed_cells >= kMinChangedCells;
+
+
+        // ============================================================
+        // 3. A NEW semantic region appeared
+        //
+        // This is the case we care about:
+        //
+        // rule already exists
+        //       +
+        // cone suddenly becomes visible
+        //
+        // For this POC, only react to changes dominated by additions.
+        // ============================================================
+
+        if (meaningful_change &&
+            added_cells > removed_cells) {
+
+            // Preserve what was already active before the new cone
+            // appeared.
+            base_grid = semantic_current_grid_;
+            // Freeze the new requested semantic geometry.
+            target_snapshot = semantic_target_grid_;
+            target_sdf = compute_signed_distance_field(target_snapshot);
+
+            // --------------------------------------------------------
+            // Find the maximum interior depth of ONLY the newly added
+            // target region.
+            //
+            // target_sdf < 0 inside the semantic target.
+            // Therefore -target_sdf gives interior depth in meters.
+            // --------------------------------------------------------
+            float max_new_depth_m = 0.0f;
+
+            for (std::size_t n = 0; n < N; ++n) {
+
+                const bool already_active =
+                    base_grid[n] > 0;
+
+                const bool target_occ =
+                    target_snapshot[n] > 0;
+
+                if (already_active || !target_occ) {
+                    continue;
+                }
+
+                const float depth_m = std::max(0.0f, -target_sdf[n]);
+
+                max_new_depth_m = std::max(max_new_depth_m, depth_m);
+            }
+
+
+            if (max_new_depth_m > 1.0e-4f) {
+
+                // Start at the deepest interior level set.
+                //
+                // Then offset_m decreases slowly toward zero.
+                //
+                // This causes the active zero-level boundary to
+                // propagate OUTWARD toward the final semantic boundary.
+                offset_m = max_new_depth_m;
+
+                transition_active = true;
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Started perception-driven semantic growth: "
+                    "added=%d removed=%d changed=%d "
+                    "initial_offset=%.3f m speed=%.3f m/s",
+                    added_cells,
+                    removed_cells,
+                    changed_cells,
+                    offset_m,
+                    kGrowthSpeedMps
+                );
+            }
+        }
+
+
+        // Always update this so we compare against the newest incoming
+        // semantic target on the next iteration.
+        previous_target = semantic_target_grid_;
+
+
+        //If no perception-driven transition is running, just use
+        //    the current target normally.
+        if (!transition_active) {
+            semantic_current_grid_ = semantic_target_grid_;
+            return;
+        }
+
+
+        // ============================================================
+        // 5. Advance the moving level set
+        //
+        // offset_m:
+        //
+        //      large ----------------------------> 0
+        //
+        // active semantic region:
+        //
+        //      small ---------------------------> full target
+        // ============================================================
+
+        offset_m = std::max(0.0f, offset_m - growth_step);
+        //Construct the new active semantic grid
+        std::vector<int8_t> next_grid = base_grid;
+
+        int newly_active_cells = 0;
+
+        for (std::size_t n = 0; n < N; ++n) {
+
+            if (target_snapshot[n] <= 0) {
+                continue;
+            }
+
+            // Preserve cells that were already active before the
+            // perception event.
+            if (next_grid[n] > 0) {
+                continue;
+            }
+
+
+            // target_sdf is negative inside the target.
+            // target interior depth = 0.8 m
+            // target_sdf          = -0.8
+            //
+            // offset = 0.7
+            //
+            // -0.8 <= -0.7   -> active
+            //
+            // A cell near the outer target boundary might be:
+            //
+            // target_sdf = -0.05
+            //
+            // -0.05 <= -0.7  -> false
+            //
+            // It becomes active later as offset approaches zero.
+            if (target_sdf[n] <= -offset_m) {
+
+                next_grid[n] = 1;
+                ++newly_active_cells;
+            }
+        }
+        semantic_current_grid_.swap(next_grid);
+
+        // Finish at the target
+
+        if (offset_m <= 1.0e-4f) {
+            semantic_current_grid_ = target_snapshot;
+            transition_active = false;
+            offset_m = 0.0f;
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Completed perception-driven semantic growth"
+            );
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            500,
+            "Semantic growth POC: "
+            "speed=%.3f m/s dt=%.4f s "
+            "step=%.5f m offset=%.3f m "
+            "new_cells=%d active=%d",
+            kGrowthSpeedMps,
+            safe_dt,
+            growth_step,
+            offset_m,
+            newly_active_cells,
+            transition_active ? 1 : 0
+        );
     }
 
     void update_interpolated_semantic_grid() {
@@ -3654,7 +3903,6 @@ private:
         // Stage B PoC: rate-limits the semantic layer's SDF (instead of
         // snapping semantic_current_grid_ straight to semantic_target_grid_)
         // whenever there is no active INSERTING/REMOVING/TRANSITIONING
-        // homotopy running. Off by default -- one-line revert.
         this->declare_parameter("enable_sdf_rate_limited_semantic_growth", false);
 
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
