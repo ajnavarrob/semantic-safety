@@ -2876,11 +2876,9 @@ private:
     // already represents "how fast can the robot plausibly react,"
     void advance_semantic_boundary_sdf(float dt)
     {
-        const std::size_t N =
-            static_cast<std::size_t>(IMAX * JMAX);
+        const std::size_t N = static_cast<std::size_t>(IMAX * JMAX);
 
-        if (semantic_target_grid_.size() != N ||
-            semantic_current_grid_.size() != N) {
+        if (semantic_target_grid_.size() != N || semantic_current_grid_.size() != N) {
             return;
         }
 
@@ -2893,13 +2891,7 @@ private:
         const float safe_dt = std::clamp(dt, 1.0e-4f, 0.2f);
         const float growth_step = kGrowthSpeedMps * safe_dt;
 
-
-        // ============================================================
         // Local persistent state
-        //
-        // These are static ONLY so you can test the idea without
-        // modifying the rest of the class.
-        // ============================================================
         static bool initialized = false;
 
         // Last target received from the semantic fuser.
@@ -2912,7 +2904,6 @@ private:
         static std::vector<float> target_sdf;
 
         // Semantic grid that existed at the start of the transition.
-        //
         // These cells remain occupied while the newly detected
         // semantic region grows.
         static std::vector<int8_t> base_grid;
@@ -2921,22 +2912,15 @@ private:
         //
         // Large offset:
         //     only deep interior target cells are active.
-        //
         // offset -> 0:
         //     complete target becomes active.
         static float offset_m = 0.0f;
         static bool transition_active = false;
 
-
-        // ============================================================
         // 1. First invocation
-        // ============================================================
-
         if (!initialized) {
-
             previous_target = semantic_target_grid_;
             target_snapshot = semantic_target_grid_;
-
             target_sdf = compute_signed_distance_field(target_snapshot);
             base_grid = semantic_current_grid_;
 
@@ -2948,21 +2932,15 @@ private:
             // before this mechanism was enabled.
         }
 
-
-        // ============================================================
         // 2. Detect a meaningful change in the target semantic map
-        // ============================================================
-
         int changed_cells = 0;
         int added_cells = 0;
         int removed_cells = 0;
 
         for (std::size_t n = 0; n < N; ++n) {
-
             const bool old_occ = previous_target[n] > 0;
-
             const bool new_occ = semantic_target_grid_[n] > 0;
-
+            
             if (old_occ == new_occ) {
                 continue;
             }
@@ -2977,61 +2955,40 @@ private:
             }
         }
 
-
         const bool meaningful_change = changed_cells >= kMinChangedCells;
 
-
-        // ============================================================
         // 3. A NEW semantic region appeared
-        //
         // This is the case we care about:
-        //
         // rule already exists
         //       +
-        // cone suddenly becomes visible
-        //
+        // suddenly becomes visible
         // For this POC, only react to changes dominated by additions.
-        // ============================================================
 
-        if (meaningful_change &&
-            added_cells > removed_cells) {
-
-            // Preserve what was already active before the new cone
-            // appeared.
+        if (meaningful_change && added_cells > removed_cells) {
+            // Preserve what was already active before the new cone appeared.
             base_grid = semantic_current_grid_;
             // Freeze the new requested semantic geometry.
             target_snapshot = semantic_target_grid_;
             target_sdf = compute_signed_distance_field(target_snapshot);
 
-            // --------------------------------------------------------
             // Find the maximum interior depth of ONLY the newly added
             // target region.
             //
             // target_sdf < 0 inside the semantic target.
             // Therefore -target_sdf gives interior depth in meters.
-            // --------------------------------------------------------
             float max_new_depth_m = 0.0f;
-
             for (std::size_t n = 0; n < N; ++n) {
-
-                const bool already_active =
-                    base_grid[n] > 0;
-
-                const bool target_occ =
-                    target_snapshot[n] > 0;
-
+                const bool already_active = base_grid[n] > 0;
+                const bool target_occ = target_snapshot[n] > 0;
                 if (already_active || !target_occ) {
                     continue;
                 }
-
                 const float depth_m = std::max(0.0f, -target_sdf[n]);
-
                 max_new_depth_m = std::max(max_new_depth_m, depth_m);
             }
 
 
             if (max_new_depth_m > 1.0e-4f) {
-
                 // Start at the deepest interior level set.
                 //
                 // Then offset_m decreases slowly toward zero.
@@ -3039,7 +2996,6 @@ private:
                 // This causes the active zero-level boundary to
                 // propagate OUTWARD toward the final semantic boundary.
                 offset_m = max_new_depth_m;
-
                 transition_active = true;
 
                 RCLCPP_INFO(
@@ -3069,27 +3025,18 @@ private:
             return;
         }
 
-
-        // ============================================================
         // 5. Advance the moving level set
-        //
         // offset_m:
-        //
         //      large ----------------------------> 0
-        //
         // active semantic region:
-        //
         //      small ---------------------------> full target
-        // ============================================================
 
         offset_m = std::max(0.0f, offset_m - growth_step);
         //Construct the new active semantic grid
         std::vector<int8_t> next_grid = base_grid;
-
         int newly_active_cells = 0;
 
         for (std::size_t n = 0; n < N; ++n) {
-
             if (target_snapshot[n] <= 0) {
                 continue;
             }
@@ -3099,7 +3046,6 @@ private:
             if (next_grid[n] > 0) {
                 continue;
             }
-
 
             // target_sdf is negative inside the target.
             // target interior depth = 0.8 m
@@ -3117,7 +3063,6 @@ private:
             //
             // It becomes active later as offset approaches zero.
             if (target_sdf[n] <= -offset_m) {
-
                 next_grid[n] = 1;
                 ++newly_active_cells;
             }
@@ -3125,7 +3070,6 @@ private:
         semantic_current_grid_.swap(next_grid);
 
         // Finish at the target
-
         if (offset_m <= 1.0e-4f) {
             semantic_current_grid_ = target_snapshot;
             transition_active = false;
