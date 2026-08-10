@@ -2884,7 +2884,7 @@ private:
 
         // 0.01 m/s means with DS = 0.05 m it takes approximately
         // 5 seconds for the boundary to advance one grid-cell layer.
-        constexpr float kGrowthSpeedMps = 0.01f;
+        constexpr float kGrowthSpeedMps = 0.15f;
 
         // Ignore tiny changes in the incoming target(maybe noise)
         constexpr int kMinChangedCells = 3;
@@ -3098,8 +3098,8 @@ private:
     }
 
     void update_interpolated_semantic_grid() {
-        if (enable_sdf_rate_limited_semantic_growth_ &&
-            !semantic_update_.active) {
+
+        if (enable_sdf_rate_limited_semantic_growth_ && !semantic_update_.active) {
             advance_semantic_boundary_sdf(dt_grid);
             return;
         }
@@ -3829,7 +3829,7 @@ private:
         // Logging / visualization
         // ------------------------------------------------------------
         this->declare_parameter("enable_data_logging_to_file", false);
-        this->declare_parameter("enable_display", false);
+        this->declare_parameter("enable_display", true);
         this->declare_parameter("logging_publish_hz", 10.0);
         this->declare_parameter("constraints_path", "");
         this->declare_parameter("enable_human_persistence", true);
@@ -3847,7 +3847,7 @@ private:
         // Stage B PoC: rate-limits the semantic layer's SDF (instead of
         // snapping semantic_current_grid_ straight to semantic_target_grid_)
         // whenever there is no active INSERTING/REMOVING/TRANSITIONING
-        this->declare_parameter("enable_sdf_rate_limited_semantic_growth", false);
+        this->declare_parameter("enable_sdf_rate_limited_semantic_growth", true);
 
         enable_data_logging_to_file_ = this->get_parameter("enable_data_logging_to_file").as_bool();
         enable_display = this->get_parameter("enable_display").as_bool();
@@ -5282,7 +5282,7 @@ private:
     std::vector<int8_t> semantic_current_grid_;
 
     // Rate Limiting semantic boundary growth (see enable_sdf_rate_limited_semantic_growth_).
-    bool enable_sdf_rate_limited_semantic_growth_{false};
+    bool enable_sdf_rate_limited_semantic_growth_{true};
     std::vector<float> semantic_sdf_active_;
 
     std::vector<float> physical_occ_previous_;
