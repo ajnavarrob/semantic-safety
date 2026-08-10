@@ -2884,7 +2884,7 @@ private:
 
         // 0.01 m/s means with DS = 0.05 m it takes approximately
         // 5 seconds for the boundary to advance one grid-cell layer.
-        constexpr float kGrowthSpeedMps = 0.15f;
+        constexpr float kGrowthSpeedMps = 0.1f;
 
         // Ignore tiny changes in the incoming target(maybe noise)
         constexpr int kMinChangedCells = 3;
