@@ -5154,6 +5154,7 @@ private:
     // Rate Limiting semantic boundary growth (see enable_sdf_rate_limited_semantic_growth_).
     bool enable_sdf_rate_limited_semantic_growth_{true};
     std::vector<float> semantic_sdf_active_;
+    std::vector<int8_t> previous_perception_semantic_target_;
 
     std::vector<float> physical_occ_previous_;
     std::vector<float> physical_occ_current_;
