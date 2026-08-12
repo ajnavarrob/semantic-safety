@@ -27,7 +27,9 @@ import numpy as np
 
 import rclpy
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import UInt64
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 
 class SemanticMapFuser(Node):
@@ -105,6 +107,7 @@ class SemanticMapFuser(Node):
         }
 
         self.constraints_signature: Optional[str] = None
+        self.constraints_revision: int = 0
         self.constraints_last_mtime_ns: Optional[int] = None
         self.warned_keys: Set[str] = set()
         self.last_log_time_ns = 0
@@ -161,6 +164,7 @@ class SemanticMapFuser(Node):
 
         self.declare_parameter('publish_combined_safety_target', True)
         self.declare_parameter('combined_safety_target_topic', '/semantic_safety_target')
+        self.declare_parameter('combined_safety_target_revision_topic', '/semantic_safety_target_revision')
 
     def _load_parameters(self) -> None:
         self.semantic_observation_prefix = self._normalize_prefix(
@@ -225,6 +229,9 @@ class SemanticMapFuser(Node):
         )
         self.combined_safety_target_topic = str(
             self.get_parameter('combined_safety_target_topic').value
+        )
+        self.combined_safety_target_revision_topic = str(
+            self.get_parameter('combined_safety_target_revision_topic').value
         )
 
     @staticmethod
@@ -293,11 +300,23 @@ class SemanticMapFuser(Node):
             )
 
         self.combined_target_publisher = None
+        self.combined_target_revision_publisher = None
+
         if self.publish_combined_safety_target:
             self.combined_target_publisher = self.create_publisher(
                 OccupancyGrid,
                 self.combined_safety_target_topic,
                 10
+            )
+
+            revision_qos = QoSProfile(depth=1)
+            revision_qos.reliability = ReliabilityPolicy.RELIABLE
+            revision_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+            self.combined_target_revision_publisher = self.create_publisher(
+                UInt64,
+                self.combined_safety_target_revision_topic,
+                revision_qos
             )
 
     def semantic_observation_callback(
@@ -361,6 +380,15 @@ class SemanticMapFuser(Node):
 
         return masks
 
+    @staticmethod
+    def _constraint_revision_from_text(text: str) -> int:
+        # 64-bit FNV-1a; semantic_poisson.cpp uses the same function.
+        value = 1469598103934665603
+        for byte in text.encode('utf-8'):
+            value ^= byte
+            value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return value
+
     def reload_constraints_if_changed(self, force: bool = False) -> None:
         if not self.constraints_path:
             return
@@ -382,10 +410,15 @@ class SemanticMapFuser(Node):
 
         try:
             with open(self.constraints_path, 'r', encoding='utf-8') as handle:
-                document = json.load(handle)
+                raw_constraints_text = handle.read()
+            document = json.loads(raw_constraints_text)
         except (OSError, json.JSONDecodeError) as exc:
             self.get_logger().warn(f'Failed to load constraints JSON: {exc}')
             return
+
+        loaded_revision = self._constraint_revision_from_text(
+            raw_constraints_text
+        )
 
         compiled_buffers, compiled_rule_ids = self._compile_constraint_document(document)
         signature = json.dumps(
@@ -394,7 +427,15 @@ class SemanticMapFuser(Node):
         )
 
         self.constraints_last_mtime_ns = mtime_ns
+
+        revision_changed = loaded_revision != self.constraints_revision
+        self.constraints_revision = loaded_revision
+
         if signature == self.constraints_signature:
+            if revision_changed:
+                self.get_logger().info(
+                    f'Constraint revision acknowledged: {self.constraints_revision}'
+                )
             return
 
         old_buffers = dict(self.class_buffer_m)
@@ -654,6 +695,14 @@ class SemanticMapFuser(Node):
             combined_mask = np.zeros(self.grid_cell_count, dtype=bool)
             for class_name in self.SEMANTIC_CLASSES:
                 combined_mask |= target_masks[class_name]
+
+            # Publish the revision first. semantic_poisson ignores target maps
+            # until this exact revision has been acknowledged.
+            if self.combined_target_revision_publisher is not None:
+                revision_msg = UInt64()
+                revision_msg.data = int(self.constraints_revision)
+                self.combined_target_revision_publisher.publish(revision_msg)
+
             self.combined_target_publisher.publish(
                 self._make_binary_grid(combined_mask, stamp)
             )
