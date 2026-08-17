@@ -18,8 +18,8 @@
   ],
   "metadata": {
     "source": "live_command_demo",
-    "timestamp": "2026-08-06T09:48:27.401248",
-    "instruction": "stay away from traffic cones",
+    "timestamp": "2026-08-17T16:38:08.463159",
+    "instruction": "stay 1m away from cone",
     "flat_status": "ok",
     "action": "add"
   }
