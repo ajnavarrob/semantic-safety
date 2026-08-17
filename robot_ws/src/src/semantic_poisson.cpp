@@ -4151,7 +4151,7 @@ private:
         const int robot_i = IMAX / 2;
         const int robot_j = JMAX / 2;
 
-        constexpr float kDangerRadiusM = 0.30f;
+        constexpr float kDangerRadiusM = 0.50f;
 
         const int radius_cells =
             static_cast<int>(std::ceil(kDangerRadiusM / DS));
