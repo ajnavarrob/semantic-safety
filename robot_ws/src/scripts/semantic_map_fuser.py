@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Rule-aware semantic map fuser — Commit 3.
+Rule-aware semantic map fuser — Commit 4 - Added per class persistence
 
-Responsibilities:
     1. Subscribe to front and rear per-class semantic observation grids.
-    2. Maintain short-lived persistent raw semantic layers.
+    2. Maintain short-lived persistence on per-class semantic observations.
     3. Load the runtime constraints JSON used by semantic_poisson.
     4. Compile enforced exclusion/avoidance rules by semantic class.
     5. Expand only the semantic class affected by each rule.
@@ -143,7 +142,7 @@ class SemanticMapFuser(Node):
         self.declare_parameter('occupied_threshold', 50)
         self.declare_parameter('output_frame', 'body_link')
 
-        self.declare_parameter('human_timeout_sec', 0.75)
+        self.declare_parameter('human_timeout_sec', 0.0)
         self.declare_parameter('traffic_cone_timeout_sec', 3.0)
         self.declare_parameter('caution_tape_timeout_sec', 5.0)
         self.declare_parameter('floor_danger_tape_timeout_sec', 5.0)
@@ -184,14 +183,18 @@ class SemanticMapFuser(Node):
         ))
         self.output_frame = str(self.get_parameter('output_frame').value)
 
-        self.class_timeout_sec: Dict[str, float] = {}
-        self.class_timeout_ns: Dict[str, int] = {}
+        # These durations control per-cell persistence of semantic observations.
+        # A currently observed cell refreshes its timestamp; an absent detection
+        # does not immediately clear it. Instead, the cell remains active until
+        # its class-specific persistence duration expires.
+        self.class_persistence_sec: Dict[str, float] = {}
+        self.class_persistence_ns: Dict[str, int] = {}
         for class_name in self.SEMANTIC_CLASSES:
-            timeout = max(0.0, float(
+            persistence_sec = max(0.0, float(
                 self.get_parameter(f'{class_name}_timeout_sec').value
             ))
-            self.class_timeout_sec[class_name] = timeout
-            self.class_timeout_ns[class_name] = int(timeout * 1e9)
+            self.class_persistence_sec[class_name] = persistence_sec
+            self.class_persistence_ns[class_name] = int(persistence_sec * 1e9)
 
         self.constraints_path = os.path.expanduser(
             str(self.get_parameter('constraints_path').value).strip()
@@ -339,7 +342,15 @@ class SemanticMapFuser(Node):
             )
             return
 
-        observed_mask = np.asarray(msg.data, dtype=np.int16) >= self.occupied_threshold
+        observed_mask = (
+            np.asarray(msg.data, dtype=np.int16)
+            >= self.occupied_threshold
+        )
+
+        # Persistence is attached to the semantic observation itself:
+        # only currently observed cells refresh their timestamp. Empty cells do
+        # not immediately erase prior detections; they expire in
+        # _active_raw_masks() according to the class-specific duration.
         if not np.any(observed_mask):
             return
 
@@ -367,15 +378,24 @@ class SemanticMapFuser(Node):
         masks: Dict[str, np.ndarray] = {}
         for class_name in self.SEMANTIC_CLASSES:
             last_seen = self.last_seen_ns[class_name]
-            timeout_ns = self.class_timeout_ns[class_name]
+            persistence_ns = self.class_persistence_ns[class_name]
 
             if last_seen is None:
                 masks[class_name] = np.zeros(self.grid_cell_count, dtype=bool)
                 continue
 
-            max_age_ns = timeout_ns if timeout_ns > 0 else int(1e9 / self.publish_rate_hz)
+            # Zero persistence means "current-frame only" behavior. This is
+            # intentionally used for humans because human persistence/tracking
+            # is handled separately in semantic_poisson.
+            max_age_ns = (
+                persistence_ns
+                if persistence_ns > 0
+                else int(1e9 / self.publish_rate_hz)
+            )
+
             masks[class_name] = (
-                (last_seen >= 0) & ((now_ns - last_seen) <= max_age_ns)
+                (last_seen >= 0)
+                & ((now_ns - last_seen) <= max_age_ns)
             )
 
         return masks
@@ -838,8 +858,10 @@ class SemanticMapFuser(Node):
             raw_count = int(np.count_nonzero(raw_masks[class_name]))
             target_count = int(np.count_nonzero(target_masks[class_name]))
             buffer_m = self.class_buffer_m[class_name]
+            persistence_sec = self.class_persistence_sec[class_name]
             fields.append(
-                f'{class_name}={raw_count}->{target_count}@{buffer_m:.2f}m'
+                f'{class_name}={raw_count}->{target_count}'
+                f'@{buffer_m:.2f}m/persist={persistence_sec:.2f}s'
             )
 
         self.get_logger().info('Semantic layers | ' + ', '.join(fields))
@@ -854,6 +876,11 @@ class SemanticMapFuser(Node):
             f'Constraints reload rate: {self.constraints_reload_hz:.2f} Hz',
             f'Publish rate: {self.publish_rate_hz:.2f} Hz',
             f'Output frame: {self.output_frame}',
+            'Semantic observation persistence: '
+            + ', '.join(
+                f'{class_name}={self.class_persistence_sec[class_name]:.2f}s'
+                for class_name in self.SEMANTIC_CLASSES
+            ),
             f'Empty target without enforced rule: {self.empty_target_without_rule}',
         ]
         self.get_logger().info('\n'.join(lines))
