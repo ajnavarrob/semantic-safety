@@ -129,7 +129,7 @@ public:
     // Alpha settings.
     float alpha_fixed_ = 0.95f;
     float alpha_min_ = 0.0f;
-    float alpha_max_ = 1.0f;
+    float alpha_max_ = 10000000.0f;
     float alpha_ref_ = 0.95f;
     float alpha_weight_ = 10.0f;
     float alpha_solution_ = 0.95f;
