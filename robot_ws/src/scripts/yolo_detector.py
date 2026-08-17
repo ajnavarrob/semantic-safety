@@ -87,8 +87,8 @@ class YOLODetectorNode(Node):
 
         # The model must run at the minimum class threshold. Class-specific
         # filtering is then applied after inference.
-        self.declare_parameter("human_confidence_threshold", 0.15)
-        self.declare_parameter("traffic_cone_confidence_threshold", 0.30)
+        self.declare_parameter("human_confidence_threshold", 0.80)
+        self.declare_parameter("traffic_cone_confidence_threshold", 0.15)
         self.declare_parameter("caution_tape_confidence_threshold", 0.25)
         self.declare_parameter("floor_danger_tape_confidence_threshold", 0.30)
         self.declare_parameter("wet_floor_sign_confidence_threshold", 0.30)

@@ -359,8 +359,8 @@ def generate_launch_description():
             'mask_threshold': 0.5,
 
             # Per-class confidence thresholds
-            'human_confidence_threshold': 0.15,
-            'traffic_cone_confidence_threshold': 0.30,
+            'human_confidence_threshold': 0.8,
+            'traffic_cone_confidence_threshold': 0.15,
             'caution_tape_confidence_threshold': 0.25,
             'floor_danger_tape_confidence_threshold': 0.30,
             'wet_floor_sign_confidence_threshold': 0.30,
@@ -429,8 +429,8 @@ def generate_launch_description():
             'mask_threshold': 0.5,
 
             # Per-class confidence thresholds
-            'human_confidence_threshold': 0.15,
-            'traffic_cone_confidence_threshold': 0.30,
+            'human_confidence_threshold': 0.85,
+            'traffic_cone_confidence_threshold': 0.15,
             'caution_tape_confidence_threshold': 0.25,
             'floor_danger_tape_confidence_threshold': 0.30,
             'wet_floor_sign_confidence_threshold': 0.30,
