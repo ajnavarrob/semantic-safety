@@ -54,8 +54,8 @@ public:
         this->declare_parameter("min_z", minZ_default);
         this->declare_parameter("max_z", maxZ_default);
 
-        // Raw semantic class map in body_link.  The persistent map is published
-        // on a different topic to avoid subscribing to our own output.
+        // Raw semantic class map in body_link. The persistent map is
+        // published on a separate topic to avoid subscribing to our own output.
         this->declare_parameter<std::string>(
             "semantic_class_map_input_topic",
             "/class_map"
@@ -65,37 +65,19 @@ public:
             "/class_map_persistent"
         );
 
-        // A semantic label remains active while its exponentially decaying
-        // confidence is above this threshold.  With confidence initialized to
-        // 1.0, disappearance time is:
-        //
-        //   t_persist = -ln(threshold) / beta_down[class].
-        //
-        // Humans (class 1) are intentionally NOT persisted here because the
-        // semantic controller already has a dedicated human tracker.
-        this->declare_parameter(
-            "semantic_persistence_threshold",
-            0.25
-        );
-
-        // Class-specific decay rates [1/s]:
+        // Persistence durations [s] for non-human semantic classes.
+        // Class IDs:
+        //   1 human                -> not persisted here
         //   2 traffic_cone
         //   3 caution_tape
         //   4 floor_danger_tape
         //   5 wet_floor_sign
         //   6 spill
-        //
-        // At threshold 0.25 these correspond approximately to:
-        //   cone       1.54 s
-        //   caution    2.77 s
-        //   floor tape 2.77 s
-        //   wet sign   1.98 s
-        //   spill      2.77 s
-        this->declare_parameter("semantic_beta_down_traffic_cone", 0.90);
-        this->declare_parameter("semantic_beta_down_caution_tape", 0.50);
-        this->declare_parameter("semantic_beta_down_floor_danger_tape", 0.50);
-        this->declare_parameter("semantic_beta_down_wet_floor_sign", 0.70);
-        this->declare_parameter("semantic_beta_down_spill", 0.50);
+        this->declare_parameter("semantic_persistence_traffic_cone_sec", 1.5);
+        this->declare_parameter("semantic_persistence_caution_tape_sec", 2.5);
+        this->declare_parameter("semantic_persistence_floor_danger_tape_sec", 2.5);
+        this->declare_parameter("semantic_persistence_wet_floor_sign_sec", 2.0);
+        this->declare_parameter("semantic_persistence_spill_sec", 2.5);
 
         if (min_z_override >= 0.0f) {
             minZ_ = min_z_override;
@@ -111,38 +93,38 @@ public:
 
         semantic_class_map_input_topic_ =
             this->get_parameter("semantic_class_map_input_topic").as_string();
+
         semantic_class_map_output_topic_ =
             this->get_parameter("semantic_class_map_output_topic").as_string();
 
-        semantic_persistence_threshold_ =
-            static_cast<float>(
-                this->get_parameter("semantic_persistence_threshold").as_double()
-            );
+        semantic_persistence_sec_[0] = 0.0;
+        semantic_persistence_sec_[1] = 0.0;  // human handled elsewhere
+        semantic_persistence_sec_[2] =
+            this->get_parameter(
+                "semantic_persistence_traffic_cone_sec"
+            ).as_double();
+        semantic_persistence_sec_[3] =
+            this->get_parameter(
+                "semantic_persistence_caution_tape_sec"
+            ).as_double();
+        semantic_persistence_sec_[4] =
+            this->get_parameter(
+                "semantic_persistence_floor_danger_tape_sec"
+            ).as_double();
+        semantic_persistence_sec_[5] =
+            this->get_parameter(
+                "semantic_persistence_wet_floor_sign_sec"
+            ).as_double();
+        semantic_persistence_sec_[6] =
+            this->get_parameter(
+                "semantic_persistence_spill_sec"
+            ).as_double();
 
-        semantic_beta_down_[0] = 0.0f;
-        semantic_beta_down_[1] = 0.0f;  // human: handled by human tracker
-        semantic_beta_down_[2] = static_cast<float>(
-            this->get_parameter("semantic_beta_down_traffic_cone").as_double()
-        );
-        semantic_beta_down_[3] = static_cast<float>(
-            this->get_parameter("semantic_beta_down_caution_tape").as_double()
-        );
-        semantic_beta_down_[4] = static_cast<float>(
-            this->get_parameter("semantic_beta_down_floor_danger_tape").as_double()
-        );
-        semantic_beta_down_[5] = static_cast<float>(
-            this->get_parameter("semantic_beta_down_wet_floor_sign").as_double()
-        );
-        semantic_beta_down_[6] = static_cast<float>(
-            this->get_parameter("semantic_beta_down_spill").as_double()
-        );
-
-        semantic_persistence_threshold_ =
-            std::clamp(semantic_persistence_threshold_, 0.01f, 0.99f);
-
-        for (int cls = 2; cls <= 6; ++cls) {
-            semantic_beta_down_[cls] =
-                std::max(semantic_beta_down_[cls], 1.0e-3f);
+        for (int cls = FIRST_PERSISTED_CLASS_;
+             cls <= LAST_PERSISTED_CLASS_;
+             ++cls) {
+            semantic_persistence_sec_[cls] =
+                std::max(0.0, semantic_persistence_sec_[cls]);
         }
 
         RCLCPP_INFO(
@@ -154,16 +136,15 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Semantic persistence: input=%s output=%s threshold=%.2f "
-            "beta_down=[cone %.2f, caution %.2f, floor_tape %.2f, sign %.2f, spill %.2f]",
+            "Semantic persistence: input=%s output=%s "
+            "durations=[cone %.2fs, caution %.2fs, floor_tape %.2fs, sign %.2fs, spill %.2fs]",
             semantic_class_map_input_topic_.c_str(),
             semantic_class_map_output_topic_.c_str(),
-            semantic_persistence_threshold_,
-            semantic_beta_down_[2],
-            semantic_beta_down_[3],
-            semantic_beta_down_[4],
-            semantic_beta_down_[5],
-            semantic_beta_down_[6]
+            semantic_persistence_sec_[2],
+            semantic_persistence_sec_[3],
+            semantic_persistence_sec_[4],
+            semantic_persistence_sec_[5],
+            semantic_persistence_sec_[6]
         );
 
         cloud_msg.header.stamp = this->now();
@@ -184,9 +165,9 @@ public:
 
                 const int n = i * JMAX + j;
                 persistent_class_map_[n] = 0;
-                for (int cls = 0; cls < NUM_SEMANTIC_CLASSES_; ++cls) {
-                    semantic_class_confidence_[cls][n] = 0.0f;
-                }
+                semantic_last_seen_class_[n] = 0;
+                semantic_last_seen_time_[n] =
+                    std::chrono::steady_clock::time_point::min();
             }
         }
 
@@ -253,8 +234,6 @@ public:
                     std::placeholders::_1
                 )
             );
-
-        semantic_last_update_time_ = std::chrono::steady_clock::now();
 
         occupancy_publish_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(67),
@@ -690,17 +669,21 @@ private:
                     tf2::durationFromSec(0.05)
                 );
 
-            x_world = static_cast<float>(
-                transform.transform.translation.x
-            );
-            y_world = static_cast<float>(
-                transform.transform.translation.y
-            );
+            x_world =
+                static_cast<float>(
+                    transform.transform.translation.x
+                );
+
+            y_world =
+                static_cast<float>(
+                    transform.transform.translation.y
+                );
 
             const auto& q = transform.transform.rotation;
 
             const double siny_cosp =
                 2.0 * (q.w * q.z + q.x * q.y);
+
             const double cosy_cosp =
                 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
 
@@ -716,33 +699,38 @@ private:
         }
     }
 
-    void warp_semantic_confidence_to_current_body(
+    void warp_persistent_semantic_state_to_current_body(
         float current_x_world,
         float current_y_world,
         float current_yaw_world,
-        std::array<std::array<float, IMAX * JMAX>,
-                   NUM_SEMANTIC_CLASSES_>& warped
+        std::array<int8_t, IMAX * JMAX>& warped_class,
+        std::array<std::chrono::steady_clock::time_point,
+                   IMAX * JMAX>& warped_time
     ) {
-        for (auto& layer : warped) {
-            layer.fill(0.0f);
-        }
+        warped_class.fill(0);
+        warped_time.fill(
+            std::chrono::steady_clock::time_point::min()
+        );
 
         if (!semantic_pose_initialized_) {
-            warped = semantic_class_confidence_;
+            warped_class = semantic_last_seen_class_;
+            warped_time = semantic_last_seen_time_;
             return;
         }
 
         const float c_cur = std::cos(current_yaw_world);
         const float s_cur = std::sin(current_yaw_world);
+
         const float c_old = std::cos(semantic_prev_yaw_world_);
         const float s_old = std::sin(semantic_prev_yaw_world_);
 
         // Inverse resampling:
-        // current body cell -> odom/world -> previous body coordinates.
-        // This keeps persisted semantic evidence approximately fixed in the
-        // world while the robot translates/rotates.
+        // current body cell -> odom/world -> previous body cell.
+        // This keeps persisted semantic evidence approximately stationary
+        // in the world while the robot moves.
         for (int i = 0; i < IMAX; ++i) {
             for (int j = 0; j < JMAX; ++j) {
+
                 const int n_cur = i * JMAX + j;
 
                 const float x_cur_body =
@@ -765,14 +753,17 @@ private:
 
                 const float dx_old =
                     x_world - semantic_prev_x_world_;
+
                 const float dy_old =
                     y_world - semantic_prev_y_world_;
 
                 const float x_old_body =
-                    c_old * dx_old + s_old * dy_old;
+                    c_old * dx_old +
+                    s_old * dy_old;
 
                 const float y_old_body =
-                    -s_old * dx_old + c_old * dy_old;
+                    -s_old * dx_old +
+                    c_old * dy_old;
 
                 const float jf =
                     x_old_body / DS +
@@ -783,23 +774,28 @@ private:
                     0.5f * static_cast<float>(IMAX);
 
                 const int j_old =
-                    static_cast<int>(std::round(jf));
+                    static_cast<int>(
+                        std::round(jf)
+                    );
+
                 const int i_old =
-                    static_cast<int>(std::round(if_));
+                    static_cast<int>(
+                        std::round(if_)
+                    );
 
                 if (i_old < 0 || i_old >= IMAX ||
                     j_old < 0 || j_old >= JMAX) {
                     continue;
                 }
 
-                const int n_old = i_old * JMAX + j_old;
+                const int n_old =
+                    i_old * JMAX + j_old;
 
-                for (int cls = FIRST_PERSISTED_CLASS_;
-                     cls <= LAST_PERSISTED_CLASS_;
-                     ++cls) {
-                    warped[cls][n_cur] =
-                        semantic_class_confidence_[cls][n_old];
-                }
+                warped_class[n_cur] =
+                    semantic_last_seen_class_[n_old];
+
+                warped_time[n_cur] =
+                    semantic_last_seen_time_[n_old];
             }
         }
     }
@@ -813,6 +809,7 @@ private:
 
         if (msg->data.size() !=
             static_cast<std::size_t>(IMAX * JMAX)) {
+
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
@@ -824,8 +821,11 @@ private:
             return;
         }
 
-        if (msg->info.width != static_cast<std::uint32_t>(JMAX) ||
-            msg->info.height != static_cast<std::uint32_t>(IMAX)) {
+        if (msg->info.width !=
+                static_cast<std::uint32_t>(JMAX) ||
+            msg->info.height !=
+                static_cast<std::uint32_t>(IMAX)) {
+
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
@@ -839,7 +839,10 @@ private:
             return;
         }
 
-        if (std::abs(msg->info.resolution - DS) > 1.0e-5f) {
+        if (std::abs(
+                msg->info.resolution - DS
+            ) > 1.0e-5f) {
+
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
@@ -851,17 +854,11 @@ private:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(semantic_persistence_mutex_);
+        std::lock_guard<std::mutex>
+            lock(semantic_persistence_mutex_);
 
-        const auto now = std::chrono::steady_clock::now();
-
-        float semantic_dt =
-            std::chrono::duration<float>(
-                now - semantic_last_update_time_
-            ).count();
-
-        semantic_last_update_time_ = now;
-        semantic_dt = std::clamp(semantic_dt, 0.0f, 0.5f);
+        const auto now =
+            std::chrono::steady_clock::now();
 
         float current_x_world = 0.0f;
         float current_y_world = 0.0f;
@@ -874,95 +871,134 @@ private:
                 current_yaw_world
             );
 
-        std::array<std::array<float, IMAX * JMAX>,
-                   NUM_SEMANTIC_CLASSES_> warped_confidence;
+        std::array<int8_t, IMAX * JMAX>
+            warped_class{};
+
+        std::array<std::chrono::steady_clock::time_point,
+                   IMAX * JMAX>
+            warped_time{};
 
         if (have_pose) {
-            warp_semantic_confidence_to_current_body(
+            warp_persistent_semantic_state_to_current_body(
                 current_x_world,
                 current_y_world,
                 current_yaw_world,
-                warped_confidence
+                warped_class,
+                warped_time
             );
         } else {
-            warped_confidence = semantic_class_confidence_;
+            warped_class =
+                semantic_last_seen_class_;
+
+            warped_time =
+                semantic_last_seen_time_;
 
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 2000,
                 "No odom->body_link TF for semantic persistence; "
-                "decaying in the current grid frame without ego-motion compensation"
+                "retaining semantic cells without ego-motion compensation"
             );
         }
 
-        // First decay old semantic evidence.
-        for (int cls = FIRST_PERSISTED_CLASS_;
-             cls <= LAST_PERSISTED_CLASS_;
-             ++cls) {
+        semantic_last_seen_class_ = warped_class;
+        semantic_last_seen_time_ = warped_time;
 
-            const float decay =
-                std::exp(
-                    -semantic_beta_down_[cls] *
-                    semantic_dt
+        // Current detections refresh the stored class and timestamp.
+        // Human class 1 is deliberately NOT persisted here; it passes
+        // through only when currently detected.
+        for (int n = 0;
+             n < IMAX * JMAX;
+             ++n) {
+
+            const int raw_class =
+                static_cast<int>(
+                    msg->data[n]
                 );
 
-            for (int n = 0; n < IMAX * JMAX; ++n) {
-                semantic_class_confidence_[cls][n] =
-                    warped_confidence[cls][n] * decay;
+            if (raw_class >= FIRST_PERSISTED_CLASS_ &&
+                raw_class <= LAST_PERSISTED_CLASS_) {
+
+                semantic_last_seen_class_[n] =
+                    static_cast<int8_t>(raw_class);
+
+                semantic_last_seen_time_[n] =
+                    now;
             }
         }
 
-        // A current observation immediately restores confidence to 1.0.
-        // This avoids delaying a newly detected safety-critical object.
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            const int cls =
-                static_cast<int>(msg->data[n]);
+        // Build the integer persistent class map.
+        for (int n = 0;
+             n < IMAX * JMAX;
+             ++n) {
 
-            if (cls >= FIRST_PERSISTED_CLASS_ &&
-                cls <= LAST_PERSISTED_CLASS_) {
-                semantic_class_confidence_[cls][n] = 1.0f;
-            }
-        }
+            const int raw_class =
+                static_cast<int>(
+                    msg->data[n]
+                );
 
-        // Build the output map.
-        //
-        // Current measurements always win.  Persistence only fills cells that
-        // are currently background.  Class 1 (human) therefore passes through
-        // untouched and is never persisted here.
-        for (int n = 0; n < IMAX * JMAX; ++n) {
-            const int raw_cls =
-                static_cast<int>(msg->data[n]);
-
-            if (raw_cls != 0) {
+            // Any current nonzero measurement wins immediately.
+            // This includes humans, which remain instantaneous here.
+            if (raw_class != 0) {
                 persistent_class_map_[n] =
-                    static_cast<int8_t>(raw_cls);
+                    static_cast<int8_t>(
+                        raw_class
+                    );
                 continue;
             }
 
-            int best_class = 0;
-            float best_confidence =
-                semantic_persistence_threshold_;
+            const int stored_class =
+                static_cast<int>(
+                    semantic_last_seen_class_[n]
+                );
 
-            for (int cls = FIRST_PERSISTED_CLASS_;
-                 cls <= LAST_PERSISTED_CLASS_;
-                 ++cls) {
+            if (stored_class < FIRST_PERSISTED_CLASS_ ||
+                stored_class > LAST_PERSISTED_CLASS_) {
 
-                const float c =
-                    semantic_class_confidence_[cls][n];
-
-                if (c > best_confidence) {
-                    best_confidence = c;
-                    best_class = cls;
-                }
+                persistent_class_map_[n] = 0;
+                continue;
             }
 
-            persistent_class_map_[n] =
-                static_cast<int8_t>(best_class);
+            const auto last_seen =
+                semantic_last_seen_time_[n];
+
+            if (last_seen ==
+                std::chrono::steady_clock::time_point::min()) {
+
+                persistent_class_map_[n] = 0;
+                continue;
+            }
+
+            const double age_sec =
+                std::chrono::duration<double>(
+                    now - last_seen
+                ).count();
+
+            if (age_sec <=
+                semantic_persistence_sec_[stored_class]) {
+
+                persistent_class_map_[n] =
+                    static_cast<int8_t>(
+                        stored_class
+                    );
+
+            } else {
+                persistent_class_map_[n] = 0;
+
+                semantic_last_seen_class_[n] = 0;
+
+                semantic_last_seen_time_[n] =
+                    std::chrono::steady_clock::time_point::min();
+            }
         }
 
-        nav_msgs::msg::OccupancyGrid out = *msg;
-        out.header.stamp = this->now();
+        nav_msgs::msg::OccupancyGrid out =
+            *msg;
+
+        out.header.stamp =
+            this->now();
+
         out.data.assign(
             persistent_class_map_.begin(),
             persistent_class_map_.end()
@@ -971,10 +1007,17 @@ private:
         semantic_class_map_pub_->publish(out);
 
         if (have_pose) {
-            semantic_prev_x_world_ = current_x_world;
-            semantic_prev_y_world_ = current_y_world;
-            semantic_prev_yaw_world_ = current_yaw_world;
-            semantic_pose_initialized_ = true;
+            semantic_prev_x_world_ =
+                current_x_world;
+
+            semantic_prev_y_world_ =
+                current_y_world;
+
+            semantic_prev_yaw_world_ =
+                current_yaw_world;
+
+            semantic_pose_initialized_ =
+                true;
         }
     }
 
@@ -1135,30 +1178,37 @@ private:
     //   5 wet_floor_sign
     //   6 spill
     //
-    // Human persistence is intentionally excluded here.
+    // Humans are intentionally excluded from this persistence layer.
     static constexpr int NUM_SEMANTIC_CLASSES_ = 7;
+
+    // Human persistence is being accounted for on semantic_poisson.cpp
     static constexpr int FIRST_PERSISTED_CLASS_ = 2;
     static constexpr int LAST_PERSISTED_CLASS_ = 6;
 
-    std::array<std::array<float, IMAX * JMAX>,
-               NUM_SEMANTIC_CLASSES_>
-        semantic_class_confidence_{};
-
+    // Published semantic class IDs. These remain integer-valued.
     std::array<int8_t, IMAX * JMAX>
         persistent_class_map_{};
 
-    std::array<float, NUM_SEMANTIC_CLASSES_>
-        semantic_beta_down_{};
+    // Per-cell stored semantic class and last observation time.
+    std::array<int8_t, IMAX * JMAX>
+        semantic_last_seen_class_{};
 
-    float semantic_persistence_threshold_{0.25f};
+    std::array<std::chrono::steady_clock::time_point,
+               IMAX * JMAX>
+        semantic_last_seen_time_{};
 
-    std::string semantic_class_map_input_topic_{"/class_map"};
-    std::string semantic_class_map_output_topic_{"/class_map_persistent"};
+    // Class-specific persistence duration in seconds.
+    std::array<double, NUM_SEMANTIC_CLASSES_>
+        semantic_persistence_sec_{};
 
-    std::chrono::steady_clock::time_point
-        semantic_last_update_time_;
+    std::string
+        semantic_class_map_input_topic_{"/class_map"};
+
+    std::string
+        semantic_class_map_output_topic_{"/class_map_persistent"};
 
     bool semantic_pose_initialized_{false};
+
     float semantic_prev_x_world_{0.0f};
     float semantic_prev_y_world_{0.0f};
     float semantic_prev_yaw_world_{0.0f};
