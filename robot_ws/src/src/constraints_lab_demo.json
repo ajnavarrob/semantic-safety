@@ -1,9 +1,40 @@
 {
   "schema_version": "0.2",
-  "constraints": [],
+  "constraints": [
+    {
+      "id": "avoid_human_buffer",
+      "type": "exclusion",
+      "enabled": true,
+      "enforce": true,
+      "target": {
+        "semantic_class": [
+          "human"
+        ]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 1.0
+      }
+    },
+    {
+      "id": "avoid_floor_danger_tape_buffer",
+      "type": "exclusion",
+      "enabled": true,
+      "enforce": true,
+      "target": {
+        "semantic_class": [
+          "floor_danger_tape"
+        ]
+      },
+      "spatial_parameters": {
+        "buffer_distance_m": 1.0
+      }
+    }
+  ],
   "metadata": {
     "source": "live_command_demo",
-    "timestamp": "2026-08-15T04:23:28.624534",
-    "instruction": "clear"
+    "timestamp": "2026-08-17T21:47:28.386540",
+    "instruction": "stay away from floor tape",
+    "flat_status": "ok",
+    "action": "add"
   }
 }
