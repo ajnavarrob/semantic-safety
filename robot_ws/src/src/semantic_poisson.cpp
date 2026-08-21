@@ -3908,6 +3908,77 @@ private:
                 SemanticUpdateMode::REMOVING_CONSTRAINT;
         }
 
+        // ================================================================
+        // ABLATION MODE: abrupt semantic-boundary application
+        //
+        // Keep the structural admission check above, but bypass the live
+        // radius homotopy and all per-step radius admission.  The entire
+        // admitted target radius is applied in one update.  This is intended
+        // only for the experimental ablation against the normal COMPASS
+        // admission-checked slow-boundary insertion.
+        // ================================================================
+        if (abrupt_semantic_insertion_) {
+            semantic_buffer_current_m_ =
+                semantic_buffer_target_m_;
+
+            semantic_buffer_current_active_ =
+                semantic_buffer_target_active_;
+
+            admitted_semantic_buffer_m_ =
+                semantic_buffer_target_m_;
+
+            admitted_semantic_buffer_active_ =
+                semantic_buffer_target_active_;
+
+            semantic_metric_progress_m_ =
+                semantic_metric_extent_m_;
+
+            semantic_update_.mode =
+                SemanticUpdateMode::NORMAL;
+
+            semantic_update_.active = false;
+            semantic_update_.lambda = 1.0f;
+            semantic_update_.lambda_dot = 0.0f;
+            semantic_update_.commanded_lambda_dot = 0.0f;
+
+            semantic_candidate_target_ready_ = false;
+
+            // Mark this exact controller cycle as a constraint-application
+            // event so /poisson/logging_data gives the rosbag an explicit t=0.
+            new_constraint_event_flag_ = true;
+            ++constraint_event_counter_;
+
+            // Commit the candidate rule. commit_candidate_constraint_config()
+            // copies the target radii/activity into the admitted/current state.
+            commit_candidate_constraint_config();
+
+            // Rebuild immediately from the live raw class map using the full
+            // requested radii. The remainder of this occupancy-grid callback
+            // will then build boundaries and solve the PSF from this abruptly
+            // expanded semantic region.
+            semantic_current_grid_ =
+                build_live_semantic_buffer_grid(
+                    semantic_buffer_current_m_,
+                    semantic_buffer_current_active_
+                );
+
+            semantic_occupancy_grid_ =
+                semantic_current_grid_;
+
+            RCLCPP_WARN(
+                this->get_logger(),
+                "ABLATION: candidate constraint applied with ABRUPT semantic "
+                "buffer expansion: extent=%.3f m event=%d",
+                semantic_metric_extent_m_,
+                constraint_event_counter_
+            );
+
+            return;
+        }
+
+        // ================================================================
+        // NORMAL COMPASS MODE
+        // ================================================================
         // Start at the nominal rate. Each individual radius increment is
         // checked and reduced by evaluate_candidate_radius_step() as needed.
         initialize_semantic_homotopy(
@@ -6270,6 +6341,14 @@ private:
     float* beta_grid_{nullptr};
 
     SemanticUpdateState semantic_update_;
+
+    // Experimental ablation switch.
+    // true  = structurally admit the candidate, then apply the full semantic
+    //         buffer radius in one controller update (NO slow boundary growth,
+    //         NO per-step radius admission).
+    // false = normal COMPASS admission-checked radius homotopy.
+    bool abrupt_semantic_insertion_{true};
+
     ConstraintManager constraint_manager_;
 
     // constraint_runtime_config_ is always the currently admitted config used
